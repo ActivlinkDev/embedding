@@ -46,7 +46,9 @@ def embed_texts(texts):
     logger.info("Category embeddings generated.")
     return embeddings
 
-category_embeddings = embed_texts(device_categories)
+# Load precomputed embeddings from file
+with open("category_embeddings.json", "r") as f:
+    category_embeddings = json.load(f)
 
 def embed_query(query: str):
     response = openai.embeddings.create(

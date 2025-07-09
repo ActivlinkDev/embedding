@@ -2,4 +2,4 @@ venv/
 .venu/
 .env
 __pycache__/
-
+generate_embeddings.py
