@@ -35,20 +35,13 @@ def fetch_device_categories_local(filepath="category.json"):
 
 device_categories = fetch_device_categories_local()
 
-# Generate embeddings
-def embed_texts(texts):
-    logger.info("Generating category embeddings...")
-    response = openai.embeddings.create(
-        model="text-embedding-3-large",
-        input=texts
-    )
-    embeddings = [item.embedding for item in response.data]
-    logger.info("Category embeddings generated.")
-    return embeddings
-
-# Load precomputed embeddings from file
-with open("category_embeddings.json", "r") as f:
-    category_embeddings = json.load(f)
+# Load precomputed embeddings from compressed .npz file
+try:
+    category_embeddings = np.load("category_embeddings.npz")["embeddings"].tolist()
+    logger.info(f"Loaded {len(category_embeddings)} category embeddings from .npz file.")
+except Exception as e:
+    logger.error(f"Error loading category embeddings .npz file: {e}")
+    raise
 
 def embed_query(query: str):
     response = openai.embeddings.create(

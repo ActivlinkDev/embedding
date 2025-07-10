@@ -4,6 +4,7 @@ load_dotenv()
 import os
 import json
 import openai
+import numpy as np
 from time import sleep
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -38,11 +39,10 @@ def batch_embed_texts(texts, batch_size=100, delay=1):
 # Run embedding
 embeddings = batch_embed_texts(categories)
 
-# ✅ Round floats to 4 decimal places to reduce file size
-rounded_embeddings = [[round(val, 4) for val in emb] for emb in embeddings]
+# Convert to NumPy array (float32 = smaller)
+embeddings_array = np.array(embeddings, dtype=np.float32)
 
-# Save reduced-size embeddings to file
-with open("category_embeddings.json", "w") as f:
-    json.dump(rounded_embeddings, f)
+# Save to compressed .npz file
+np.savez_compressed("category_embeddings.npz", embeddings=embeddings_array)
 
-print("✅ Embeddings saved successfully (with reduced precision).")
+print("✅ Embeddings saved successfully (compressed to .npz).")

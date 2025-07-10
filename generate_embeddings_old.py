@@ -38,8 +38,11 @@ def batch_embed_texts(texts, batch_size=100, delay=1):
 # Run embedding
 embeddings = batch_embed_texts(categories)
 
-# Save embeddings to file
-with open("category_embeddings.json", "w") as f:
-    json.dump(embeddings, f)
+# ✅ Round floats to 4 decimal places to reduce file size
+rounded_embeddings = [[round(val, 4) for val in emb] for emb in embeddings]
 
-print("✅ Embeddings saved successfully.")
+# Save reduced-size embeddings to file
+with open("category_embeddings.json", "w") as f:
+    json.dump(rounded_embeddings, f)
+
+print("✅ Embeddings saved successfully (with reduced precision).")
