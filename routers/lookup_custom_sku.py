@@ -9,29 +9,27 @@ load_dotenv()
 
 router = APIRouter()
 
-# MongoDB connection
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
-collection = db["CustomSKU"]  # ✅ Updated collection name
+collection = db["CustomSKU"]  # ✅ Your collection
 
 @router.get("/lookup-sku", tags=["SKU Lookup"])
 def lookup_sku(
     locale: str = Query(..., description="Locale inside Locale_Specific_Data"),
+    client: str = Query(..., description="Client name to match (required)"),  # ✅ Now required
     Make: Optional[str] = None,
     Model: Optional[str] = None,
     GTIN: Optional[str] = None,
     SKU: Optional[str] = None,
-    id: Optional[str] = None,
-    client: Optional[str] = None
+    id: Optional[str] = None
 ):
-    # Always match documents with this locale inside Locale_Specific_Data
+    # Base query: locale must match within array AND client must match exactly
     base_query = {
         "Locale_Specific_Data": {
             "$elemMatch": {"locale": locale}
-        }
+        },
+        "Client": client
     }
-    if client:
-        base_query["Client"] = client
 
     def find_with(extra_query, matched_by):
         full_query = {**base_query, **extra_query}
@@ -59,7 +57,7 @@ def lookup_sku(
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid ObjectId format")
 
-    # 2. Match by GTIN (as exact match in string or array)
+    # 2. Match by GTIN (exact match, string or array)
     if GTIN:
         result = find_with({"Identifiers.GTIN": GTIN}, "GTIN")
         if result:
@@ -71,7 +69,7 @@ def lookup_sku(
         if result:
             return result
 
-    # 4. Match by Make (exact, case-insensitive) + Model (fuzzy, case-insensitive)
+    # 4. Match by Make + fuzzy Model
     if Make and Model:
         result = find_with({
             "Identifiers.Make": {"$regex": f"^{Make}$", "$options": "i"},
