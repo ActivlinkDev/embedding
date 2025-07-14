@@ -33,9 +33,7 @@ def lookup_master_sku(
         "Locale_Specific_Data.locale": locale
     }
 
-    projection = {
-        "Locale_Specific_Data.$": 1
-    }
+  
 
     result = collection.find_one(query, projection)
 
