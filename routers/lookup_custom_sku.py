@@ -1,29 +1,34 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from typing import Optional
 from pymongo import MongoClient
 from bson import ObjectId
 import os
 from dotenv import load_dotenv
 
+from utils.dependencies import verify_token  # ✅ Match your existing auth pattern
+
 load_dotenv()
 
-router = APIRouter()
+router = APIRouter(
+    prefix="/sku",
+    tags=["SKU Lookup"]
+)
 
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
-collection = db["CustomSKU"]  # ✅ Your collection
+collection = db["CustomSKU"]
 
-@router.get("/lookup-sku", tags=["SKU Lookup"])
+@router.get("/lookup")
 def lookup_sku(
     locale: str = Query(..., description="Locale inside Locale_Specific_Data"),
-    client: str = Query(..., description="Client name to match (required)"),  # ✅ Now required
+    client: str = Query(..., description="Client name to match (required)"),
     Make: Optional[str] = None,
     Model: Optional[str] = None,
     GTIN: Optional[str] = None,
     SKU: Optional[str] = None,
-    id: Optional[str] = None
+    id: Optional[str] = None,
+    _: None = Depends(verify_token)  # ✅ Enforces token authentication
 ):
-    # Base query: locale must match within array AND client must match exactly
     base_query = {
         "Locale_Specific_Data": {
             "$elemMatch": {"locale": locale}
@@ -42,7 +47,6 @@ def lookup_sku(
             }
         return None
 
-    # 1. Match by MongoDB _id
     if id:
         try:
             object_id = ObjectId(id)
@@ -57,19 +61,16 @@ def lookup_sku(
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid ObjectId format")
 
-    # 2. Match by GTIN (exact match, string or array)
     if GTIN:
         result = find_with({"Identifiers.GTIN": GTIN}, "GTIN")
         if result:
             return result
 
-    # 3. Match by SKU
     if SKU:
         result = find_with({"Identifiers.SKU": SKU}, "SKU")
         if result:
             return result
 
-    # 4. Match by Make + fuzzy Model
     if Make and Model:
         result = find_with({
             "Identifiers.Make": {"$regex": f"^{Make}$", "$options": "i"},
