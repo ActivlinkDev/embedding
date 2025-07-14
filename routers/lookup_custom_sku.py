@@ -18,7 +18,7 @@ client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
 collection = db["CustomSKU"]
 
-@router.get("/lookup")
+@router.get("/lookup_custom_sku")
 def lookup_sku(
     locale: str = Query(..., description="Locale inside Locale_Specific_Data"),
     client: str = Query(..., description="Client name to match (required)"),

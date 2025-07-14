@@ -9,7 +9,7 @@ from utils.dependencies import verify_token  # Token-based auth
 load_dotenv()
 
 router = APIRouter(
-    prefix="/master-sku",
+    prefix="/sku",
     tags=["Lookup Master SKU"]
 )
 
@@ -17,7 +17,7 @@ client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
 collection = db["MasterSKU"]
 
-@router.get("/lookup")
+@router.get("/lookup_master_sku")
 def lookup_master_sku(
     id: str = Query(..., description="The _id of the MasterSKU document"),
     locale: str = Query(..., description="Locale inside Locale_Specific_Data"),

@@ -11,14 +11,14 @@ load_dotenv()
 
 router = APIRouter(
     prefix="/sku",
-    tags=["Lookup Custom SKU"]
+    tags=["Lookup Custom SKU All Locales"]
 )
 
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
 collection = db["CustomSKU"]
 
-@router.get("/lookup")
+@router.get("/lookup_custom_all")
 def lookup_sku(
     id: Optional[str] = None,
     client: Optional[str] = Query(None, description="Client name required for GTIN, SKU, Make+Model searches"),
