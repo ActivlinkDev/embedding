@@ -35,7 +35,7 @@ def lookup_master_sku(
 
   
 
-    result = collection.find_one(query, projection)
+    result = collection.find_one(query)
 
     if result:
         # Convert ObjectId to string
