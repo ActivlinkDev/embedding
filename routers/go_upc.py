@@ -11,19 +11,15 @@ router = APIRouter(
     tags=["UPC Lookup"]
 )
 
-GO_UPC_API_URL = "https://go-upc.com/api/v1/code"
-GO_UPC_TOKEN = os.getenv("GO_UPC_TOKEN")
+GO_UPC_API_KEY = os.getenv("GO_UPC_TOKEN")
+BASE_URL = "https://go-upc.com/api/v1/code"
 
 @router.get("/lookup", dependencies=[Depends(verify_token)])
 def lookup_go_upc(
     gtin: str = Query(..., description="The GTIN to look up")
 ):
-    url = f"{GO_UPC_API_URL}/{gtin}"
-    headers = {
-        "Authorization": f"Bearer {GO_UPC_TOKEN}"
-    }
-
-    response = requests.get(url, headers=headers)
+    url = f"{BASE_URL}/{gtin}?key={GO_UPC_API_KEY}"
+    response = requests.get(url)
 
     if response.status_code == 200:
         return response.json()
