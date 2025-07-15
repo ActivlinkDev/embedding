@@ -9,6 +9,7 @@
   "Oven",
   "Microwave",
   "Vacuum Cleaner",
+  "Robot Vacuum Cleaner",
   "Cycles",
   "Steam Cleaner",
   "Road Bike",
@@ -31,5 +32,7 @@
  "Fitness Smart Watch",
  "iPhone",
  "Smartphone",
- "Coffee Machine"
+ "Coffee Machine",
+ "Tablet"
+ 
 ]

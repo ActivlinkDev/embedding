@@ -18,7 +18,7 @@ locale_collection = db["Locale_Params"]
 
 SCALE_SERP_API_KEY = os.getenv("SCALE_SERP_KEY")
 BASE_URL = "https://api.scaleserp.com/search"
-REQUEST_TIMEOUT = 5
+REQUEST_TIMEOUT = 10
 
 
 @router.get("/shopping", dependencies=[Depends(verify_token)])
