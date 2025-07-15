@@ -1,0 +1,300 @@
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel
+from typing import Optional
+import requests
+import os
+from datetime import datetime
+
+from pymongo import MongoClient
+from dotenv import load_dotenv
+from utils.dependencies import verify_token
+from utils.common import embed_query, find_best_match, category_embeddings, device_categories
+
+load_dotenv()
+
+router = APIRouter(
+    prefix="/sku",
+    tags=["Create Master SKU"]
+)
+
+client = MongoClient(os.getenv("MONGO_URI"))
+db = client["Activlink"]
+
+# Collections
+locale_collection = db["Locale_Params"]
+master_collection = db["MasterSKU"]
+
+ICECAT_USERNAME = os.getenv("ICECAT_USER")
+GO_UPC_API_KEY = os.getenv("GO_UPC_TOKEN")
+SCALE_SERP_API_KEY = os.getenv("SCALE_SERP_KEY")
+
+
+class MasterSKURequest(BaseModel):
+    Make: str
+    Model: str
+    GTIN: str
+    locale: str
+    Category: Optional[str] = None
+
+
+def build_locale_data_from_serp(title: str, locale: str, category: str):
+    locale_info = locale_collection.find_one(
+        {"locale": locale},
+        {"_id": 0, "google_domain": 1, "hl": 1, "gl": 1}
+    )
+    if not locale_info:
+        raise HTTPException(status_code=404, detail=f"No locale details found for {locale}")
+
+    params = {
+        "api_key": SCALE_SERP_API_KEY,
+        "search_type": "shopping",
+        "q": title,
+        "google_domain": locale_info.get("google_domain", "google.com"),
+        "hl": locale_info.get("hl", "en"),
+        "gl": locale_info.get("gl", "us"),
+        "shopping_condition": "new",
+        "num": 1,
+        "output": "json"
+    }
+
+    try:
+        response = requests.get("https://api.scaleserp.com/search", params=params, timeout=10)
+        data = response.json()
+
+        if response.status_code != 200 or "shopping_results" not in data:
+            return None
+
+        result = data["shopping_results"][0]
+
+        serp_title = result.get("title", "")
+        if data.Model.lower() not in serp_title.lower():
+            serp_title = None
+            google_id = None
+            google_url = None
+            merchant = None
+            currency = None
+            price = None
+            msrp_source = "No SERP Match Found"
+        else:
+            google_id = result.get("id")
+            google_url = result.get("link")
+            merchant = result.get("merchant")
+            currency = result.get("price_parsed", {}).get("currency")
+            price = result.get("price")
+
+        return {
+            "locale": locale,
+            "Category": category,
+            "Input_Title": title,
+            "SERP_Title": serp_title,
+            "Google_ID": google_id,
+            "Google_URL": google_url,
+            "Merchant": merchant,
+            "Currency": currency,
+            "Price": price,
+            "MSRP_Source": msrp_source if 'msrp_source' in locals() else "SERP",
+            "created_at": str(int(datetime.utcnow().timestamp() * 1000))
+        }
+
+    except Exception as e:
+        print(f"[SERP error] {e}")
+        return None
+
+
+@router.post("/create_master_sku")
+def create_master_sku(
+    data: MasterSKURequest,
+    _: None = Depends(verify_token)
+):
+    locale_data = locale_collection.find_one({"locale": data.locale}, {"_id": 0})
+    if not locale_data:
+        raise HTTPException(status_code=404, detail=f"No locale data found for {data.locale}")
+
+    existing = None
+    if data.GTIN.strip():
+        existing = master_collection.find_one({"GTIN": {"$in": [data.GTIN]}})
+
+        # Check for GTIN conflict with different Make+Model
+        if existing and not (
+            existing.get("Make", "").lower() == data.Make.lower()
+            and existing.get("Model", "").lower() == data.Model.lower()
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"GTIN {data.GTIN} already exists in another SKU: {existing.get('Make')} {existing.get('Model')}"
+            )
+
+    if not existing and data.Make.strip() and data.Model.strip():
+        existing = master_collection.find_one({
+            "Make": {"$regex": f"^{data.Make}$", "$options": "i"},
+            "Model": {"$regex": data.Model, "$options": "i"}
+        })
+
+    if existing:
+        for entry in existing.get("Locale_Specific_Data", []):
+            if entry.get("locale") == data.locale:
+                existing["_id"] = str(existing["_id"])
+                return {
+                    "source": "master",
+                    "matched_by": "GTIN or Make+Model",
+                    "result": existing
+                }
+
+        localized_title = f"{data.Make} {data.Model}"
+        icecat_data_locale = None
+        try:
+            url = f"https://live.icecat.biz/api/?username={ICECAT_USERNAME}&lang={data.locale[:2]}&GTIN={data.GTIN}"
+            res = requests.get(url)
+            if res.status_code == 200:
+                icecat_data_locale = res.json().get("data", {})
+                localized_title = icecat_data_locale.get("GeneralInfo", {}).get("Title") or localized_title
+        except Exception as e:
+            print(f"[ICECAT locale fetch error] {e}")
+
+        if not icecat_data_locale:
+            try:
+                headers = {"Authorization": f"Bearer {GO_UPC_API_KEY}"}
+                upc_response = requests.get(f"https://go-upc.com/api/v1/code/{data.GTIN}", headers=headers)
+                if upc_response.status_code == 200:
+                    upc_data = upc_response.json()
+                    localized_title = upc_data.get("product", {}).get("title") or localized_title
+            except Exception as e:
+                print(f"[Go-UPC fallback error for locale title] {e}")
+
+        category_name = (
+            icecat_data_locale.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value")
+            if icecat_data_locale else existing.get("Category", "Unknown")
+        )
+
+        locale_block = build_locale_data_from_serp(localized_title, data.locale, category_name)
+
+        if not locale_block:
+            raise HTTPException(status_code=500, detail="Failed to build locale-specific data.")
+
+        master_collection.update_one(
+            {"_id": existing["_id"]},
+            {"$addToSet": {"Locale_Specific_Data": locale_block}}
+        )
+
+        existing["_id"] = str(existing["_id"])
+        existing.setdefault("Locale_Specific_Data", []).append(locale_block)
+
+        return {
+            "source": "master-update",
+            "updated_locale": data.locale,
+            "result": existing
+        }
+
+    icecat_data = None
+    upc_data = None
+    title = f"{data.Make} {data.Model}"
+
+    try:
+        icecat_url_gtin = f"https://live.icecat.biz/api/?username={ICECAT_USERNAME}&lang={data.locale[:2]}&GTIN={data.GTIN}"
+        ice_response = requests.get(icecat_url_gtin)
+        if ice_response.status_code == 200:
+            raw_data = ice_response.json()
+            icecat_data = raw_data.get("data", {})
+            title = icecat_data.get("GeneralInfo", {}).get("Title") or title
+    except Exception as e:
+        print(f"[ICECAT GTIN error] {e}")
+
+    if not icecat_data:
+        try:
+            fallback_url = f"https://live.icecat.biz/api/?username={ICECAT_USERNAME}&lang={data.locale[:2]}&brand={data.Make}&productcode={data.Model}"
+            fallback_response = requests.get(fallback_url)
+            if fallback_response.status_code == 200:
+                raw_data = fallback_response.json()
+                icecat_data = raw_data.get("data", {})
+                title = icecat_data.get("GeneralInfo", {}).get("Title") or title
+        except Exception as e:
+            print(f"[ICECAT fallback error] {e}")
+
+    if not icecat_data:
+        try:
+            if not GO_UPC_API_KEY:
+                raise HTTPException(status_code=500, detail="Go-UPC API key not configured")
+            headers = {"Authorization": f"Bearer {GO_UPC_API_KEY}"}
+            upc_response = requests.get(f"https://go-upc.com/api/v1/code/{data.GTIN}", headers=headers)
+            if upc_response.status_code == 200:
+                upc_data = upc_response.json()
+                title = upc_data.get("product", {}).get("name") or title
+
+                # Use GPT to extract Make and Model from title if they are missing
+                if not data.Make.strip() or not data.Model.strip():
+                    from openai import OpenAI
+                    openai = OpenAI()
+                    prompt = f"Extract the brand (Make) and model number from this product title: '{title}'. Return as JSON with keys 'Make' and 'Model'."
+                    try:
+                        response = openai.chat.completions.create(
+                            model="gpt-4",
+                            messages=[
+                                {"role": "user", "content": prompt}
+                            ]
+                        )
+                        import json
+                        parsed = json.loads(response.choices[0].message.content)
+                        data.Make = data.Make or parsed.get("Make", "")
+                        data.Model = data.Model or parsed.get("Model", "")
+                    except Exception as e:
+                        print(f"[GPT extraction error] {e}")
+        except Exception as e:
+            print(f"[Go-UPC error] {e}")
+
+    category_for_match = (
+        data.Category
+        or (icecat_data.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value") if icecat_data else None)
+        or (upc_data.get("product", {}).get("category") if upc_data else None)
+        or "Unknown"
+    )
+
+    if not category_for_match:
+        raise HTTPException(status_code=400, detail="Unable to resolve category for matching.")
+
+    embedding = embed_query(category_for_match)
+    matched_category, similarity = find_best_match(embedding, category_embeddings, device_categories)
+
+    now_ms = str(int(datetime.utcnow().timestamp() * 1000))
+
+    image_url = None
+    brand_logo = None
+
+    if icecat_data:
+        general_info = icecat_data.get("GeneralInfo", {})
+        image_url = icecat_data.get("Image", {}).get("HighPic")
+        brand_logo = (
+            general_info.get("BrandLogo") or
+            general_info.get("BrandInfo", {}).get("BrandLogo")
+        )
+    elif upc_data:
+        image_url = upc_data.get("product", {}).get("imageUrl")
+
+    locale_category = (
+        data.Category
+        or (icecat_data.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value") if icecat_data else None)
+        or matched_category
+    )
+
+    locale_block = build_locale_data_from_serp(title, data.locale, locale_category)
+
+    if not locale_block:
+        raise HTTPException(status_code=500, detail="Failed to build locale-specific data.")
+
+    result_doc = {
+        "created_at": now_ms,
+        "Make": data.Make,
+        "Model": data.Model,
+        "Productname": data.Model,
+        "GTIN": [data.GTIN],
+        "Category": matched_category,
+        "Title": title,
+        "Image_URL": image_url,
+        "brand_logo": brand_logo,
+        "Source": "ICECAT" if icecat_data else ("UPC" if upc_data else "INPUT"),
+        "Locale_Specific_Data": [locale_block]
+    }
+
+    insert_result = master_collection.insert_one(result_doc)
+    result_doc["_id"] = str(insert_result.inserted_id)
+
+    return result_doc
