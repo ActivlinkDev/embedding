@@ -4,7 +4,6 @@ from typing import Optional
 import requests
 import os
 from datetime import datetime
-
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from utils.dependencies import verify_token
@@ -20,7 +19,6 @@ router = APIRouter(
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
 
-# Collections
 locale_collection = db["Locale_Params"]
 master_collection = db["MasterSKU"]
 
@@ -36,8 +34,7 @@ class MasterSKURequest(BaseModel):
     locale: str
     Category: Optional[str] = None
 
-
-def build_locale_data_from_serp(title: str, locale: str, category: str):
+def build_locale_data_from_serp(title: str, locale: str, category: str, model: str):
     locale_info = locale_collection.find_one(
         {"locale": locale},
         {"_id": 0, "google_domain": 1, "hl": 1, "gl": 1}
@@ -104,7 +101,6 @@ def create_master_sku(
             "Model": {"$regex": data.Model, "$options": "i"}
         })
 
-    # ✅ Existing SKU found and locale already present
     if existing:
         for entry in existing.get("Locale_Specific_Data", []):
             if entry.get("locale") == data.locale:
@@ -115,7 +111,6 @@ def create_master_sku(
                     "result": existing
                 }
 
-        # 🆕 New locale – re-fetch Icecat in that locale
         localized_title = f"{data.Make} {data.Model}"
         icecat_data_locale = None
         try:
@@ -127,36 +122,19 @@ def create_master_sku(
         except Exception as e:
             print(f"[ICECAT locale fetch error] {e}")
 
-        # Fallback to UPC for localized title if needed
-        if not icecat_data_locale:
-            try:
-                headers = {"Authorization": f"Bearer {GO_UPC_API_KEY}"}
-                upc_response = requests.get(f"https://go-upc.com/api/v1/code/{data.GTIN}", headers=headers)
-                if upc_response.status_code == 200:
-                    upc_data = upc_response.json()
-                    localized_title = upc_data.get("product", {}).get("title") or localized_title
-            except Exception as e:
-                print(f"[Go-UPC fallback error for locale title] {e}")
-
         category_name = (
             icecat_data_locale.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value")
             if icecat_data_locale else existing.get("Category", "Unknown")
         )
 
-        locale_block = build_locale_data_from_serp(localized_title, data.locale, category_name)
+        locale_block = build_locale_data_from_serp(localized_title, data.locale, category_name, data.Model)
 
         if not locale_block:
             raise HTTPException(status_code=500, detail="Failed to build locale-specific data.")
 
-        # Remove existing locale if duplicate (safety)
         master_collection.update_one(
             {"_id": existing["_id"]},
-            {"$pull": {"Locale_Specific_Data": {"locale": data.locale}}}
-        )
-
-        master_collection.update_one(
-            {"_id": existing["_id"]},
-            {"$push": {"Locale_Specific_Data": locale_block}}
+            {"$addToSet": {"Locale_Specific_Data": locale_block}}
         )
 
         existing["_id"] = str(existing["_id"])
@@ -168,7 +146,7 @@ def create_master_sku(
             "result": existing
         }
 
-    # 🆕 No existing master SKU — start from scratch
+    # No match found, creating new
     icecat_data = None
     upc_data = None
     title = f"{data.Make} {data.Model}"
@@ -196,13 +174,29 @@ def create_master_sku(
 
     if not icecat_data:
         try:
-            if not GO_UPC_API_KEY:
-                raise HTTPException(status_code=500, detail="Go-UPC API key not configured")
             headers = {"Authorization": f"Bearer {GO_UPC_API_KEY}"}
             upc_response = requests.get(f"https://go-upc.com/api/v1/code/{data.GTIN}", headers=headers)
             if upc_response.status_code == 200:
                 upc_data = upc_response.json()
-                title = upc_data.get("product", {}).get("title") or title
+                title = upc_data.get("product", {}).get("name") or title
+
+                if not data.Make.strip() or not data.Model.strip():
+                    from openai import OpenAI
+                    openai = OpenAI()
+                    prompt = f"Extract the brand (Make) and model number from this product title: '{title}'. Return as JSON with keys 'Make' and 'Model'."
+                    try:
+                        response = openai.chat.completions.create(
+                            model="gpt-4",
+                            messages=[
+                                {"role": "user", "content": prompt}
+                            ]
+                        )
+                        import json
+                        parsed = json.loads(response.choices[0].message.content)
+                        data.Make = data.Make or parsed.get("Make", "")
+                        data.Model = data.Model or parsed.get("Model", "")
+                    except Exception as e:
+                        print(f"[GPT extraction error] {e}")
         except Exception as e:
             print(f"[Go-UPC error] {e}")
 
@@ -213,11 +207,8 @@ def create_master_sku(
         or "Unknown"
     )
 
-    if not category_for_match:
-        raise HTTPException(status_code=400, detail="Unable to resolve category for matching.")
-
     embedding = embed_query(category_for_match)
-    matched_category, similarity = find_best_match(embedding, category_embeddings, device_categories)
+    matched_category, _ = find_best_match(embedding, category_embeddings, device_categories)
 
     now_ms = str(int(datetime.utcnow().timestamp() * 1000))
 
@@ -231,6 +222,20 @@ def create_master_sku(
             general_info.get("BrandLogo") or
             general_info.get("BrandInfo", {}).get("BrandLogo")
         )
+
+        # ✅ SAFE Make/Model extraction
+        brand = general_info.get("Brand")
+        if isinstance(brand, dict):
+            data.Make = brand.get("Value", data.Make)
+        elif isinstance(brand, str):
+            data.Make = brand or data.Make
+
+        product_info = general_info.get("ProductNameInfo", {}).get("ProductIntName")
+        if isinstance(product_info, dict):
+            data.Model = product_info.get("Value", data.Model)
+        elif isinstance(product_info, str):
+            data.Model = product_info or data.Model
+
     elif upc_data:
         image_url = upc_data.get("product", {}).get("imageUrl")
 
@@ -240,7 +245,7 @@ def create_master_sku(
         or matched_category
     )
 
-    locale_block = build_locale_data_from_serp(title, data.locale, locale_category)
+    locale_block = build_locale_data_from_serp(title, data.locale, locale_category, data.Model)
 
     if not locale_block:
         raise HTTPException(status_code=500, detail="Failed to build locale-specific data.")

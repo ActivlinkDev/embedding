@@ -19,6 +19,7 @@ router = APIRouter(
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
 
+# Collections
 locale_collection = db["Locale_Params"]
 master_collection = db["MasterSKU"]
 
@@ -58,7 +59,26 @@ def build_locale_data_from_serp(title: str, locale: str, category: str, model: s
         response = requests.get("https://api.scaleserp.com/search", params=params, timeout=10)
         data = response.json()
 
-        result = data.get("shopping_results", [{}])[0] if data.get("shopping_results") else {}
+        if response.status_code != 200 or "shopping_results" not in data:
+            return None
+
+        result = data["shopping_results"][0]
+        serp_title = result.get("title", "")
+
+        if model.lower() not in serp_title.lower():
+            return {
+                "locale": locale,
+                "Category": category,
+                "Input_Title": title,
+                "SERP_Title": None,
+                "Google_ID": None,
+                "Google_URL": None,
+                "Merchant": None,
+                "Currency": None,
+                "Price": None,
+                "MSRP_Source": "No SERP Match Found",
+                "created_at": str(int(datetime.utcnow().timestamp() * 1000))
+            }
 
         return {
             "locale": locale,
@@ -70,25 +90,13 @@ def build_locale_data_from_serp(title: str, locale: str, category: str, model: s
             "Merchant": result.get("merchant"),
             "Currency": result.get("price_parsed", {}).get("currency"),
             "Price": result.get("price"),
-            "MSRP_Source": "SERP" if result else "No SERP Match Found",
+            "MSRP_Source": "SERP",
             "created_at": str(int(datetime.utcnow().timestamp() * 1000))
         }
 
     except Exception as e:
         print(f"[SERP error] {e}")
-        return {
-            "locale": locale,
-            "Category": category,
-            "Input_Title": title,
-            "SERP_Title": None,
-            "Google_ID": None,
-            "Google_URL": None,
-            "Merchant": None,
-            "Currency": None,
-            "Price": None,
-            "MSRP_Source": "No SERP Match Found",
-            "created_at": str(int(datetime.utcnow().timestamp() * 1000))
-        }
+        return None
 
 
 @router.post("/create_master_sku")
@@ -131,12 +139,25 @@ def create_master_sku(
         except Exception as e:
             print(f"[ICECAT locale fetch error] {e}")
 
+        if not icecat_data_locale:
+            try:
+                headers = {"Authorization": f"Bearer {GO_UPC_API_KEY}"}
+                upc_response = requests.get(f"https://go-upc.com/api/v1/code/{data.GTIN}", headers=headers)
+                if upc_response.status_code == 200:
+                    upc_data = upc_response.json()
+                    localized_title = upc_data.get("product", {}).get("name") or localized_title
+            except Exception as e:
+                print(f"[Go-UPC fallback error for locale title] {e}")
+
         category_name = (
             icecat_data_locale.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value")
             if icecat_data_locale else existing.get("Category", "Unknown")
         )
 
         locale_block = build_locale_data_from_serp(localized_title, data.locale, category_name, data.Model)
+
+        if not locale_block:
+            raise HTTPException(status_code=500, detail="Failed to build locale-specific data.")
 
         master_collection.update_one(
             {"_id": existing["_id"]},
@@ -152,6 +173,7 @@ def create_master_sku(
             "result": existing
         }
 
+    # At this point we are creating a new master SKU
     icecat_data = None
     upc_data = None
     title = f"{data.Make} {data.Model}"
@@ -220,25 +242,20 @@ def create_master_sku(
     image_url = None
     brand_logo = None
 
-    if icecat_data:
-        general_info = icecat_data.get("GeneralInfo", {})
-        image_url = icecat_data.get("Image", {}).get("HighPic")
-        brand_logo = (
-            general_info.get("BrandLogo") or
-            general_info.get("BrandInfo", {}).get("BrandLogo")
-        )
+   if icecat_data:
+    general_info = icecat_data.get("GeneralInfo", {})
+    image_url = icecat_data.get("Image", {}).get("HighPic")
+    brand_logo = (
+        general_info.get("BrandLogo") or
+        general_info.get("BrandInfo", {}).get("BrandLogo")
+    )
 
-        brand = general_info.get("Brand")
-        if isinstance(brand, dict):
-            data.Make = brand.get("Value", data.Make)
-        elif isinstance(brand, str):
-            data.Make = brand or data.Make
+    # ✅ Final Make & Model fallback mapping
+    if not data.Make.strip():
+        data.Make = general_info.get("Brand", {}).get("Value", data.Make)
 
-        product_info = general_info.get("ProductNameInfo", {}).get("ProductIntName")
-        if isinstance(product_info, dict):
-            data.Model = product_info.get("Value", data.Model)
-        elif isinstance(product_info, str):
-            data.Model = product_info or data.Model
+    if not data.Model.strip():
+        data.Model = general_info.get("ProductNameInfo", {}).get("ProductIntName", {}).get("Value", data.Model)
 
     elif upc_data:
         image_url = upc_data.get("product", {}).get("imageUrl")
@@ -250,6 +267,9 @@ def create_master_sku(
     )
 
     locale_block = build_locale_data_from_serp(title, data.locale, locale_category, data.Model)
+
+    if not locale_block:
+        raise HTTPException(status_code=500, detail="Failed to build locale-specific data.")
 
     result_doc = {
         "created_at": now_ms,
