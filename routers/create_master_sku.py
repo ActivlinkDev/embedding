@@ -34,6 +34,9 @@ class MasterSKURequest(BaseModel):
     locale: str
     Category: Optional[str] = None
 
+def is_valid_gtin(gtin: str) -> bool:
+    return gtin.isdigit() and len(gtin) in {8, 12, 13, 14}
+
 def build_locale_data_from_serp(title: str, locale: str, category: str, model: str):
     locale_info = locale_collection.find_one(
         {"locale": locale},
@@ -71,7 +74,7 @@ def build_locale_data_from_serp(title: str, locale: str, category: str, model: s
             "Currency": result.get("price_parsed", {}).get("currency"),
             "Price": result.get("price"),
             "MSRP_Source": "SERP" if result else "No SERP Match Found",
-            "created_at": str(int(datetime.utcnow().timestamp() * 1000))
+            "created_at": datetime.utcnow().isoformat()
         }
 
     except Exception as e:
@@ -87,15 +90,17 @@ def build_locale_data_from_serp(title: str, locale: str, category: str, model: s
             "Currency": None,
             "Price": None,
             "MSRP_Source": "No SERP Match Found",
-            "created_at": str(int(datetime.utcnow().timestamp() * 1000))
+            "created_at": datetime.utcnow().isoformat()
         }
-
 
 @router.post("/create_master_sku")
 def create_master_sku(
     data: MasterSKURequest,
     _: None = Depends(verify_token)
 ):
+    if data.GTIN.strip() and not is_valid_gtin(data.GTIN):
+        raise HTTPException(status_code=400, detail="Invalid GTIN format")
+
     locale_data = locale_collection.find_one({"locale": data.locale}, {"_id": 0})
     if not locale_data:
         raise HTTPException(status_code=404, detail=f"No locale data found for {data.locale}")
@@ -140,6 +145,14 @@ def create_master_sku(
 
         master_collection.update_one(
             {"_id": existing["_id"]},
+            {"$addToSet": {"GTIN": data.GTIN}}
+        )
+        master_collection.update_one(
+            {"_id": existing["_id"]},
+            {"$pull": {"Locale_Specific_Data": {"locale": data.locale}}}
+        )
+        master_collection.update_one(
+            {"_id": existing["_id"]},
             {"$addToSet": {"Locale_Specific_Data": locale_block}}
         )
 
@@ -152,27 +165,28 @@ def create_master_sku(
             "result": existing
         }
 
+    # No existing match, create new document
     icecat_data = None
     upc_data = None
     title = f"{data.Make} {data.Model}"
 
     try:
-        icecat_url_gtin = f"https://live.icecat.biz/api/?username={ICECAT_USERNAME}&lang={data.locale[:2]}&GTIN={data.GTIN}"
-        ice_response = requests.get(icecat_url_gtin)
-        if ice_response.status_code == 200:
-            raw_data = ice_response.json()
-            icecat_data = raw_data.get("data", {})
+        url = f"https://live.icecat.biz/api/?username={ICECAT_USERNAME}&lang={data.locale[:2]}&GTIN={data.GTIN}"
+        res = requests.get(url)
+        if res.status_code == 200:
+            raw = res.json()
+            icecat_data = raw.get("data", {})
             title = icecat_data.get("GeneralInfo", {}).get("Title") or title
     except Exception as e:
         print(f"[ICECAT GTIN error] {e}")
 
     if not icecat_data:
         try:
-            fallback_url = f"https://live.icecat.biz/api/?username={ICECAT_USERNAME}&lang={data.locale[:2]}&brand={data.Make}&productcode={data.Model}"
-            fallback_response = requests.get(fallback_url)
-            if fallback_response.status_code == 200:
-                raw_data = fallback_response.json()
-                icecat_data = raw_data.get("data", {})
+            url = f"https://live.icecat.biz/api/?username={ICECAT_USERNAME}&lang={data.locale[:2]}&brand={data.Make}&productcode={data.Model}"
+            res = requests.get(url)
+            if res.status_code == 200:
+                raw = res.json()
+                icecat_data = raw.get("data", {})
                 title = icecat_data.get("GeneralInfo", {}).get("Title") or title
         except Exception as e:
             print(f"[ICECAT fallback error] {e}")
@@ -180,9 +194,9 @@ def create_master_sku(
     if not icecat_data:
         try:
             headers = {"Authorization": f"Bearer {GO_UPC_API_KEY}"}
-            upc_response = requests.get(f"https://go-upc.com/api/v1/code/{data.GTIN}", headers=headers)
-            if upc_response.status_code == 200:
-                upc_data = upc_response.json()
+            res = requests.get(f"https://go-upc.com/api/v1/code/{data.GTIN}", headers=headers)
+            if res.status_code == 200:
+                upc_data = res.json()
                 title = upc_data.get("product", {}).get("name") or title
 
                 if not data.Make.strip() or not data.Model.strip():
@@ -191,10 +205,8 @@ def create_master_sku(
                     prompt = f"Extract the brand (Make) and model number from this product title: '{title}'. Return as JSON with keys 'Make' and 'Model'."
                     try:
                         response = openai.chat.completions.create(
-                            model="gpt-4",
-                            messages=[
-                                {"role": "user", "content": prompt}
-                            ]
+                            model="gpt-3.5-turbo",
+                            messages=[{"role": "user", "content": prompt}]
                         )
                         import json
                         parsed = json.loads(response.choices[0].message.content)
@@ -205,59 +217,57 @@ def create_master_sku(
         except Exception as e:
             print(f"[Go-UPC error] {e}")
 
-    category_for_match = (
+    category_input = (
         data.Category
         or (icecat_data.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value") if icecat_data else None)
         or (upc_data.get("product", {}).get("category") if upc_data else None)
         or "Unknown"
     )
 
-    embedding = embed_query(category_for_match)
-    matched_category, _ = find_best_match(embedding, category_embeddings, device_categories)
+    embedding = embed_query(category_input)
+    matched_category, similarity = find_best_match(embedding, category_embeddings, device_categories)
+    final_category = matched_category if similarity >= 0.35 else "Unknown"
 
-    now_ms = str(int(datetime.utcnow().timestamp() * 1000))
+    now_iso = datetime.utcnow().isoformat()
+    gtin_from_icecat = [data.GTIN]
+    if isinstance(icecat_data, dict):
+        general_info = icecat_data.get("GeneralInfo", {})
+        gtin_data = general_info.get("GTIN")
+        if isinstance(gtin_data, list):
+            gtin_from_icecat = gtin_data
 
     image_url = None
     brand_logo = None
 
     if icecat_data:
-        general_info = icecat_data.get("GeneralInfo", {})
+        info = icecat_data.get("GeneralInfo", {})
         image_url = icecat_data.get("Image", {}).get("HighPic")
-        brand_logo = (
-            general_info.get("BrandLogo") or
-            general_info.get("BrandInfo", {}).get("BrandLogo")
-        )
-
-        brand = general_info.get("Brand")
+        brand_logo = info.get("BrandLogo") or info.get("BrandInfo", {}).get("BrandLogo")
+        brand = info.get("Brand")
         if isinstance(brand, dict):
             data.Make = brand.get("Value", data.Make)
         elif isinstance(brand, str):
             data.Make = brand or data.Make
-
-        product_info = general_info.get("ProductNameInfo", {}).get("ProductIntName")
-        if isinstance(product_info, dict):
-            data.Model = product_info.get("Value", data.Model)
-        elif isinstance(product_info, str):
-            data.Model = product_info or data.Model
-
+        name_info = info.get("ProductNameInfo", {}).get("ProductIntName")
+        if isinstance(name_info, dict):
+            data.Model = name_info.get("Value", data.Model)
+        elif isinstance(name_info, str):
+            data.Model = name_info or data.Model
     elif upc_data:
         image_url = upc_data.get("product", {}).get("imageUrl")
 
-    locale_category = (
-        data.Category
-        or (icecat_data.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value") if icecat_data else None)
-        or matched_category
-    )
+    locale_category_for_block = category_input if icecat_data else final_category
+    locale_block = build_locale_data_from_serp(title, data.locale, locale_category_for_block, data.Model)
 
-    locale_block = build_locale_data_from_serp(title, data.locale, locale_category, data.Model)
-
-    result_doc = {
-        "created_at": now_ms,
+    doc = {
+        "created_at": now_iso,
         "Make": data.Make,
         "Model": data.Model,
         "Productname": data.Model,
-        "GTIN": [data.GTIN],
-        "Category": matched_category,
+        "GTIN": gtin_from_icecat,
+        "Category": final_category,
+        "Matched_Category": matched_category,
+        "Match_Similarity": similarity,
         "Title": title,
         "Image_URL": image_url,
         "brand_logo": brand_logo,
@@ -265,7 +275,6 @@ def create_master_sku(
         "Locale_Specific_Data": [locale_block]
     }
 
-    insert_result = master_collection.insert_one(result_doc)
-    result_doc["_id"] = str(insert_result.inserted_id)
-
-    return result_doc
+    result = master_collection.insert_one(doc)
+    doc["_id"] = str(result.inserted_id)
+    return doc
