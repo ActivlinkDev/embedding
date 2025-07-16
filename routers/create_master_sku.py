@@ -16,7 +16,7 @@ load_dotenv()
 
 router = APIRouter(
     prefix="/sku",
-    tags=["Create Master SKU"]
+    tags=["SKU"]
 )
 
 client = MongoClient(os.getenv("MONGO_URI"))
@@ -24,6 +24,7 @@ db = client["Activlink"]
 
 locale_collection = db["Locale_Params"]
 master_collection = db["MasterSKU"]
+failed_matches_collection = db["Failed_Matches"]
 
 ICECAT_USERNAME = os.getenv("ICECAT_USER")
 GO_UPC_API_KEY = os.getenv("GO_UPC_TOKEN")
@@ -51,7 +52,7 @@ def is_valid_gtin(gtin: str) -> bool:
 
 def fetch_locale_info(locale: str) -> Optional[Dict[str, Any]]:
     """Get locale info from database."""
-    return locale_collection.find_one({"locale": locale}, {"_id": 0, "google_domain": 1, "hl": 1, "gl": 1})
+    return locale_collection.find_one({"locale": locale}, {"_id": 0, "google_domain": 1, "hl": 1, "gl": 1, "currency": 1})
 
 def fetch_icecat_by_gtin(gtin: str, locale: str) -> Optional[Dict]:
     """Try to get Icecat info by GTIN."""
@@ -135,10 +136,11 @@ def extract_multimedia_urls(icecat_data: dict) -> dict:
     }
 
 def build_locale_data_from_serp(title: str, locale: str, category: str, model: str, extra: dict = None) -> Dict:
-    """Build the locale block from SERP API. Allows extra fields."""
     locale_info = fetch_locale_info(locale)
     if not locale_info:
         raise HTTPException(status_code=404, detail=f"No locale details found for {locale}")
+
+    currency_code = locale_info.get("currency")  # Get from Locale_Params
 
     params = {
         "api_key": SCALE_SERP_API_KEY,
@@ -165,7 +167,7 @@ def build_locale_data_from_serp(title: str, locale: str, category: str, model: s
             "Google_ID": result.get("id"),
             "Google_URL": result.get("link"),
             "Merchant": result.get("merchant"),
-            "Currency": result.get("price_parsed", {}).get("currency"),
+            "Currency": currency_code,  # Set from Locale_Params
             "Price": result.get("price"),
             "MSRP_Source": "SERP" if result else "No SERP Match Found",
             "created_at": utc_now_iso()
@@ -184,7 +186,7 @@ def build_locale_data_from_serp(title: str, locale: str, category: str, model: s
             "Google_ID": None,
             "Google_URL": None,
             "Merchant": None,
-            "Currency": None,
+            "Currency": currency_code,  # Set from Locale_Params
             "Price": None,
             "MSRP_Source": "No SERP Match Found",
             "created_at": utc_now_iso()
@@ -222,14 +224,29 @@ def update_existing_sku(existing: Dict, data: MasterSKURequest, locale_block: Di
     existing.setdefault("Locale_Specific_Data", []).append(locale_block)
     return existing
 
-def get_category(data: MasterSKURequest, icecat_data: Optional[Dict], upc_data: Optional[Dict]) -> str:
-    """Determine final category from various sources."""
+def get_category_for_embedding(data: MasterSKURequest, icecat_data: Optional[Dict], upc_data: Optional[Dict]) -> str:
+    """Determine final category for embedding/matching/root, from all sources."""
     return (
         data.Category
         or (icecat_data.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value") if icecat_data else None)
         or (upc_data.get("product", {}).get("category") if upc_data else None)
         or "Unknown"
     )
+
+def choose_locale_category(icecat_data, upc_data, data):
+    # 1. Try Icecat
+    if icecat_data:
+        cat = icecat_data.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value")
+        if cat: return cat
+    # 2. Try UPC
+    if upc_data:
+        cat = upc_data.get("product", {}).get("category")
+        if cat: return cat
+    # 3. Try API input
+    if data.Category and data.Category.strip():
+        return data.Category.strip()
+    # 4. Default to Unknown
+    return "Unknown"
 
 def get_image_and_brand(icecat_data: Optional[Dict], upc_data: Optional[Dict], data: MasterSKURequest):
     """Extract image and brand information."""
@@ -265,7 +282,21 @@ def compute_category_embedding(category_input: str):
     embedding = embed_query(category_input)
     matched_category, similarity = find_best_match(embedding, category_embeddings, device_categories)
     final_category = matched_category if similarity >= 0.35 else "Unknown"
-    return final_category, matched_category, similarity
+    return final_category, matched_category, similarity, embedding
+
+def log_failed_match(category_input: str, data: MasterSKURequest, embedding, similarity: float):
+    failed_doc = {
+        "category_input": category_input,
+        "Make": data.Make,
+        "Model": data.Model,
+        "GTIN": data.GTIN,
+        "locale": data.locale,
+        "embedding": embedding.tolist() if hasattr(embedding, 'tolist') else embedding,
+        "similarity": similarity,
+        "created_at": utc_now_iso(),
+        "input_payload": data.dict()
+    }
+    failed_matches_collection.insert_one(failed_doc)
 
 def add_serp_match_flag(locale_block: Dict, model: str):
     serp_title = locale_block.get("SERP_Title")
@@ -306,13 +337,12 @@ def create_master_sku(data: MasterSKURequest, _: None = Depends(verify_token)):
         if icecat_data_locale:
             localized_title = icecat_data_locale.get("GeneralInfo", {}).get("Title") or localized_title
 
-        category_name = (
-            icecat_data_locale.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value")
-            if icecat_data_locale else existing.get("Category", "Unknown")
-        )
+        # New logic for locale-specific category
+        upc_data_locale = fetch_upc(data.GTIN)
+        locale_category_for_block = choose_locale_category(icecat_data_locale, upc_data_locale, data)
 
         extra = extract_multimedia_urls(icecat_data_locale) if icecat_data_locale else {}
-        locale_block = build_locale_data_from_serp(localized_title, data.locale, category_name, data.Model, extra=extra)
+        locale_block = build_locale_data_from_serp(localized_title, data.locale, locale_category_for_block, data.Model, extra=extra)
         add_serp_match_flag(locale_block, data.Model)
 
         updated = update_existing_sku(existing, data, locale_block)
@@ -341,12 +371,22 @@ def create_master_sku(data: MasterSKURequest, _: None = Depends(verify_token)):
             title = upc_data.get("product", {}).get("name") or title
             extract_make_model_from_title(title, data)
 
-    category_input = get_category(data, icecat_data, upc_data)
-    final_category, matched_category, similarity = compute_category_embedding(category_input)
+    # --- ROOT-LEVEL CATEGORY LOGIC FOR EMBEDDING ---
+    category_input = get_category_for_embedding(data, icecat_data, upc_data)
+    final_category, matched_category, similarity, embedding = compute_category_embedding(category_input)
+
+    if final_category == "Unknown":
+        # Log failed match
+        log_failed_match(category_input, data, embedding, similarity)
+        # If user did not provide any category, error
+        if not (data.Category and data.Category.strip()):
+            raise HTTPException(status_code=422, detail="No category could be matched, please provide input")
+
     gtin_from_icecat = get_gtin_from_icecat(icecat_data, data.GTIN)
     image_url, brand_logo = get_image_and_brand(icecat_data, upc_data, data)
 
-    locale_category_for_block = category_input if icecat_data else final_category
+    # --- PER-LOCALE CATEGORY LOGIC ---
+    locale_category_for_block = choose_locale_category(icecat_data, upc_data, data)
     extra = extract_multimedia_urls(icecat_data) if icecat_data else {}
     locale_block = build_locale_data_from_serp(title, data.locale, locale_category_for_block, data.Model, extra=extra)
     add_serp_match_flag(locale_block, data.Model)
@@ -358,13 +398,13 @@ def create_master_sku(data: MasterSKURequest, _: None = Depends(verify_token)):
         "Model": data.Model,
         "Productname": data.Model,
         "GTIN": gtin_from_icecat,
-        "Category": final_category,
+        "Category": final_category,  # <--- for embeddings/matching
         "Matched_Category": matched_category,
         "Match_Similarity": similarity,
         "Title": title,
         "Image_URL": image_url,
         "brand_logo": brand_logo,
-        "Source": "ICECAT" if icecat_data else ("UPC" if upc_data else "INPUT"),
+        "Source": "CAT" if icecat_data else ("UPC" if upc_data else "INPUT"),
         "Locale_Specific_Data": [locale_block]
     }
 

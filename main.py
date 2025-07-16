@@ -1,7 +1,7 @@
 # main.py
 
 from fastapi import FastAPI
-from routers import match, categories, client_lookup, lookup_custom_sku,lookup_master_sku,lookup_locale_params,lookup_custom_sku_all,create_custom_sku,lookup_master_sku_all,ice_lookup,go_upc,scale_lookup,ai_extract_and_match,create_master_sku
+from routers import match, categories, client_lookup, lookup_custom_sku,lookup_master_sku,lookup_locale_params,lookup_custom_sku_all,create_custom_sku,lookup_master_sku_all,ice_lookup,go_upc,scale_lookup,ai_extract_and_match,create_master_sku,register_device
 
 app = FastAPI(
     title="Activlink API Suite",
@@ -24,3 +24,4 @@ app.include_router(ice_lookup.router)
 app.include_router(go_upc.router)
 app.include_router(scale_lookup.router)
 app.include_router(ai_extract_and_match.router)
+app.include_router(register_device.router)

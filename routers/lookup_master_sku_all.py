@@ -11,7 +11,7 @@ load_dotenv()
 
 router = APIRouter(
     prefix="/sku",
-    tags=["Lookup Master SKU All"],
+    tags=["SKU"],
     dependencies=[Depends(verify_token)]  # ✅ Apply token auth to all routes in this router
 )
 
