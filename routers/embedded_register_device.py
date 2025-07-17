@@ -342,7 +342,6 @@ def register(payload: RegisterRequest, _: None = Depends(verify_token)):
             "Unique_Parameters": unique.dict(),
             "customSKU_id": customsku_id,
             "masterSKU_id": mastersku_id,
-            "customSKU": customsku_obj,
             "masterSKU": mastersku_obj,
             "status": "matched" if matched_status == "matched" else "error logged",
             "registered_at": datetime.utcnow().isoformat() + "Z"
@@ -368,14 +367,14 @@ def register(payload: RegisterRequest, _: None = Depends(verify_token)):
 
     # --- Root activation code/URL/QR (same for all devices in registration) ---
     activation_code = generate_activation_code()
-    activation_url = f"https://www.activlink.io/register?id={registration_id}"
-    qr_code_base64 = generate_qr_code(activation_url)
+    registration_url = f"https://www.activlink.io/register?id={registration_id}"
+    registration_qr = generate_qr_code(registration_url)
 
     # --- Update registration doc with activation fields (root) ---
     update_fields = {
         "Activation Code": activation_code,
-        "activation_url": activation_url,
-        "activation_qr": qr_code_base64
+        "registration_url": registration_url,
+        "registration_qr": registration_qr
     }
     if any_matched:
         registrations_collection.update_one(
@@ -393,7 +392,7 @@ def register(payload: RegisterRequest, _: None = Depends(verify_token)):
         "status": registration_doc["status"],
         "registration_id": registration_id,
         "activation_code": activation_code,
-        "activation_url": activation_url,
-        "activation_qr": qr_code_base64,
+        "registration_url": registration_url,
+        "registration_qr": registration_qr,
         "devices": device_results
     }
