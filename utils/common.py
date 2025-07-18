@@ -1,5 +1,4 @@
 import os
-import json
 import numpy as np
 import openai
 import logging
@@ -17,26 +16,16 @@ if not openai.api_key:
     logger.error("OPENAI_API_KEY not set!")
     raise ValueError("OPENAI_API_KEY not set!")
 
-# Load category list
-def fetch_device_categories_local(filepath="category.json"):
-    logger.info(f"Loading device categories from {filepath}...")
-    try:
-        with open(filepath, "r") as f:
-            categories = json.load(f)
-        logger.info(f"Loaded {len(categories)} categories.")
-        return categories
-    except Exception as e:
-        logger.error(f"Error loading category file: {e}")
-        raise
+# Load categories and embeddings from NPZ
+EMBEDDINGS_FILE = "generate_embeddings.npz"
 
-device_categories = fetch_device_categories_local()
-
-# Load embeddings
 try:
-    category_embeddings = np.load("category_embeddings.npz")["embeddings"].tolist()
-    logger.info(f"Loaded {len(category_embeddings)} category embeddings.")
+    npz = np.load(EMBEDDINGS_FILE, allow_pickle=True)
+    category_embeddings = npz["embeddings"].tolist()
+    device_categories = npz["categories"].tolist()
+    logger.info(f"Loaded {len(device_categories)} categories and embeddings from {EMBEDDINGS_FILE}.")
 except Exception as e:
-    logger.error(f"Error loading embeddings: {e}")
+    logger.error(f"Error loading embeddings/categories from {EMBEDDINGS_FILE}: {e}")
     raise
 
 # Utilities
