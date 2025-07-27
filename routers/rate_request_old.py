@@ -12,7 +12,6 @@ client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
 ratings = db["Rating"]
 error_log_collection = db["Error_Log_RateRequest"]
-stripe_payment_collection = db["Stripe_Price_ID"]
 
 class RateRequest(BaseModel):
     product_id: str = Field(..., example="")
@@ -23,9 +22,9 @@ class RateRequest(BaseModel):
     age: int = Field(..., example=0)
     price: float = Field(..., example=0)
     multi_count: int = Field(..., example=0)
-    client: str = Field(..., example="acme_corp")
-    source: str = Field(..., example="web_app")
-    mode: str = Field(..., example="live")
+    client: str = Field(..., example="acme_corp")   # NEW FIELD
+    source: str = Field(..., example="web_app")     # NEW FIELD
+    mode: str = Field(..., example="live")          # NEW FIELD
 
     def missing_fields(self):
         missing = []
@@ -79,6 +78,14 @@ def match_with_reasons(doc, payload):
         reasons.append(f"locale '{payload.locale}' not matched in localeFactor")
     if str(payload.poc) not in doc.get("pocFactor", {}):
         reasons.append(f"poc '{payload.poc}' not found in pocFactor")
+
+    # CATEGORY DEBUGGING (comment out in production)
+    # print("\n=== CATEGORY MATCH DEBUG ===")
+    # print("PAYLOAD CATEGORY:", repr(payload.category))
+    # for cf in doc.get("categoryFactor", []):
+    #     print("DOC DEVICE:", repr(cf.get("device", "")))
+    #     print("Normalized payload.category:", normalize(payload.category), "Normalized doc device:", normalize(cf.get("device", "")))
+    # print("===========================")
 
     if not any(normalize(cf.get("device", "")) == normalize(payload.category) for cf in doc.get("categoryFactor", [])):
         reasons.append(f"category '{payload.category}' not matched in categoryFactor")
@@ -159,25 +166,6 @@ def rate_request(payload: RateRequest, _: None = Depends(verify_token)):
     rate = round(base_fee * locale_factor * poc_factor * category_factor * age_factor * price_factor * multi_factor, 2)
     rounded_price = round_price_49_99(rate)
 
-    # Stripe price lookup logic
-    mode_map = {
-        "subscription": "recurring",
-        "payment": "one_time"
-    }
-    price_type = mode_map.get(payload.mode.lower(), "one_time")
-    lookup_unit_amount = int(round(rounded_price * 100))
-
-    stripe_query = {
-        "currency": payload.currency.lower(),
-        "unit_amount": lookup_unit_amount,
-        "type": price_type,
-        "active": True
-    }
-
-    stripe_price_doc = stripe_payment_collection.find_one(stripe_query)
-    stripe_price_id = stripe_price_doc["id"] if stripe_price_doc else None
-    stripe_price_doc_filtered = {k: v for k, v in stripe_price_doc.items() if k != "_id"} if stripe_price_doc else None
-
     return {
         "input": payload.dict(),
         "factors": {
@@ -190,11 +178,5 @@ def rate_request(payload: RateRequest, _: None = Depends(verify_token)):
             "multi_factor": multi_factor
         },
         "rate": rate,
-        "rounded_price": rounded_price,
-        "stripe_price_lookup": {
-            "query": stripe_query,
-            "found": bool(stripe_price_doc),
-            "stripe_price_id": stripe_price_id,
-            "stripe_full_doc": stripe_price_doc_filtered
-        }
+        "rounded_price": rounded_price
     }
