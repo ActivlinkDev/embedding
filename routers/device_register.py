@@ -72,15 +72,25 @@ def validate_mandatory_fields(payload):
 
 def lookup_customsku(ids, client_id, locale):
     customsku_doc = None
+    # Try by SKU
     if valid_value(ids.SKU):
         customsku_doc = customsku_collection.find_one({
             "Identifiers.SKU": ids.SKU,
             "Client": client_id,
             "Locale_Specific_Data.locale": locale
         })
+    # Try by GTIN (GTIN is an array in your data, so use $in)
     if not customsku_doc and valid_value(ids.GTIN):
         customsku_doc = customsku_collection.find_one({
-            "Identifiers.GTIN": ids.GTIN,
+            "Identifiers.GTIN": { "$in": [ids.GTIN] },
+            "Client": client_id,
+            "Locale_Specific_Data.locale": locale
+        })
+    # Fallback to make and model
+    if not customsku_doc and valid_value(ids.make) and valid_value(ids.model):
+        customsku_doc = customsku_collection.find_one({
+            "Identifiers.Make": ids.make,
+            "Identifiers.Model": ids.model,
             "Client": client_id,
             "Locale_Specific_Data.locale": locale
         })
@@ -126,7 +136,7 @@ def get_first_non_blank(*args):
 
 def price_is_missing(val):
     try:
-        if val is None or str(val).strip() == "" or str(val).strip().lower() == "string":
+        if val is None or str(val).strip() == "" or str(val).strip().lower() != "string":
             return True
         return float(val) == 0
     except Exception:
@@ -136,16 +146,20 @@ def price_is_missing(val):
 def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_token)):
     validate_mandatory_fields(payload)
 
+    # 1. Lookup client document by clientkey (MUST match exactly)
     client_doc = clients_collection.find_one({"ClientKey": payload.clientkey})
     if not client_doc:
         raise HTTPException(status_code=400, detail="Invalid clientkey.")
-    locale_doc = locale_params_collection.find_one({"locale": payload.locale})
-    if not locale_doc:
-        raise HTTPException(status_code=400, detail="Locale is not supported in system.")
 
+    # 2. Extract Client_ID from the client document
     client_id = client_doc.get("Client_ID")
     if not client_id:
         raise HTTPException(status_code=400, detail="Client_ID not found in client document.")
+
+    # 3. Lookup locale doc for currency etc.
+    locale_doc = locale_params_collection.find_one({"locale": payload.locale})
+    if not locale_doc:
+        raise HTTPException(status_code=400, detail="Locale is not supported in system.")
 
     inserted = []
 
@@ -229,6 +243,7 @@ def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_tok
             })
             continue
 
+        # --- Use Client_ID from ClientKey for lookups ---
         customsku_doc = lookup_customsku(ids, client_id, payload.locale)
         customsku_id = str(customsku_doc["_id"]) if customsku_doc else None
         lsd_custom = extract_locale_specific_data(customsku_doc, payload.locale) if customsku_doc else None
@@ -310,6 +325,7 @@ def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_tok
         registration_parameters = {
             "purchaseDate": unique.purchase_date or "",
             "price": price,
+            "currency": locale_doc.get("currency", ""),   # currency comes from Locale_Params
             "clientRef": unique.client_ref or "",
             "registrationStatus": "unassigned"
         }

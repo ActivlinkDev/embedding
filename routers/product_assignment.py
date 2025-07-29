@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, constr
 from datetime import datetime
 from utils.dependencies import verify_token
 from pymongo import MongoClient
@@ -29,7 +29,7 @@ def calculate_age_in_months(purchase_date: str) -> int:
         age_months -= 1
     return max(age_months, 0)
 
-def criteria_failure_reasons(crit, locale, gtee, age_in_months, price):
+def criteria_failure_reasons(crit, locale, gtee, age_in_months, price, currency):
     reasons = []
     if locale not in crit.get("locale", []):
         reasons.append(f"locale '{locale}' not in {crit.get('locale', [])}")
@@ -39,6 +39,8 @@ def criteria_failure_reasons(crit, locale, gtee, age_in_months, price):
         reasons.append(f"age_in_months {age_in_months} not in [{crit.get('monthsLow', 0)}, {crit.get('monthsHigh', 9999)}]")
     if not (crit.get("msrpLow", 0) <= price <= crit.get("msrpHigh", 999999)):
         reasons.append(f"price {price} not in [{crit.get('msrpLow', 0)}, {crit.get('msrpHigh', 999999)}]")
+    if currency not in crit.get("currency", []):
+        reasons.append(f"currency '{currency}' not in {crit.get('currency', [])}")
     return reasons
 
 def find_strict_assignment(payload, age_in_months):
@@ -61,7 +63,8 @@ def find_strict_assignment(payload, age_in_months):
                 payload.locale,
                 payload.gtee,
                 age_in_months,
-                payload.price
+                payload.price,
+                payload.currency
             )
             debug_print(f"Checking criteria block {idx}:")
             debug_print("Criteria block:", crit)
@@ -97,6 +100,7 @@ class ProductAssignmentRequest(BaseModel):
     locale: str = Field(..., example="")
     purchase_date: str = Field(..., example="")
     gtee: int = Field(..., example=0)
+    currency: constr(strip_whitespace=True, min_length=3, max_length=3, pattern="^[A-Z]{3}$") = Field(..., example="GBP")
 
     @field_validator("purchase_date")
     def validate_purchase_date_format(cls, v):
@@ -108,7 +112,7 @@ class ProductAssignmentRequest(BaseModel):
 
     def missing_fields(self):
         missing = []
-        for field in ["client", "source", "category", "locale", "purchase_date"]:
+        for field in ["client", "source", "category", "locale", "purchase_date", "currency"]:
             value = getattr(self, field)
             if not isinstance(value, str) or value.strip() == "":
                 missing.append(field)
