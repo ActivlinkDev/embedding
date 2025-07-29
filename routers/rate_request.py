@@ -1,10 +1,11 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from utils.dependencies import verify_token
 from datetime import datetime
 import os
 import re
+from typing import List, Optional
 
 router = APIRouter(tags=["Rate Request"])
 
@@ -13,6 +14,10 @@ db = client["Activlink"]
 ratings = db["Rating"]
 error_log_collection = db["Error_Log_RateRequest"]
 stripe_payment_collection = db["Stripe_Price_ID"]
+quotes_collection = db["Quotes"]
+error_log_stripe_collection = db["Error_Log_Stripe"]
+
+# --- Models ---
 
 class RateRequest(BaseModel):
     product_id: str = Field(..., example="")
@@ -31,43 +36,41 @@ class RateRequest(BaseModel):
         missing = []
         for field in self.model_fields:
             val = getattr(self, field)
-            if val in ("", None) or (isinstance(val, (int, float)) and val == 0):
-                missing.append(field)
+            if field == "age":
+                if val in ("", None):  # Only blank/None age is missing, 0 is valid
+                    missing.append(field)
+            else:
+                if val in ("", None) or (isinstance(val, (int, float)) and val == 0):
+                    missing.append(field)
         return missing
 
-# Helper: Fuzzy-normalize strings for comparison
+class RateRequestBatch(BaseModel):
+    deviceId: Optional[str] = Field(None, example="abc-123")
+    requests: List[RateRequest]
+
+# --- Utilities (Unchanged) ---
+
 def normalize(s):
     return re.sub(r'\W+', '', (s or '')).strip().lower()
 
-# Find the price factor from the priceFactor list
 def find_price_factor(price_factor_list, price):
     for pf in price_factor_list:
         if pf["priceLow"] <= price <= pf["priceHigh"]:
             return pf["factor"]
     return None
 
-# Helper: round up to the next .49 or .99, but keep as is if already .49 or .99
 def round_price_49_99(value):
-    """
-    Round up to the nearest .49 or .99.
-    If already at .49 or .99, leave as is.
-    """
     cents = round(value % 1, 2)
     whole = int(value)
-    # Already at .49 or .99: leave as is
     if abs(cents - 0.49) < 0.001 or abs(cents - 0.99) < 0.001:
         return round(value, 2)
-    # Round up to .49
     if cents < 0.49:
         return round(whole + 0.49, 2)
-    # Round up to .99
     elif cents < 0.99:
         return round(whole + 0.99, 2)
-    # Just in case, for values >= x.99, round up to (whole + 1.49)
     else:
         return round(whole + 1.49, 2)
 
-# Collect all failed reasons per field for doc match (fuzzy)
 def match_with_reasons(doc, payload):
     reasons = []
 
@@ -79,7 +82,6 @@ def match_with_reasons(doc, payload):
         reasons.append(f"locale '{payload.locale}' not matched in localeFactor")
     if str(payload.poc) not in doc.get("pocFactor", {}):
         reasons.append(f"poc '{payload.poc}' not found in pocFactor")
-
     if not any(normalize(cf.get("device", "")) == normalize(payload.category) for cf in doc.get("categoryFactor", [])):
         reasons.append(f"category '{payload.category}' not matched in categoryFactor")
     if str(payload.age) not in doc.get("ageFactor", {}):
@@ -96,105 +98,158 @@ def match_with_reasons(doc, payload):
 
     return len(reasons) == 0, reasons
 
+def extract_lang_from_locale(locale: str) -> str:
+    """
+    Extracts the 2-letter language code from a locale string like 'en_US' or 'es-MX' or 'fr'
+    """
+    if not locale:
+        return ""
+    return re.split(r'[_-]', locale)[0].lower()
+
+# --- Endpoint ---
+
 @router.post("/rate_request")
-def rate_request(payload: RateRequest, _: None = Depends(verify_token)):
-    # Validate all fields present and not blank
-    missing = payload.missing_fields()
-    if missing:
-        error = f"Missing or blank required field(s): {', '.join(missing)}"
-        error_log_collection.insert_one({
-            "input": payload.dict(),
-            "error_type": "validation",
-            "error_detail": error,
-            "created_at": datetime.utcnow()
-        })
-        raise HTTPException(status_code=422, detail=error)
+def rate_request(
+    payload: RateRequestBatch,
+    _: None = Depends(verify_token)
+):
+    enriched_results = []
+    device_id = payload.deviceId
 
-    failure_reasons = []
-    matching_doc = None
+    for req in payload.requests:
+        enriched = req.dict()
+        try:
+            # Add lang field based on locale
+            enriched["lang"] = extract_lang_from_locale(req.locale)
 
-    # Only filter by product_id and currency initially (so we can gather field errors)
-    for doc in ratings.find({"currency": payload.currency, "productID": {"$in": [payload.product_id]}}):
-        matched, reasons = match_with_reasons(doc, payload)
-        if matched:
-            matching_doc = doc
-            break
-        else:
-            failure_reasons.append({
-                "doc_id": str(doc["_id"]),
-                "reasons": reasons
-            })
+            # Validate all fields present and not blank (age=0 is now valid)
+            missing = req.missing_fields()
+            if missing:
+                error = f"Missing or blank required field(s): {', '.join(missing)}"
+                error_log_collection.insert_one({
+                    "input": req.dict(),
+                    "error_type": "validation",
+                    "error_detail": error,
+                    "created_at": datetime.utcnow()
+                })
+                enriched["status"] = "error"
+                enriched["error"] = error
+                enriched_results.append(enriched)
+                continue
 
-    if not matching_doc:
-        error = {
-            "message": "No rating config found matching all input fields.",
-            "details": failure_reasons
-        }
-        error_log_collection.insert_one({
-            "input": payload.dict(),
-            "error_type": "not_found",
-            "error_detail": error,
-            "created_at": datetime.utcnow()
-        })
-        raise HTTPException(status_code=404, detail=error)
+            failure_reasons = []
+            matching_doc = None
 
-    # All factors guaranteed to exist in this doc now:
-    base_fee = matching_doc["baseFee"]
-    locale_factor = next(
-        (f["factor"] for f in matching_doc.get("localeFactor", [])
-         if normalize(f["locale"]) == normalize(payload.locale)),
-        None
-    )
-    poc_factor = matching_doc.get("pocFactor", {}).get(str(payload.poc))
-    category_factor = next(
-        (f["factor"] for f in matching_doc.get("categoryFactor", [])
-         if normalize(f["device"]) == normalize(payload.category)),
-        None
-    )
-    age_factor = matching_doc.get("ageFactor", {}).get(str(payload.age))
-    price_factor = find_price_factor(matching_doc.get("priceFactor", []), payload.price)
-    multi_factor = matching_doc.get("multiFactor", {}).get(str(payload.multi_count))
+            # Only filter by product_id and currency initially (so we can gather field errors)
+            for doc in ratings.find({"currency": req.currency, "productID": {"$in": [req.product_id]}}):
+                matched, reasons = match_with_reasons(doc, req)
+                if matched:
+                    matching_doc = doc
+                    break
+                else:
+                    failure_reasons.append({
+                        "doc_id": str(doc["_id"]),
+                        "reasons": reasons
+                    })
 
-    # Calculate rate
-    rate = round(base_fee * locale_factor * poc_factor * category_factor * age_factor * price_factor * multi_factor, 2)
-    rounded_price = round_price_49_99(rate)
+            if not matching_doc:
+                error = {
+                    "message": "No rating config found matching all input fields.",
+                    "details": failure_reasons
+                }
+                error_log_collection.insert_one({
+                    "input": req.dict(),
+                    "error_type": "not_found",
+                    "error_detail": error,
+                    "created_at": datetime.utcnow()
+                })
+                enriched["status"] = "error"
+                enriched["error"] = error
+                enriched_results.append(enriched)
+                continue
 
-    # Stripe price lookup logic
-    mode_map = {
-        "subscription": "recurring",
-        "payment": "one_time"
-    }
-    price_type = mode_map.get(payload.mode.lower(), "one_time")
-    lookup_unit_amount = int(round(rounded_price * 100))
+            base_fee = matching_doc["baseFee"]
+            locale_factor = next(
+                (f["factor"] for f in matching_doc.get("localeFactor", [])
+                 if normalize(f["locale"]) == normalize(req.locale)),
+                None
+            )
+            poc_factor = matching_doc.get("pocFactor", {}).get(str(req.poc))
+            category_factor = next(
+                (f["factor"] for f in matching_doc.get("categoryFactor", [])
+                 if normalize(f["device"]) == normalize(req.category)),
+                None
+            )
+            age_factor = matching_doc.get("ageFactor", {}).get(str(req.age))
+            price_factor = find_price_factor(matching_doc.get("priceFactor", []), req.price)
+            multi_factor = matching_doc.get("multiFactor", {}).get(str(req.multi_count))
 
-    stripe_query = {
-        "currency": payload.currency.lower(),
-        "unit_amount": lookup_unit_amount,
-        "type": price_type,
-        "active": True
-    }
+            rate = round(base_fee * locale_factor * poc_factor * category_factor * age_factor * price_factor * multi_factor, 2)
+            rounded_price = round_price_49_99(rate)
 
-    stripe_price_doc = stripe_payment_collection.find_one(stripe_query)
-    stripe_price_id = stripe_price_doc["id"] if stripe_price_doc else None
-    stripe_price_doc_filtered = {k: v for k, v in stripe_price_doc.items() if k != "_id"} if stripe_price_doc else None
+            # --- Stripe Price ID lookup (commented out as not needed) ---
+            # mode_map = {
+            #     "subscription": "recurring",
+            #     "payment": "one_time"
+            # }
+            # price_type = mode_map.get(req.mode.lower(), "one_time")
+            # lookup_unit_amount = int(round(rounded_price * 100))
+            #
+            # stripe_query = {
+            #     "currency": req.currency.lower(),
+            #     "unit_amount": lookup_unit_amount,
+            #     "type": price_type,
+            #     "active": True
+            # }
+            #
+            # stripe_price_doc = stripe_payment_collection.find_one(stripe_query)
+            # stripe_price_id = stripe_price_doc["id"] if stripe_price_doc else None
+            # stripe_price_doc_filtered = {k: v for k, v in stripe_price_doc.items() if k != "_id"} if stripe_price_doc else None
 
-    return {
-        "input": payload.dict(),
-        "factors": {
-            "base_fee": base_fee,
-            "locale_factor": locale_factor,
-            "poc_factor": poc_factor,
-            "category_factor": category_factor,
-            "age_factor": age_factor,
-            "price_factor": price_factor,
-            "multi_factor": multi_factor
-        },
-        "rate": rate,
-        "rounded_price": rounded_price,
-        "stripe_price_lookup": {
-            "query": stripe_query,
-            "found": bool(stripe_price_doc),
-            "stripe_price_id": stripe_price_id,
-            "stripe_full_doc": stripe_price_doc_filtered
-        }
-    }
+            enriched["status"] = "ok"
+            enriched["factors"] = {
+                "base_fee": base_fee,
+                "locale_factor": locale_factor,
+                "poc_factor": poc_factor,
+                "category_factor": category_factor,
+                "age_factor": age_factor,
+                "price_factor": price_factor,
+                "multi_factor": multi_factor
+            }
+            enriched["rate"] = rate
+            enriched["rounded_price"] = rounded_price
+
+            # enriched["stripe_price_lookup"] = {
+            #     "query": stripe_query,
+            #     "found": bool(stripe_price_doc),
+            #     "stripe_price_id": stripe_price_id,
+            #     "stripe_full_doc": stripe_price_doc_filtered
+            # }
+            #
+            # --- Stripe error log if not found ---
+            # if (
+            #     "stripe_price_lookup" in enriched
+            #     and not enriched["stripe_price_lookup"].get("found", True)
+            # ):
+            #     error_log_stripe_collection.insert_one({
+            #         "request": req.dict(),
+            #         "stripe_query": enriched["stripe_price_lookup"].get("query"),
+            #         "error_type": "stripe_price_not_found",
+            #         "error_detail": "Stripe price not found for this combination",
+            #         "created_at": datetime.utcnow()
+            #     })
+
+        except Exception as e:
+            enriched["status"] = "error"
+            enriched["error"] = str(e)
+
+        enriched_results.append(enriched)
+
+    # Only responses, deviceId, and created_at are stored in the Quotes collection
+    quotes_collection.insert_one({
+        "deviceId": device_id,
+        "responses": enriched_results,
+        "created_at": datetime.utcnow()
+    })
+
+    return enriched_results
