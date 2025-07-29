@@ -9,7 +9,7 @@ load_dotenv()
 
 router = APIRouter(
     prefix="/scale",
-    tags=["SERP Lookup"]
+    tags=["Enrich"]
 )
 
 mongo_client = MongoClient(os.getenv("MONGO_URI"))

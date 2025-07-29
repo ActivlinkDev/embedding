@@ -11,7 +11,7 @@ from bson import ObjectId
 from dotenv import load_dotenv
 
 from utils.dependencies import verify_token
-from routers.create_master_sku import create_master_sku, MasterSKURequest
+from .create_master_sku import create_master_sku, MasterSKURequest
 
 # === QR CODE SUPPORT ===
 import qrcode

@@ -5,7 +5,7 @@ from bson import ObjectId
 import os
 from dotenv import load_dotenv
 
-from utils.dependencies import verify_token  # ✅ Match your existing auth pattern
+from utils.dependencies import verify_token
 
 load_dotenv()
 
@@ -27,7 +27,7 @@ def lookup_sku(
     GTIN: Optional[str] = None,
     SKU: Optional[str] = None,
     id: Optional[str] = None,
-    _: None = Depends(verify_token)  # ✅ Enforces token authentication
+    _: None = Depends(verify_token)
 ):
     base_query = {
         "Locale_Specific_Data": {

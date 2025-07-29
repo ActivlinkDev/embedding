@@ -8,17 +8,8 @@ from routers import (
     match,
     categories,
     client_lookup,
-    lookup_custom_sku,
-    lookup_master_sku,
     lookup_locale_params,
-    lookup_custom_sku_all,
-    create_custom_sku,
-    lookup_master_sku_all,
-    ice_lookup,
-    go_upc,
-    scale_lookup,
     ai_extract_and_match,
-    create_master_sku,
     product_assignment,
     rate_request,
     generate_payment_link,
@@ -30,7 +21,19 @@ from routers import (
     device_register,
     assign_product_by_device_id,
     assign_device_collection,
+    generate_payment_links_from_quote,
+    props_lookup,
+    stripe_webook,
 )
+from routers.enrich import (ice_lookup,
+    go_upc,
+    scale_lookup,)
+
+from routers.sku import (lookup_custom_sku,
+    lookup_master_sku,lookup_custom_sku_all,
+    create_custom_sku,
+    lookup_master_sku_all,create_master_sku,)
+
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -66,3 +69,6 @@ app.include_router(create_customer.router)
 app.include_router(device_register.router)
 app.include_router(assign_product_by_device_id.router)
 app.include_router(assign_device_collection.router)
+app.include_router(generate_payment_links_from_quote.router)
+app.include_router(props_lookup.router)
+app.include_router(stripe_webook.router)

@@ -98,6 +98,14 @@ def match_with_reasons(doc, payload):
 
     return len(reasons) == 0, reasons
 
+def extract_lang_from_locale(locale: str) -> str:
+    """
+    Extracts the 2-letter language code from a locale string like 'en_US' or 'es-MX' or 'fr'
+    """
+    if not locale:
+        return ""
+    return re.split(r'[_-]', locale)[0].lower()
+
 # --- Endpoint ---
 
 @router.post("/rate_request")
@@ -111,6 +119,9 @@ def rate_request(
     for req in payload.requests:
         enriched = req.dict()
         try:
+            # Add lang field based on locale
+            enriched["lang"] = extract_lang_from_locale(req.locale)
+
             # Validate all fields present and not blank (age=0 is now valid)
             missing = req.missing_fields()
             if missing:
@@ -176,23 +187,24 @@ def rate_request(
             rate = round(base_fee * locale_factor * poc_factor * category_factor * age_factor * price_factor * multi_factor, 2)
             rounded_price = round_price_49_99(rate)
 
-            mode_map = {
-                "subscription": "recurring",
-                "payment": "one_time"
-            }
-            price_type = mode_map.get(req.mode.lower(), "one_time")
-            lookup_unit_amount = int(round(rounded_price * 100))
-
-            stripe_query = {
-                "currency": req.currency.lower(),
-                "unit_amount": lookup_unit_amount,
-                "type": price_type,
-                "active": True
-            }
-
-            stripe_price_doc = stripe_payment_collection.find_one(stripe_query)
-            stripe_price_id = stripe_price_doc["id"] if stripe_price_doc else None
-            stripe_price_doc_filtered = {k: v for k, v in stripe_price_doc.items() if k != "_id"} if stripe_price_doc else None
+            # --- Stripe Price ID lookup (commented out as not needed) ---
+            # mode_map = {
+            #     "subscription": "recurring",
+            #     "payment": "one_time"
+            # }
+            # price_type = mode_map.get(req.mode.lower(), "one_time")
+            # lookup_unit_amount = int(round(rounded_price * 100))
+            #
+            # stripe_query = {
+            #     "currency": req.currency.lower(),
+            #     "unit_amount": lookup_unit_amount,
+            #     "type": price_type,
+            #     "active": True
+            # }
+            #
+            # stripe_price_doc = stripe_payment_collection.find_one(stripe_query)
+            # stripe_price_id = stripe_price_doc["id"] if stripe_price_doc else None
+            # stripe_price_doc_filtered = {k: v for k, v in stripe_price_doc.items() if k != "_id"} if stripe_price_doc else None
 
             enriched["status"] = "ok"
             enriched["factors"] = {
@@ -206,25 +218,28 @@ def rate_request(
             }
             enriched["rate"] = rate
             enriched["rounded_price"] = rounded_price
-            enriched["stripe_price_lookup"] = {
-                "query": stripe_query,
-                "found": bool(stripe_price_doc),
-                "stripe_price_id": stripe_price_id,
-                "stripe_full_doc": stripe_price_doc_filtered
-            }
+            # Add rounded_price in pence (or smallest currency unit)
+            enriched["rounded_price_pence"] = int(round(rounded_price * 100))
 
+            # enriched["stripe_price_lookup"] = {
+            #     "query": stripe_query,
+            #     "found": bool(stripe_price_doc),
+            #     "stripe_price_id": stripe_price_id,
+            #     "stripe_full_doc": stripe_price_doc_filtered
+            # }
+            #
             # --- Stripe error log if not found ---
-            if (
-                "stripe_price_lookup" in enriched
-                and not enriched["stripe_price_lookup"].get("found", True)
-            ):
-                error_log_stripe_collection.insert_one({
-                    "request": req.dict(),
-                    "stripe_query": enriched["stripe_price_lookup"].get("query"),
-                    "error_type": "stripe_price_not_found",
-                    "error_detail": "Stripe price not found for this combination",
-                    "created_at": datetime.utcnow()
-                })
+            # if (
+            #     "stripe_price_lookup" in enriched
+            #     and not enriched["stripe_price_lookup"].get("found", True)
+            # ):
+            #     error_log_stripe_collection.insert_one({
+            #         "request": req.dict(),
+            #         "stripe_query": enriched["stripe_price_lookup"].get("query"),
+            #         "error_type": "stripe_price_not_found",
+            #         "error_detail": "Stripe price not found for this combination",
+            #         "created_at": datetime.utcnow()
+            #     })
 
         except Exception as e:
             enriched["status"] = "error"

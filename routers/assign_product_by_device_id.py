@@ -12,6 +12,7 @@ router = APIRouter(tags=["Device Product Assignment"])
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
 devices_collection = db["Devices"]
+error_log_collection = db["Error_Log_ProductAssignment"]
 
 @router.get("/assign_product_for_device/{device_id}")
 def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
@@ -85,6 +86,42 @@ def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
                 "mode": mode
             }
             product_list.append(product_entry)
+
+    # === Log error and raise if no products found, include parameter(s) likely causing it ===
+    if not product_list:
+        # Find the likely failing parameters
+        failing_params = []
+        input_dict = req_payload.dict()
+        check_params = ["client", "source", "category", "price", "locale", "gtee", "currency"]  # fields to check individually
+        for key in check_params:
+            # Try with this parameter blanked/neutral
+            test_input = input_dict.copy()
+            if isinstance(test_input[key], (int, float)):
+                test_input[key] = 0
+            else:
+                test_input[key] = ""
+            # Always keep purchase_date, only blank others
+            test_payload = ProductAssignmentRequest(**test_input)
+            test_result = product_assignment(test_payload)
+            has_products = any(
+                prod.get("POC", {}).get("durationMonths")
+                for prod in test_result.get("products", [])
+            )
+            if has_products:
+                failing_params.append(key)
+
+        error_message = "No products found for this device."
+        if failing_params:
+            error_message += " Likely problematic parameter(s): " + ", ".join(failing_params)
+        log_entry = {
+            "device_id": device_id,
+            "inputs": req_payload.dict(),
+            "timestamp": datetime.utcnow().isoformat(),
+            "message": error_message,
+            "failing_params": failing_params
+        }
+        error_log_collection.insert_one(log_entry)
+        raise HTTPException(status_code=404, detail=error_message)
 
     return {
         "Inputs": req_payload.dict(),

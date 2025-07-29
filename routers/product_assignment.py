@@ -46,12 +46,12 @@ def criteria_failure_reasons(crit, locale, gtee, age_in_months, price, currency)
 def find_strict_assignment(payload, age_in_months):
     """
     Find a doc where at least one criteria matches all fields.
-    Return (doc_id, age_in_months, products) or None.
-    Also returns debug_failed reasons.
+    Return (doc_id, products, debug_failed) or None.
     """
     docs = product_assignments.find({
         "activeClient": {"$elemMatch": {"client": payload.client, "source": payload.source}},
-        "categoryGroup": {"$in": [payload.category]}
+        "categoryGroup": {"$in": [payload.category]},
+        "status": "active"   # <-- Only active assignments
     })
     debug_failed = []
     for doc in docs:

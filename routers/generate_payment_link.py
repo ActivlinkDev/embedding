@@ -6,7 +6,7 @@ import stripe
 import os
 import requests
 
-router = APIRouter(tags=["Stripe Checkout"])
+router = APIRouter(tags=["Payment Links"])
 
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 TINYURL_API_KEY = os.getenv("TINYURL_API_KEY")

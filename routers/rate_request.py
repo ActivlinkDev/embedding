@@ -187,25 +187,6 @@ def rate_request(
             rate = round(base_fee * locale_factor * poc_factor * category_factor * age_factor * price_factor * multi_factor, 2)
             rounded_price = round_price_49_99(rate)
 
-            # --- Stripe Price ID lookup (commented out as not needed) ---
-            # mode_map = {
-            #     "subscription": "recurring",
-            #     "payment": "one_time"
-            # }
-            # price_type = mode_map.get(req.mode.lower(), "one_time")
-            # lookup_unit_amount = int(round(rounded_price * 100))
-            #
-            # stripe_query = {
-            #     "currency": req.currency.lower(),
-            #     "unit_amount": lookup_unit_amount,
-            #     "type": price_type,
-            #     "active": True
-            # }
-            #
-            # stripe_price_doc = stripe_payment_collection.find_one(stripe_query)
-            # stripe_price_id = stripe_price_doc["id"] if stripe_price_doc else None
-            # stripe_price_doc_filtered = {k: v for k, v in stripe_price_doc.items() if k != "_id"} if stripe_price_doc else None
-
             enriched["status"] = "ok"
             enriched["factors"] = {
                 "base_fee": base_fee,
@@ -218,26 +199,7 @@ def rate_request(
             }
             enriched["rate"] = rate
             enriched["rounded_price"] = rounded_price
-
-            # enriched["stripe_price_lookup"] = {
-            #     "query": stripe_query,
-            #     "found": bool(stripe_price_doc),
-            #     "stripe_price_id": stripe_price_id,
-            #     "stripe_full_doc": stripe_price_doc_filtered
-            # }
-            #
-            # --- Stripe error log if not found ---
-            # if (
-            #     "stripe_price_lookup" in enriched
-            #     and not enriched["stripe_price_lookup"].get("found", True)
-            # ):
-            #     error_log_stripe_collection.insert_one({
-            #         "request": req.dict(),
-            #         "stripe_query": enriched["stripe_price_lookup"].get("query"),
-            #         "error_type": "stripe_price_not_found",
-            #         "error_detail": "Stripe price not found for this combination",
-            #         "created_at": datetime.utcnow()
-            #     })
+            enriched["rounded_price_pence"] = int(round(rounded_price * 100))
 
         except Exception as e:
             enriched["status"] = "error"
@@ -245,11 +207,15 @@ def rate_request(
 
         enriched_results.append(enriched)
 
-    # Only responses, deviceId, and created_at are stored in the Quotes collection
-    quotes_collection.insert_one({
+    # Store in Quotes collection and return the docId as "quote_id"
+    quote_insert = quotes_collection.insert_one({
         "deviceId": device_id,
         "responses": enriched_results,
         "created_at": datetime.utcnow()
     })
+    created_quote_id = str(quote_insert.inserted_id)
 
-    return enriched_results
+    return {
+        "quote_id": created_quote_id,
+        "responses": enriched_results
+    }
