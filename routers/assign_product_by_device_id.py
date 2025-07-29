@@ -25,17 +25,29 @@ def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
     if not device:
         raise HTTPException(status_code=404, detail="Device not found.")
 
-    # 2. Extract required parameters
+    # 2. Extract required parameters with robust checks and logging
     try:
-        client_ = device["client"]
-        source = device["source"]
+        client_ = device.get("client")
+        print(f"DEBUG: Extracted client from device: {repr(client_)}")
+        if not client_ or not client_.strip():
+            print(f"ERROR: Device missing or blank client! Device: {device}")
+            raise HTTPException(status_code=400, detail="Device 'client' is missing or blank.")
+
+        source = device.get("source")
+        if not source or not source.strip():
+            raise HTTPException(status_code=400, detail="Device 'source' is missing or blank.")
+
         identifiers = device.get("identifiers", {})
         category = identifiers.get("category") or ""
         price = device.get("registrationParameters", {}).get("price") or 0
-        locale = device["locale"]
+        locale = device.get("locale")
+        if not locale or not locale.strip():
+            raise HTTPException(status_code=400, detail="Device 'locale' is missing or blank.")
+
         purchase_date = device.get("registrationParameters", {}).get("purchaseDate")
         if not purchase_date:
             purchase_date = datetime.utcnow().strftime("%Y-%m-%d")
+
         gtee = (
             identifiers.get("gteeLabour")
             or identifiers.get("gteeParts")
@@ -45,7 +57,11 @@ def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
             gtee = int(gtee)
         except Exception:
             gtee = 0
-        currency = device.get("registrationParameters", {})["currency"]
+
+        currency = device.get("registrationParameters", {}).get("currency")
+        if not currency or not currency.strip():
+            raise HTTPException(status_code=400, detail="Device 'currency' is missing or blank.")
+
     except KeyError as e:
         raise HTTPException(status_code=400, detail=f"Missing required field: {str(e)}")
     except Exception as e:
@@ -89,33 +105,47 @@ def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
 
     # === Log error and raise if no products found, include parameter(s) likely causing it ===
     if not product_list:
-        # Find the likely failing parameters
+        parameter_checks = []
         failing_params = []
         input_dict = req_payload.dict()
-        check_params = ["client", "source", "category", "price", "locale", "gtee", "currency"]  # fields to check individually
+        check_params = ["client", "source", "category", "price", "locale", "gtee", "currency"]
         for key in check_params:
-            # Try with this parameter blanked/neutral
             test_input = input_dict.copy()
             if isinstance(test_input[key], (int, float)):
                 test_input[key] = 0
             else:
                 test_input[key] = ""
-            # Always keep purchase_date, only blank others
-            test_payload = ProductAssignmentRequest(**test_input)
-            test_result = product_assignment(test_payload)
-            has_products = any(
-                prod.get("POC", {}).get("durationMonths")
-                for prod in test_result.get("products", [])
-            )
-            if has_products:
-                failing_params.append(key)
+            try:
+                test_payload = ProductAssignmentRequest(**test_input)
+                test_result = product_assignment(test_payload)
+                has_products = any(
+                    prod.get("POC", {}).get("durationMonths")
+                    for prod in test_result.get("products", [])
+                )
+                result = "products_found" if has_products else "no_products"
+                parameter_checks.append({
+                    "parameter": key,
+                    "test_value": test_input[key],
+                    "result": result,
+                    "products": test_result.get("products", [])
+                })
+                if has_products:
+                    failing_params.append(key)
+            except Exception as e:
+                parameter_checks.append({
+                    "parameter": key,
+                    "test_value": test_input[key],
+                    "result": "validation_error",
+                    "validation_error": str(e)
+                })
 
         error_message = "No products found for this device."
         if failing_params:
             error_message += " Likely problematic parameter(s): " + ", ".join(failing_params)
         log_entry = {
             "device_id": device_id,
-            "inputs": req_payload.dict(),
+            "original_inputs": req_payload.dict(),
+            "parameter_checks": parameter_checks,
             "timestamp": datetime.utcnow().isoformat(),
             "message": error_message,
             "failing_params": failing_params

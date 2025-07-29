@@ -112,17 +112,14 @@ class ProductAssignmentRequest(BaseModel):
 
     def missing_fields(self):
         missing = []
-        print("DEBUG: missing_fields() running on:", self.dict())
         for field in ["client", "source", "category", "locale", "purchase_date", "currency"]:
             value = getattr(self, field)
-            print(f"  Checking field '{field}': value={repr(value)}")
             if not isinstance(value, str) or value.strip() == "":
                 missing.append(field)
         if self.price is None or (isinstance(self.price, (int, float)) and self.price == 0):
             missing.append("price")
         if self.gtee is None or (isinstance(self.gtee, int) and self.gtee == 0):
             missing.append("gtee")
-        print(f"DEBUG: Fields considered missing: {missing}")
         return missing
 
 # ------------------------ Endpoint --------------------------
@@ -130,18 +127,18 @@ class ProductAssignmentRequest(BaseModel):
 @router.post("/product_assignment")
 def product_assignment(payload: ProductAssignmentRequest, _: None = Depends(verify_token)):
     # Validate required fields
-    debug_print("\n==== PRODUCT ASSIGNMENT DEBUG ====")
-    debug_print("INPUT PAYLOAD:", payload.dict())
     missing = payload.missing_fields()
     if missing:
         log_and_raise_error(
             "validation",
-            f"The following required field(s) are missing or blank: {', '.join(missing)}",
+            f"Missing or blank required field(s): {', '.join(missing)}",
             payload,
             status=422
         )
 
     age_in_months = calculate_age_in_months(payload.purchase_date)
+    debug_print("\n==== PRODUCT ASSIGNMENT DEBUG ====")
+    debug_print("INPUT PAYLOAD:", payload.dict())
     debug_print("AGE IN MONTHS:", age_in_months)
 
     doc_id, products, debug_failed = find_strict_assignment(payload, age_in_months)

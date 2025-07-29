@@ -134,13 +134,15 @@ def get_first_non_blank(*args):
             return val
     return ""
 
+# --------- Fixed here: Accepts missing or zero as missing ---------
 def price_is_missing(val):
     try:
-        if val is None or str(val).strip() == "" or str(val).strip().lower() != "string":
+        if val is None or str(val).strip() == "" or str(val).strip().lower() == "string":
             return True
         return float(val) == 0
     except Exception:
         return True
+# ------------------------------------------------------------
 
 @router.post("/device-register")
 def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_token)):
@@ -314,13 +316,18 @@ def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_tok
             "imei": unique.imei if unique.imei and unique.imei != "string" else ""
         }
 
+        # ---- PRICE FALLBACK LOGIC ----
         if price_is_missing(unique.price):
-            price = lsd_custom.get("MSRP") if lsd_custom and lsd_custom.get("MSRP") is not None else None
-            if price_is_missing(price):
-                price = lsd_master.get("Price") if lsd_master and lsd_master.get("Price") is not None else None
-            price = float(price) if not price_is_missing(price) else 0
+            price = None
+            if lsd_custom and not price_is_missing(lsd_custom.get("MSRP")):
+                price = float(lsd_custom.get("MSRP"))
+            elif lsd_master and not price_is_missing(lsd_master.get("Price")):
+                price = float(lsd_master.get("Price"))
+            else:
+                price = 0
         else:
             price = float(unique.price)
+        # -----------------------------
 
         registration_parameters = {
             "purchaseDate": unique.purchase_date or "",
