@@ -106,6 +106,35 @@ def extract_lang_from_locale(locale: str) -> str:
         return ""
     return re.split(r'[_-]', locale)[0].lower()
 
+# --- Grouping Utility ---
+
+def group_responses(responses):
+    groups = {}
+    group_keys = [
+        "product_id", "client", "currency", "locale", "category", "age",
+        "price", "multi_count", "source", "lang"
+    ]
+    for resp in responses:
+        group_key = tuple(resp.get(k) for k in group_keys)
+        if group_key not in groups:
+            group_obj = {k: resp.get(k) for k in group_keys}
+            group_obj["options"] = []
+            groups[group_key] = group_obj
+        option = {
+            "status": resp.get("status"),
+            "poc": resp.get("poc"),
+            "mode": resp.get("mode"),
+            "rate": resp.get("rate"),
+            "rounded_price": resp.get("rounded_price"),
+            "rounded_price_pence": resp.get("rounded_price_pence"),
+            "factors": resp.get("factors"),
+            "error": resp.get("error") if "error" in resp else None
+        }
+        # Remove None fields
+        option = {k: v for k, v in option.items() if v is not None}
+        groups[group_key]["options"].append(option)
+    return list(groups.values())
+
 # --- Endpoint ---
 
 @router.post("/rate_request")
@@ -207,15 +236,18 @@ def rate_request(
 
         enriched_results.append(enriched)
 
-    # Store in Quotes collection and return the docId as "quote_id"
+    # --- Group responses before storing/returning ---
+    grouped = group_responses(enriched_results)
+
+    # Store grouped responses in Quotes collection
     quote_insert = quotes_collection.insert_one({
         "deviceId": device_id,
-        "responses": enriched_results,
+        "responses": grouped,
         "created_at": datetime.utcnow()
     })
     created_quote_id = str(quote_insert.inserted_id)
 
     return {
         "quote_id": created_quote_id,
-        "responses": enriched_results
+        "responses": grouped
     }
