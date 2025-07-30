@@ -153,7 +153,11 @@ def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
         error_log_collection.insert_one(log_entry)
         raise HTTPException(status_code=404, detail=error_message)
 
+    # === Add distinct product IDs array to response ===
+    distinct_product_ids = list({prod["product_id"] for prod in product_list})
+
     return {
         "Inputs": req_payload.dict(),
-        "Products": product_list
+        "Products": product_list,
+        "DistinctProductIds": distinct_product_ids
     }
