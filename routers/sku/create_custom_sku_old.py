@@ -5,7 +5,6 @@ from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timezone
 import os
-import time
 
 from pymongo import MongoClient
 from bson import ObjectId
@@ -70,6 +69,7 @@ def build_locale_data(
 
     d = {
         "locale": data.Locale,
+        # Title: falls back to MasterSKU.Locale_Specific_Data.Input_Title if input Title blank/None
         "Title": fallback(
             locale_details.Title, mastersku_locale.get("Input_Title") if mastersku_locale else ""
         ),
@@ -132,15 +132,6 @@ def build_existing_query(client_name, data):
     if gtin_cond: or_conditions.append(gtin_cond)
     if make_model_cond: or_conditions.append(make_model_cond)
     return {"$or": or_conditions}
-
-def wait_for_mastersku(mastersku_collection, query, locale, timeout=7, poll_interval=0.7):
-    start_time = time.time()
-    while (time.time() - start_time) < timeout:
-        mastersku = mastersku_collection.find_one(query)
-        if mastersku and locale_exists(mastersku.get("Locale_Specific_Data", []), locale):
-            return mastersku
-        time.sleep(poll_interval)
-    return None
 
 # ==== END HELPERS ====
 
@@ -222,7 +213,7 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                 "existing": existing
             }
         else:
-            # Only add the locale to CustomSKU if MasterSKU has it, else trigger creation and poll
+            # Only add the locale to CustomSKU if MasterSKU has it
             mastersku_query = None
             if data.GTIN and data.GTIN.strip():
                 mastersku_query = {"GTIN": {"$in": [data.GTIN]}}
@@ -237,7 +228,7 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
             ) if mastersku else {}
 
             if not mastersku_locale_data:
-                # Locale does not exist in MasterSKU, create and poll
+                # Locale does not exist in MasterSKU
                 master_data = MasterSKURequest(
                     Make=data.Make,
                     Model=data.Model,
@@ -246,19 +237,16 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                     Category=data.Category
                 )
                 create_master_sku(master_data)
-                mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
-                mastersku_locale_data = find_locale_data(
-                    mastersku.get("Locale_Specific_Data", []), data.Locale
-                ) if mastersku else {}
-                if not mastersku_locale_data:
-                    return {
-                        "message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."
-                    }
+                return {
+                    "message": "Master SKU in creation - please recreate CustomSKU in a moment"
+                }
+
             # Locale exists in MasterSKU - proceed to add to CustomSKU
             locale_details = data.Locale_Details or LocaleDetails()
             locale_data = build_locale_data(
                 data, locale_details, locale_info, client_info, mastersku_locale=mastersku_locale_data
             )
+
             customsku_collection.update_one(
                 {"_id": existing["_id"]},
                 {"$push": {"Locale_Specific_Data": locale_data}}
@@ -302,11 +290,13 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                 locale_data = build_locale_data(
                     data, locale_details, locale_info, client_info, mastersku_locale=mastersku_locale_data
                 )
+
                 # Set root Category: prefer input, else MasterSKU root, else ""
                 category_root = (
                     data.Category if data.Category not in (None, "")
                     else mastersku.get("Category", "")
                 )
+
                 doc = {
                     "Client": client_name,
                     "Client_Key": data.ClientKey,
@@ -324,7 +314,7 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                 doc["qr_code_image"] = f"data:image/png;base64,{qr_code_base64}"
                 return doc
             else:
-                # Call master sku creation to add this locale, and poll
+                # Call master sku creation to add this locale
                 master_data = MasterSKURequest(
                     Make=data.Make,
                     Model=data.Model,
@@ -333,42 +323,11 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                     Category=data.Category
                 )
                 create_master_sku(master_data)
-                mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
-                if not mastersku:
-                    return {
-                        "message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."
-                    }
-                # After polling, proceed to CustomSKU creation
-                mastersku_id = str(mastersku["_id"])
-                identifiers = build_identifiers(mastersku, data.SKU)
-                locale_details = data.Locale_Details or LocaleDetails()
-                mastersku_locale_data = find_locale_data(
-                    mastersku.get("Locale_Specific_Data", []), data.Locale
-                )
-                locale_data = build_locale_data(
-                    data, locale_details, locale_info, client_info, mastersku_locale=mastersku_locale_data
-                )
-                category_root = (
-                    data.Category if data.Category not in (None, "")
-                    else mastersku.get("Category", "")
-                )
-                doc = {
-                    "Client": client_name,
-                    "Client_Key": data.ClientKey,
-                    "Sources": [data.Source],
-                    "Identifiers": identifiers,
-                    "MasterSKU": mastersku_id,
-                    "Category": category_root,
-                    "Locale_Specific_Data": [locale_data],
+                return {
+                    "message": "Master SKU in creation - please recreate CustomSKU in a moment"
                 }
-                result = customsku_collection.insert_one(doc)
-                doc["_id"] = str(result.inserted_id)
-                qr_url = f"http://www.activlink.io/qr?{doc['_id']}"
-                qr_code_base64 = generate_qr_code_base64(qr_url)
-                doc["qr_code_image"] = f"data:image/png;base64,{qr_code_base64}"
-                return doc
         else:
-            # No master SKU found, create master SKU and poll
+            # No master SKU found, create master SKU
             master_data = MasterSKURequest(
                 Make=data.Make,
                 Model=data.Model,
@@ -377,40 +336,9 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                 Category=data.Category
             )
             create_master_sku(master_data)
-            mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
-            if not mastersku:
-                return {
-                    "message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."
-                }
-            # After polling, proceed to CustomSKU creation
-            mastersku_id = str(mastersku["_id"])
-            identifiers = build_identifiers(mastersku, data.SKU)
-            locale_details = data.Locale_Details or LocaleDetails()
-            mastersku_locale_data = find_locale_data(
-                mastersku.get("Locale_Specific_Data", []), data.Locale
-            )
-            locale_data = build_locale_data(
-                data, locale_details, locale_info, client_info, mastersku_locale=mastersku_locale_data
-            )
-            category_root = (
-                data.Category if data.Category not in (None, "")
-                else mastersku.get("Category", "")
-            )
-            doc = {
-                "Client": client_name,
-                "Client_Key": data.ClientKey,
-                "Sources": [data.Source],
-                "Identifiers": identifiers,
-                "MasterSKU": mastersku_id,
-                "Category": category_root,
-                "Locale_Specific_Data": [locale_data],
+            return {
+                "message": "Master SKU in creation - please recreate CustomSKU in a moment"
             }
-            result = customsku_collection.insert_one(doc)
-            doc["_id"] = str(result.inserted_id)
-            qr_url = f"http://www.activlink.io/qr?{doc['_id']}"
-            qr_code_base64 = generate_qr_code_base64(qr_url)
-            doc["qr_code_image"] = f"data:image/png;base64,{qr_code_base64}"
-            return doc
 
     return {
         "message": "No GTIN or Make/Model supplied for MasterSKU matching, unable to proceed."
