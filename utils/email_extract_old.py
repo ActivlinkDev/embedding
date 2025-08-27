@@ -1,14 +1,21 @@
 # utils/email_extract.py
+"""
+Helpers for email ingestion:
+- html_to_text: converts HTML emails to plain text
+- extract_text_and_attachments_from_email_message: gets text + attachments
+- extract_structured_fields_strict_json: uses GPT to extract JSON fields
+  (now includes 'Locale' in ll_CC format and normalizes it)
+"""
+
 import re, json, base64
 from typing import Tuple, Dict, Any, List, Optional
 from bs4 import BeautifulSoup
 from openai import OpenAI
-import phonenumbers
-from phonenumbers import PhoneNumberFormat
 
+# Initialize OpenAI client (uses OPENAI_API_KEY from env)
 client = OpenAI()
 
-# --- HTML to Text ---
+# --- Convert HTML to plain text ---
 def html_to_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all(["br", "p", "div"]):
@@ -16,9 +23,11 @@ def html_to_text(html: str) -> str:
     text = soup.get_text("\n")
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
-# --- Extract text and attachments from email ---
+# --- Extract text + attachments from MIME message ---
 def extract_text_and_attachments_from_email_message(msg) -> Tuple[str, List[Dict[str, Any]], List[str]]:
-    warnings, text_parts, attachments = [], [], []
+    warnings: List[str] = []
+    text_parts: List[str] = []
+    attachments: List[Dict[str, Any]] = []
 
     try:
         if msg.is_multipart():
@@ -58,13 +67,12 @@ def extract_text_and_attachments_from_email_message(msg) -> Tuple[str, List[Dict
     text = "\n\n".join(p for p in text_parts if p).strip()
     return text, attachments, warnings
 
-# --- Prompt for GPT ---
+# --- Prompt template for GPT extraction (with header hints) ---
 STRICT_PROMPT_TEMPLATE = """Extract the following details from the order confirmation email and return strict JSON.
 
 Top-level fields:
 Customer Name
 Customer Email
-Customer Phone
 Customer Address -> object with:
   Street
   City
@@ -104,135 +112,140 @@ Email text:
 {email_text}
 """
 
-# --- ASIN enrichment ---
-def _maybe_enrich_retailer_ref(email_text: str, data: dict) -> None:
-    m = re.search(r'(?:dp|gp/product)/([A-Z0-9]{10})', email_text or "")
-    asin = m.group(1) if m else None
-    if not asin:
-        return
-    items = data.get("Items") or []
-    for item in items:
-        if isinstance(item, dict) and not item.get("RetailerReference"):
-            item["RetailerReference"] = asin
+# Pattern to find an Amazon ASIN in typical order links
+_ASIN_RE = re.compile(r'(?:dp|gp/product)/([A-Z0-9]{10})')
 
-# --- Normalize Purchase Price ---
+def _maybe_enrich_retailer_ref(email_text: str, data: dict) -> None:
+    """If retailer reference is missing, fill with ASIN from links when present."""
+    try:
+        m = _ASIN_RE.search(email_text or "")
+        asin = m.group(1) if m else None
+        if not asin or not data or not isinstance(data, dict):
+            return
+        items = data.get("Items") or []
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if isinstance(item, dict):
+                rr = item.get("RetailerReference")
+                if rr in (None, "", "null") and asin:
+                    item["RetailerReference"] = asin
+    except Exception:
+        # Soft-fail; enrichment is optional.
+        pass
+
 def _normalize_purchase_prices(data: dict, warnings: List[str]) -> None:
+    """Ensure Purchase Price fields are numeric and currency codes are standardized, tolerate weird keys."""
     try:
         items = data.get("Items", [])
-        for item in items:
+        if not isinstance(items, list):
+            return
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
             pp = item.get("Purchase Price")
             if isinstance(pp, dict):
-                try:
-                    amt = str(pp.get("Amount", "")).replace("£", "").strip()
-                    pp["Amount"] = float(amt)
-                except Exception:
-                    warnings.append(f"Could not parse amount: {pp.get('Amount')}")
-                    pp["Amount"] = None
-                pp["Currency"] = str(pp.get("Currency", "")).upper()[:3] if pp.get("Currency") else None
-    except Exception as e:
-        warnings.append(f"Price normalization error: {e}")
+                # Debug log raw keys
+                print(f"[DEBUG] Item {idx} Purchase Price keys before normalize:", list(pp.keys()))
+                # Fuzzy key matching
+                amt_key = next((k for k in pp.keys() if "amount" in k.lower()), None)
+                cur_key = next((k for k in pp.keys() if "curr" in k.lower()), None)
 
-# --- Normalize Locale to ll_CC ---
+                if amt_key:
+                    amt = pp.get(amt_key)
+                    try:
+                        amt_clean = str(amt).replace("£", "").strip()
+                        pp[amt_key] = float(amt_clean)
+                    except Exception:
+                        warnings.append(f"Failed to normalize Amount '{amt}'")
+                        pp[amt_key] = None
+
+                if cur_key:
+                    cur = pp.get(cur_key)
+                    if cur:
+                        pp[cur_key] = str(cur).upper()
+    except Exception as e:
+        warnings.append(f"Normalization error: {e}")
+
+_LOCALE_RE = re.compile(r"^\s*([A-Za-z]{2})[-_]?([A-Za-z]{2})\s*$")
+
 def _normalize_locale(data: dict, warnings: List[str]) -> None:
+    """
+    Normalize Locale to ll_CC.
+    Accepts variants like 'EN-gb', 'fr-fr', 'pt_BR' and coerces to 'en_GB', 'fr_FR', 'pt_BR'.
+    If missing or invalid, leave as null.
+    """
     try:
-        val = data.get("Locale")
-        if isinstance(val, str) and re.match(r"^[a-z]{2}_[A-Z]{2}$", val):
-            return  # already ok
-        m = re.match(r"^([a-zA-Z]{2})[-_]?([a-zA-Z]{2})$", str(val))
-        if m:
-            ll, cc = m.group(1).lower(), m.group(2).upper()
-            data["Locale"] = f"{ll}_{cc}"
-        else:
+        locale_val = data.get("Locale")
+        if not locale_val:
+            return
+        if not isinstance(locale_val, str):
+            warnings.append(f"Locale not a string: {locale_val}")
             data["Locale"] = None
+            return
+        m = _LOCALE_RE.match(locale_val)
+        if not m:
+            # Try to handle full language/country names e.g. "English (United Kingdom)" from model
+            # Leave as-is but warn, then null it to avoid downstream issues.
+            warnings.append(f"Unrecognized Locale format '{locale_val}', expected ll_CC")
+            data["Locale"] = None
+            return
+        lang, country = m.group(1), m.group(2)
+        data["Locale"] = f"{lang.lower()}_{country.upper()}"
     except Exception as e:
         warnings.append(f"Locale normalization error: {e}")
         data["Locale"] = None
 
-# --- Country name → ISO ---
-_COUNTRY_HINTS = {
-    "united kingdom": "GB", "uk": "GB", "england": "GB",
-    "united states": "US", "usa": "US",
-    "france": "FR", "germany": "DE", "spain": "ES", "italy": "IT", "portugal": "PT",
-    "ireland": "IE", "netherlands": "NL", "croatia": "HR", "canada": "CA"
-}
-
-def _infer_region_from_data(data: dict) -> Optional[str]:
-    loc = data.get("Locale")
-    if isinstance(loc, str) and len(loc) == 5 and loc[2] == "_":
-        return loc.split("_")[1]
-    country = ((data.get("Customer Address") or {}).get("Country") or "").lower()
-    return _COUNTRY_HINTS.get(country)
-
-# --- Scan text for best phone number in E.164 ---
-def _extract_best_e164_from_text(text: str, region_hint: Optional[str]) -> Optional[str]:
-    try:
-        for match in phonenumbers.PhoneNumberMatcher(text, region_hint):
-            num = match.number
-            if phonenumbers.is_valid_number(num):
-                return phonenumbers.format_number(num, PhoneNumberFormat.E164)
-    except Exception:
-        pass
-    return None
-
-# --- Normalize/Extract E.164 phone number into "Customer Phone" ---
-def _normalize_customer_phone(data: dict, email_text: str, warnings: List[str]) -> None:
-    try:
-        raw = data.get("Customer Phone")
-        region = _infer_region_from_data(data)
-
-        candidate = None
-        if isinstance(raw, str) and raw.strip():
-            try:
-                num = phonenumbers.parse(raw, region or None)
-                if phonenumbers.is_valid_number(num):
-                    candidate = phonenumbers.format_number(num, PhoneNumberFormat.E164)
-            except Exception:
-                pass
-
-        if not candidate:
-            candidate = _extract_best_e164_from_text(email_text, region)
-
-        if candidate:
-            data["Customer Phone"] = candidate
-        else:
-            data["Customer Phone"] = None
-            warnings.append("No valid E.164 phone found in email")
-    except Exception as e:
-        warnings.append(f"Phone normalization failed: {e}")
-        data["Customer Phone"] = None
-
-# --- Main extraction function ---
+# --- GPT extraction to strict JSON ---
 def extract_structured_fields_strict_json(
     email_text: str,
     hdr_from: str = "",
     hdr_to: str = "",
     hdr_subject: str = "",
-    hdr_date: str = "",
+    hdr_date: str = ""
 ) -> Tuple[Dict[str, Any], List[str]]:
     warnings: List[str] = []
-
     prompt = STRICT_PROMPT_TEMPLATE.format(
-        email_text=email_text[:15000],
-        hdr_from=hdr_from,
-        hdr_to=hdr_to,
-        hdr_subject=hdr_subject,
-        hdr_date=hdr_date,
+        email_text=email_text,
+        hdr_from=hdr_from or "",
+        hdr_to=hdr_to or "",
+        hdr_subject=hdr_subject or "",
+        hdr_date=hdr_date or "",
     )
 
     try:
-        response = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
-            response_format={"type": "json_object"},
+            response_format={"type": "json_object"},  # Force JSON output
         )
-        content = response.choices[0].message.content or "{}"
-        data = json.loads(content)
+        raw_json = resp.choices[0].message.content
+        print("[DEBUG] Raw GPT output:", raw_json)
 
+        if not raw_json:
+            warnings.append("No response from LLM")
+            return {}, warnings
+
+        data = json.loads(raw_json)
+
+        # Debug log parsed structure keys
+        print("[DEBUG] Parsed top-level keys:", list(data.keys()))
+        for idx, item in enumerate(data.get("Items", [])):
+            if isinstance(item, dict):
+                print(f"[DEBUG] Item {idx} keys:", list(item.keys()))
+                pp = item.get("Purchase Price")
+                if isinstance(pp, dict):
+                    print(f"[DEBUG] Item {idx} Purchase Price keys:", list(pp.keys()))
+
+        # Enrich retailer reference with ASIN if available
         _maybe_enrich_retailer_ref(email_text, data)
+
+        # Normalize purchase prices
         _normalize_purchase_prices(data, warnings)
+
+        # Normalize Locale to ll_CC
         _normalize_locale(data, warnings)
-        _normalize_customer_phone(data, email_text, warnings)
 
         return data, warnings
 

@@ -1,178 +1,206 @@
 # routers/email_ingest.py
-"""
-Email ingest router:
-- Reads mailbox configs from mailboxes.json
-- Pulls recent emails via IMAP
-- Extracts text + attachments
-- Uses LLM to produce structured JSON (incl. Customer Phone in E.164)
-- Writes a receipt doc to MongoDB ("Receipts" collection)
+# ==========================
+# Purpose: Ingest order-confirmation emails via IMAP (or raw pasted email),
+#          extract structured JSON via GPT, include attachments (base64),
+#          and save into MongoDB collection "Receipts".
+# ==========================
 
-Environment:
-- MONGODB_URI (mongodb+srv://...)
-- MONGODB_DB (default: activlink)
-"""
+import os, imaplib, email, time, hashlib, json
+from email.header import decode_header, make_header
+from email.utils import getaddresses
+from typing import Any, Dict, List, Optional
 
-from __future__ import annotations
-
-import email
-import imaplib
-import json
-import os
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
-
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from motor.motor_asyncio import AsyncIOMotorClient
 
-from utils.email_extract import (
-    extract_structured_fields_strict_json,
-    extract_text_and_attachments_from_email_message,
-)
+from utils.dependencies import verify_token
 
-router = APIRouter(prefix="/email/ingest", tags=["email-ingest"])
+# ✅ FastAPI router object
+router = APIRouter(prefix="/email/ingest", tags=["Email Ingest"])
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Mongo
-# ────────────────────────────────────────────────────────────────────────────────
-MONGODB_URI = os.getenv("MONGODB_URI", "")
-MONGODB_DB = os.getenv("MONGODB_DB", "activlink")
-
-if not MONGODB_URI:
-    raise RuntimeError("MONGODB_URI is required")
-
-_mongo_client = AsyncIOMotorClient(MONGODB_URI)
-_db = _mongo_client[MONGODB_DB]
-_receipts = _db["Receipts"]
-
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ────────────────────────────────────────────────────────────────────────────────
-def _load_mailboxes(path: str = "mailboxes.json") -> List[Dict[str, Any]]:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"{path} not found")
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, list):
-        raise ValueError("mailboxes.json must be a list of mailbox configs")
-    return data
-
-
-def _imap_fetch_recent(
-    host: str, user: str, password: str, folder: str, limit: int
-) -> List[Tuple[bytes, bytes]]:
-    """
-    Returns list of (msg_id, raw_bytes) for the most recent 'limit' emails in folder.
-    """
-    conn = imaplib.IMAP4_SSL(host)
+# ----------------------
+# Load mailbox configs
+# ----------------------
+MAILBOXES: List[Dict[str, Any]] = []
+if os.getenv("MAILBOXES_JSON"):
     try:
-        conn.login(user, password)
-        conn.select(folder, readonly=True)
-        typ, data = conn.search(None, "ALL")
-        if typ != "OK":
-            return []
-        ids = data[0].split()
-        if not ids:
-            return []
-        # Take the last N
-        ids = ids[-limit:]
+        MAILBOXES = json.loads(os.getenv("MAILBOXES_JSON"))
+        print(f"[EMAIL-INGEST] Loaded {len(MAILBOXES)} mailbox(es) from MAILBOXES_JSON")
+    except Exception as e:
+        print(f"[EMAIL-INGEST] Failed to parse MAILBOXES_JSON: {e}")
+else:
+    path = os.getenv("MAILBOXES_PATH", "mailboxes.json")
+    try:
+        with open(path, "r") as f:
+            MAILBOXES = json.load(f)
+        print(f"[EMAIL-INGEST] Loaded {len(MAILBOXES)} mailbox(es) from {path}")
+    except Exception as e:
+        print(f"[EMAIL-INGEST] No mailboxes.json file and MAILBOXES_JSON not set: {e}")
+        MAILBOXES = []
 
-        out = []
-        for mid in ids:
-            typ, msg_data = conn.fetch(mid, "(RFC822)")
-            if typ == "OK" and msg_data:
-                # msg_data can contain multiple parts, find the RFC822 bytes
-                for part in msg_data:
-                    if isinstance(part, tuple) and len(part) == 2:
-                        out.append((mid, part[1]))
-                        break
-        return out
-    finally:
-        try:
-            conn.logout()
-        except Exception:
-            pass
+# ----------------------
+# Mongo connection helper
+# ----------------------
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB = os.getenv("MONGO_DB", "Activlink")
+RECEIPTS_COLLECTION = os.getenv("RECEIPTS_COLLECTION", "Receipts")
 
+_mclient: Optional[AsyncIOMotorClient] = None
+def get_db():
+    global _mclient
+    if _mclient is None:
+        _mclient = AsyncIOMotorClient(MONGO_URI)
+    return _mclient[MONGO_DB]
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ----------------------
+# Pydantic Models
+# ----------------------
+class ExtractRequest(BaseModel):
+    raw_email_text: str = Field(..., description="Full email text or HTML")
+
+class ExtractResponse(BaseModel):
+    receipt_id: Optional[str] = None
+    extracted: Dict[str, Any]
+    warnings: List[str] = Field(default_factory=list)
+
+# ----------------------
+# Utilities
+# ----------------------
+def _hash_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
+
+def _first_valid_address(addr_headers: List[str]) -> Optional[str]:
+    addr_headers = [h for h in addr_headers if h]
+    if not addr_headers:
+        return None
+    parsed = getaddresses(addr_headers)
+    for _, email_addr in parsed:
+        if email_addr and "@" in email_addr:
+            return email_addr.strip().lower()
+    return None
+
+def _ensure_customer_email_from_headers(extracted: Dict[str, Any], header_email: Optional[str], warnings: List[str]) -> None:
+    if not header_email:
+        return
+    current = extracted.get("Customer Email")
+    if current != header_email:
+        if current:
+            warnings.append(f"Customer Email overridden by header recipient: '{current}' -> '{header_email}'")
+        extracted["Customer Email"] = header_email
+
+# ----------------------
+# Poll a single mailbox (LAZY imports to avoid circulars)
+# ----------------------
+async def poll_mailbox(config: dict, limit: int = 10) -> List[ExtractResponse]:
+    from utils import email_extract as EE  # lazy import
+
+    results: List[ExtractResponse] = []
+    mailbox_id = config["id"]
+
+    mail = imaplib.IMAP4_SSL(config["host"])
+    mail.login(config["user"], config["pass"])
+    mail.select(config.get("folder", "INBOX"))
+
+    typ, data = mail.search(None, "UNSEEN")
+    if typ != "OK":
+        raise HTTPException(500, f"IMAP search failed for {mailbox_id}")
+
+    ids = list(reversed(data[0].split()))[:limit]
+    db = get_db()
+
+    for eid in ids:
+        _, msg_data = mail.fetch(eid, "(RFC822)")
+        raw = msg_data[0][1]
+        msg = email.message_from_bytes(raw)
+
+        # ---- Extract headers ----
+        hdr_from = str(make_header(decode_header(msg.get("From", ""))))
+        hdr_to = str(make_header(decode_header(msg.get("To", ""))))
+        hdr_subject = str(make_header(decode_header(msg.get("Subject", ""))))
+        hdr_date = str(make_header(decode_header(msg.get("Date", ""))))
+        hdr_msgid = str(make_header(decode_header(msg.get("Message-ID", ""))))
+
+        delivered_to = msg.get_all("Delivered-To", []) or []
+        x_original_to = msg.get_all("X-Original-To", []) or []
+        envelope_to = msg.get_all("Envelope-To", []) or []
+        resent_to = msg.get_all("Resent-To", []) or []
+        to_list = msg.get_all("To", []) or []
+        header_recipient = _first_valid_address(to_list + delivered_to + x_original_to + envelope_to + resent_to)
+
+        # ---- Body & attachments ----
+        text, attachments, warnings = EE.extract_text_and_attachments_from_email_message(msg)
+
+        # ---- LLM extraction ----
+        extracted, warns2 = EE.extract_structured_fields_strict_json(
+            text, hdr_from=hdr_from, hdr_to=hdr_to, hdr_subject=hdr_subject, hdr_date=hdr_date
+        )
+        warnings.extend(warns2)
+
+        # ---- Enforce Customer Email ----
+        _ensure_customer_email_from_headers(extracted, header_recipient, warnings)
+
+        # ---- Persist ----
+        receipt_doc = {
+            "mailbox_id": mailbox_id,
+            "client_key": config.get("ClientKey"),   # ✅ include ClientKey
+            "source": "imap",
+            "headers": {
+                "from": hdr_from,
+                "to": hdr_to,
+                "subject": hdr_subject,
+                "date": hdr_date,
+                "message_id": hdr_msgid,
+                "recipient_email": header_recipient,
+            },
+            "extracted": extracted,
+            "attachments": attachments,
+            "raw_text_hash": _hash_text(text),
+            "created_at": int(time.time()),
+            "warnings": warnings[:],
+        }
+
+        ins = await db[RECEIPTS_COLLECTION].insert_one(receipt_doc)
+        receipt_id = str(ins.inserted_id)
+        mail.store(eid, "+FLAGS", "\\Seen")
+
+        results.append(ExtractResponse(receipt_id=receipt_id, extracted=extracted, warnings=warnings))
+
+    try:
+        mail.logout()
+    except Exception:
+        pass
+
+    return results
+
+# ----------------------
 # Routes
-# ────────────────────────────────────────────────────────────────────────────────
-@router.post("/poll")
-async def poll_mailboxes(limit: int = Query(10, ge=1, le=50)) -> Dict[str, Any]:
-    """
-    Pull newest 'limit' emails per mailbox, extract, and persist receipt docs.
-    """
-    mailboxes = _load_mailboxes()
+# ----------------------
+@router.post("/parse", response_model=ExtractResponse, dependencies=[Depends(verify_token)])
+async def parse_email(req: ExtractRequest):
+    from utils import email_extract as EE
+    text = EE.html_to_text(req.raw_email_text) if "<html" in req.raw_email_text.lower() else req.raw_email_text
+    extracted, warns = EE.extract_structured_fields_strict_json(text)
 
-    results: List[Dict[str, Any]] = []
-    for m in mailboxes:
-        mb_id = m.get("id") or "default"
-        host = m.get("host")
-        user = m.get("user")
-        pw = m.get("pass")
-        folder = m.get("folder", "INBOX")
-        client_key = m.get("ClientKey")
+    receipt_doc = {
+        "source": "manual_parse",
+        "headers": {},
+        "extracted": extracted,
+        "attachments": [],
+        "raw_text_hash": _hash_text(text),
+        "created_at": int(time.time()),
+        "warnings": warns[:],
+    }
 
-        if not host or not user or not pw:
-            # Skip misconfigured mailbox entry
-            continue
+    db = get_db()
+    ins = await db[RECEIPTS_COLLECTION].insert_one(receipt_doc)
+    receipt_id = str(ins.inserted_id)
 
-        fetched = _imap_fetch_recent(host, user, pw, folder, limit)
+    return ExtractResponse(receipt_id=receipt_id, extracted=extracted, warnings=warns)
 
-        for msg_id, raw_bytes in fetched:
-            try:
-                msg = email.message_from_bytes(raw_bytes)
-                headers = {
-                    "From": msg.get("From", ""),
-                    "To": msg.get("To", ""),
-                    "Subject": msg.get("Subject", ""),
-                    "Date": msg.get("Date", ""),
-                    "Message-ID": msg.get("Message-ID", ""),
-                    "Return-Path": msg.get("Return-Path", ""),
-                }
-
-                email_text, attachments, warn_a = extract_text_and_attachments_from_email_message(msg)
-                extracted, warn_b = extract_structured_fields_strict_json(headers, email_text)
-
-                warnings = (warn_a or []) + (warn_b or [])
-
-                # "extracted" now includes "Customer Phone" in E.164 when present
-                receipt_doc = {
-                    "mailbox_id": mb_id,
-                    "ClientKey": client_key,
-                    "ingested_at": datetime.now(timezone.utc).isoformat(),
-                    "headers": headers,
-                    "text": email_text,
-                    "attachments": [
-                        {
-                            "filename": a.get("filename"),
-                            "content_type": a.get("content_type"),
-                            "size": a.get("size"),
-                            "data_base64": a.get("data_base64"),
-                        }
-                        for a in attachments
-                    ],
-                    "extracted": extracted,
-                    "warnings": warnings or None,
-                    "raw_message_id": msg_id.decode("ascii", "ignore"),
-                }
-
-                insert_res = await _receipts.insert_one(receipt_doc)
-                results.append(
-                    {
-                        "mailbox_id": mb_id,
-                        "message_id": headers.get("Message-ID"),
-                        "receipt_id": str(insert_res.inserted_id),
-                        "subject": headers.get("Subject"),
-                        "customer_phone": (extracted or {}).get("Customer Phone"),
-                    }
-                )
-            except Exception as e:
-                results.append(
-                    {
-                        "mailbox_id": mb_id,
-                        "error": str(e),
-                    }
-                )
-
-    return {"ok": True, "count": len(results), "results": results}
+@router.post("/poll", response_model=List[ExtractResponse], dependencies=[Depends(verify_token)])
+async def poll(id: str, limit: int = Query(10, ge=1, le=200)):
+    config = next((c for c in MAILBOXES if c["id"] == id), None)
+    if not config:
+        raise HTTPException(404, f"No mailbox config found for id={id}")
+    return await poll_mailbox(config, limit)
