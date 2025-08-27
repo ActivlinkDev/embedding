@@ -5,7 +5,7 @@
 #          and save into MongoDB collection "Receipts".
 # ==========================
 
-import os, imaplib, email, time, hashlib
+import os, imaplib, email, time, hashlib, json
 from email.header import decode_header, make_header
 from typing import Any, Dict, List, Optional
 
@@ -20,24 +20,36 @@ from utils.email_extract import (
     html_to_text,
 )
 
-# ✅ FastAPI router object (required by main.py)
+# ✅ FastAPI router object
 router = APIRouter(prefix="/email/ingest", tags=["Email Ingest"])
 
 # ----------------------
-# Environment Variables
+# Load mailbox configs
 # ----------------------
-IMAP_HOST = os.getenv("IMAP_HOST")
-IMAP_USER = os.getenv("IMAP_USER")
-IMAP_PASS = os.getenv("IMAP_PASS")
-IMAP_FOLDER = os.getenv("IMAP_FOLDER", "INBOX")
-
-MONGO_URI = os.getenv("MONGO_URI")
-MONGO_DB = os.getenv("MONGO_DB", "Activlink")
-RECEIPTS_COLLECTION = os.getenv("RECEIPTS_COLLECTION", "Receipts")
+MAILBOXES: List[Dict[str, Any]] = []
+if os.getenv("MAILBOXES_JSON"):
+    try:
+        MAILBOXES = json.loads(os.getenv("MAILBOXES_JSON"))
+        print(f"[EMAIL-INGEST] Loaded {len(MAILBOXES)} mailbox(es) from MAILBOXES_JSON")
+    except Exception as e:
+        print(f"[EMAIL-INGEST] Failed to parse MAILBOXES_JSON: {e}")
+else:
+    path = os.getenv("MAILBOXES_PATH", "mailboxes.json")
+    try:
+        with open(path, "r") as f:
+            MAILBOXES = json.load(f)
+        print(f"[EMAIL-INGEST] Loaded {len(MAILBOXES)} mailbox(es) from {path}")
+    except Exception as e:
+        print(f"[EMAIL-INGEST] No mailboxes.json file and MAILBOXES_JSON not set: {e}")
+        MAILBOXES = []
 
 # ----------------------
 # Mongo connection helper
 # ----------------------
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB = os.getenv("MONGO_DB", "Activlink")
+RECEIPTS_COLLECTION = os.getenv("RECEIPTS_COLLECTION", "Receipts")
+
 _mclient: Optional[AsyncIOMotorClient] = None
 
 def get_db():
@@ -50,11 +62,9 @@ def get_db():
 # Pydantic Models
 # ----------------------
 class ExtractRequest(BaseModel):
-    """Input model for /parse when pasting raw email."""
     raw_email_text: str = Field(..., description="Full email text or HTML")
 
 class ExtractResponse(BaseModel):
-    """Response model for both /parse and /poll."""
     receipt_id: Optional[str] = None
     extracted: Dict[str, Any]
     warnings: List[str] = Field(default_factory=list)
@@ -63,96 +73,39 @@ class ExtractResponse(BaseModel):
 # Utility
 # ----------------------
 def _hash_text(s: str) -> str:
-    """Create SHA256 hash of raw text (deduplication)."""
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
 
 # ----------------------
-# Routes
+# Poll a single mailbox
 # ----------------------
-
-@router.post("/parse", response_model=ExtractResponse, dependencies=[Depends(verify_token)])
-async def parse_email(req: ExtractRequest):
-    """
-    Dev/test endpoint:
-      1. Accept pasted email text/HTML
-      2. Normalize to plaintext
-      3. Run GPT extraction with strict JSON prompt
-      4. Insert into Mongo Receipts collection
-    """
-    # 1) Normalize HTML → plain text if needed
-    text = html_to_text(req.raw_email_text) if "<html" in req.raw_email_text.lower() else req.raw_email_text
-
-    # 2) Run GPT extraction
-    extracted, warns = extract_structured_fields_strict_json(text)
-
-    # 3) Build receipt document
-    receipt_doc = {
-        "source": "manual_parse",
-        "headers": {},
-        "extracted": extracted,
-        "attachments": [],  # none via paste
-        "raw_text_hash": _hash_text(text),
-        "created_at": int(time.time()),
-        "warnings": warns[:],
-    }
-
-    # 4) Save to Mongo
-    db = get_db()
-    ins = await db[RECEIPTS_COLLECTION].insert_one(receipt_doc)
-    receipt_id = str(ins.inserted_id)
-
-    return ExtractResponse(
-        receipt_id=receipt_id,
-        extracted=extracted,
-        warnings=warns
-    )
-
-
-@router.post("/poll", response_model=List[ExtractResponse], dependencies=[Depends(verify_token)])
-async def poll_imap(limit: int = Query(10, ge=1, le=200)):
-    """
-    Poll IMAP inbox for unseen messages:
-      1. Fetch messages
-      2. Extract plain text + attachments (base64)
-      3. Run GPT extraction with header hints
-      4. Insert into Mongo Receipts
-      5. Mark message as seen
-    """
-    if not all([IMAP_HOST, IMAP_USER, IMAP_PASS]):
-        raise HTTPException(500, "IMAP credentials not configured")
-
+async def poll_mailbox(config: dict, limit: int = 10) -> List[ExtractResponse]:
     results: List[ExtractResponse] = []
+    mailbox_id = config["id"]
 
-    # Connect to IMAP
-    mail = imaplib.IMAP4_SSL(IMAP_HOST)
-    mail.login(IMAP_USER, IMAP_PASS)
-    mail.select(IMAP_FOLDER)
+    mail = imaplib.IMAP4_SSL(config["host"])
+    mail.login(config["user"], config["pass"])
+    mail.select(config.get("folder", "INBOX"))
 
-    # Search for UNSEEN messages
     typ, data = mail.search(None, "UNSEEN")
     if typ != "OK":
-        raise HTTPException(500, "IMAP search failed")
+        raise HTTPException(500, f"IMAP search failed for {mailbox_id}")
 
     ids = list(reversed(data[0].split()))[:limit]
     db = get_db()
 
     for eid in ids:
-        # 1) Fetch message
         _, msg_data = mail.fetch(eid, "(RFC822)")
         raw = msg_data[0][1]
         msg = email.message_from_bytes(raw)
 
-        # Extract headers
         hdr_from = str(make_header(decode_header(msg.get("From", ""))))
         hdr_to = str(make_header(decode_header(msg.get("To", ""))))
         hdr_subject = str(make_header(decode_header(msg.get("Subject", ""))))
         hdr_date = str(make_header(decode_header(msg.get("Date", ""))))
         hdr_msgid = str(make_header(decode_header(msg.get("Message-ID", ""))))
 
-        # 2) Extract text + attachments
         text, attachments, warnings = extract_text_and_attachments_from_email_message(msg)
 
-        # 3) Run GPT extraction with header hints
         extracted, warns2 = extract_structured_fields_strict_json(
             text,
             hdr_from=hdr_from,
@@ -162,8 +115,8 @@ async def poll_imap(limit: int = Query(10, ge=1, le=200)):
         )
         warnings.extend(warns2)
 
-        # 4) Build and insert receipt doc
         receipt_doc = {
+            "mailbox_id": mailbox_id,
             "source": "imap",
             "headers": {
                 "from": hdr_from,
@@ -182,10 +135,8 @@ async def poll_imap(limit: int = Query(10, ge=1, le=200)):
         ins = await db[RECEIPTS_COLLECTION].insert_one(receipt_doc)
         receipt_id = str(ins.inserted_id)
 
-        # 5) Mark email as seen
         mail.store(eid, "+FLAGS", "\\Seen")
 
-        # Collect response
         results.append(ExtractResponse(
             receipt_id=receipt_id,
             extracted=extracted,
@@ -198,3 +149,41 @@ async def poll_imap(limit: int = Query(10, ge=1, le=200)):
         pass
 
     return results
+
+# ----------------------
+# Routes
+# ----------------------
+
+@router.post("/parse", response_model=ExtractResponse, dependencies=[Depends(verify_token)])
+async def parse_email(req: ExtractRequest):
+    """Manual test endpoint: paste raw email HTML/text."""
+    text = html_to_text(req.raw_email_text) if "<html" in req.raw_email_text.lower() else req.raw_email_text
+    extracted, warns = extract_structured_fields_strict_json(text)
+
+    receipt_doc = {
+        "source": "manual_parse",
+        "headers": {},
+        "extracted": extracted,
+        "attachments": [],
+        "raw_text_hash": _hash_text(text),
+        "created_at": int(time.time()),
+        "warnings": warns[:],
+    }
+
+    db = get_db()
+    ins = await db[RECEIPTS_COLLECTION].insert_one(receipt_doc)
+    receipt_id = str(ins.inserted_id)
+
+    return ExtractResponse(
+        receipt_id=receipt_id,
+        extracted=extracted,
+        warnings=warns
+    )
+
+@router.post("/poll", response_model=List[ExtractResponse], dependencies=[Depends(verify_token)])
+async def poll(id: str, limit: int = Query(10, ge=1, le=200)):
+    """Poll a specific mailbox by id."""
+    config = next((c for c in MAILBOXES if c["id"] == id), None)
+    if not config:
+        raise HTTPException(404, f"No mailbox config found for id={id}")
+    return await poll_mailbox(config, limit)

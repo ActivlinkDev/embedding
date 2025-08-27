@@ -1,6 +1,7 @@
 # main.py — safe startup with health check and skippable routers
 import os
 import importlib
+import asyncio, traceback
 from fastapi import FastAPI
 
 app = FastAPI(
@@ -9,16 +10,13 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# -------- Health check (quick way to confirm server responsiveness) --------
+# -------- Health check --------
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
 
 def _include_router(module_path: str, attr: str = "router") -> None:
-    """
-    Import a router module safely and include its FastAPI router.
-    Prints clear messages instead of silently blocking startup.
-    """
+    """Import a router module safely and include its FastAPI router."""
     try:
         mod = importlib.import_module(module_path)
     except Exception as e:
@@ -35,18 +33,13 @@ def _include_router(module_path: str, attr: str = "router") -> None:
     except Exception as e:
         print(f"[ROUTER-IMPORT] FAILED to include router from '{module_path}': {e}")
 
-# -------- Which routers to include? (skip list via env) --------
-
-# Comma-separated module names to skip, e.g. SKIP_ROUTERS=email_ingest,vision
-# Default: "" (no skips)
+# -------- Which routers to include? --------
 skip = {
     s.strip()
     for s in (os.getenv("SKIP_ROUTERS") or "").split(",")
     if s.strip()
 }
 
-
-# Map short names -> module import paths
 ROUTERS = {
     # core/product/sku
     "match": "routers.match",
@@ -92,30 +85,26 @@ ROUTERS = {
 
 print(f"[STARTUP] SKIP_ROUTERS={sorted(skip)}")
 
-# Include each router unless skipped; each include is isolated & logged.
 for name, module_path in ROUTERS.items():
     if name in skip:
         print(f"[ROUTER-IMPORT] Skipping '{name}' ({module_path}) per SKIP_ROUTERS")
         continue
     _include_router(module_path)
 
-# -------- Optional: toggle background poller strictly via env (default OFF) --------
-# If you later want the email poller to run automatically, set:
-#   ENABLE_EMAIL_POLL=true
-# and remove 'email_ingest' from SKIP_ROUTERS.
+# -------- Background poller (multi-mailbox) --------
 if os.getenv("ENABLE_EMAIL_POLL", "false").lower() == "true":
     try:
-        from routers.email_ingest import poll_imap  # type: ignore
-        import asyncio, traceback
+        from routers.email_ingest import poll_mailbox, MAILBOXES
 
         async def _poll_loop():
             print("[EMAIL-POLLER] Starting background poll loop (20s)")
             while True:
-                try:
-                    await poll_imap(limit=2)
-                except Exception as e:
-                    print(f"[EMAIL-POLLER] Error: {e}")
-                    traceback.print_exc()
+                for config in MAILBOXES:
+                    try:
+                        await poll_mailbox(config, limit=2)
+                    except Exception as e:
+                        print(f"[EMAIL-POLLER][{config.get('id')}] Error: {e}")
+                        traceback.print_exc()
                 await asyncio.sleep(20)
 
         @app.on_event("startup")
