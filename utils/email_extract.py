@@ -1,214 +1,243 @@
-# utils/email_extract.py
-"""
-Helpers for email ingestion:
-- html_to_text: converts HTML emails to plain text
-- extract_text_and_attachments_from_email_message: gets text + attachments
-- extract_structured_fields_strict_json: uses GPT to extract JSON fields
-"""
+# routers/email_ingest.py
+# ==========================
+# Purpose: Ingest order-confirmation emails via IMAP (or raw pasted email),
+#          extract structured JSON via GPT, include attachments (base64),
+#          and save into MongoDB collection "Receipts".
+# ==========================
 
-import re, json, base64
-from typing import Tuple, Dict, Any, List
-from bs4 import BeautifulSoup
-from openai import OpenAI
+import os, imaplib, email, time, hashlib, json
+from email.header import decode_header, make_header
+from email.utils import getaddresses
+from typing import Any, Dict, List, Optional
 
-# Initialize OpenAI client (uses OPENAI_API_KEY from .env)
-client = OpenAI()
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+from motor.motor_asyncio import AsyncIOMotorClient
 
-# --- Convert HTML to plain text ---
-def html_to_text(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup.find_all(["br", "p", "div"]):
-        tag.append("\n")
-    text = soup.get_text("\n")
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+from utils.dependencies import verify_token
+from utils.email_extract import (
+    extract_text_and_attachments_from_email_message,
+    extract_structured_fields_strict_json,
+    html_to_text,
+)
 
-# --- Extract text + attachments from MIME message ---
-def extract_text_and_attachments_from_email_message(msg) -> Tuple[str, List[Dict[str, Any]], List[str]]:
-    warnings: List[str] = []
-    text_parts: List[str] = []
-    attachments: List[Dict[str, Any]] = []
+# ✅ FastAPI router object
+router = APIRouter(prefix="/email/ingest", tags=["Email Ingest"])
 
+# ----------------------
+# Load mailbox configs
+# ----------------------
+MAILBOXES: List[Dict[str, Any]] = []
+if os.getenv("MAILBOXES_JSON"):
     try:
-        if msg.is_multipart():
-            for part in msg.walk():
-                ctype = (part.get_content_type() or "").lower()
-                disp = (part.get("Content-Disposition") or "").lower()
-
-                if "attachment" in disp:
-                    try:
-                        payload = part.get_payload(decode=True) or b""
-                        b64 = base64.b64encode(payload).decode("utf-8")
-                        attachments.append({
-                            "filename": part.get_filename(),
-                            "content_type": ctype,
-                            "data_base64": b64,
-                            "size": len(payload),
-                        })
-                    except Exception as e:
-                        warnings.append(f"Attachment decode failed: {e}")
-                elif ctype in ("text/plain", "text/html"):
-                    payload = part.get_payload(decode=True) or b""
-                    charset = part.get_content_charset() or "utf-8"
-                    chunk = payload.decode(charset, errors="ignore")
-                    if ctype == "text/html":
-                        chunk = html_to_text(chunk)
-                    text_parts.append(chunk)
-        else:
-            payload = msg.get_payload(decode=True) or b""
-            charset = msg.get_content_charset() or "utf-8"
-            chunk = payload.decode(charset, errors="ignore")
-            if (msg.get_content_type() or "").lower() == "text/html":
-                chunk = html_to_text(chunk)
-            text_parts.append(chunk)
+        MAILBOXES = json.loads(os.getenv("MAILBOXES_JSON"))
+        print(f"[EMAIL-INGEST] Loaded {len(MAILBOXES)} mailbox(es) from MAILBOXES_JSON")
     except Exception as e:
-        warnings.append(f"MIME parse error: {e}")
-
-    text = "\n\n".join(p for p in text_parts if p).strip()
-    return text, attachments, warnings
-
-# --- Prompt template for GPT extraction (with header hints) ---
-STRICT_PROMPT_TEMPLATE = """Extract the following details from the order confirmation email and return strict JSON.
-
-Top-level fields:
-Customer Name
-Customer Email
-Customer Address -> object with:
-  Street
-  City
-  Postal Code
-  Region
-  Country
-Order Number
-Purchase Date (ISO 8601: YYYY-MM-DDTHH:MM:SSZ)
-Payment Method (include card type + last 4 digits if available)
-Retailer Name
-
-For each purchased item, return Items[] with:
-Make
-Model
-Purchase Price -> {{ "Amount": decimal, "Currency": 3-char ISO }}
-GTIN -> if found else null
-RetailerReference -> retailer product code/identifier (e.g., ASIN for Amazon) if found else null
-
-If info is missing, set null. Use the header hints when helpful.
-
-Header hints:
-From: {hdr_from}
-To: {hdr_to}
-Subject: {hdr_subject}
-Date: {hdr_date}
-
-Email text:
-{email_text}
-"""
-
-
-# Pattern to find an Amazon ASIN in typical order links
-_ASIN_RE = re.compile(r'(?:dp|gp/product)/([A-Z0-9]{10})')
-
-def _maybe_enrich_retailer_ref(email_text: str, data: dict) -> None:
-    """If retailer reference is missing, fill with ASIN from links when present."""
+        print(f"[EMAIL-INGEST] Failed to parse MAILBOXES_JSON: {e}")
+else:
+    path = os.getenv("MAILBOXES_PATH", "mailboxes.json")
     try:
-        m = _ASIN_RE.search(email_text or "")
-        asin = m.group(1) if m else None
-        if not asin or not data or not isinstance(data, dict):
-            return
-        items = data.get("Items") or []
-        if not isinstance(items, list):
-            return
-        for item in items:
-            if isinstance(item, dict):
-                rr = item.get("RetailerReference")
-                if rr in (None, "", "null") and asin:
-                    item["RetailerReference"] = asin
+        with open(path, "r") as f:
+            MAILBOXES = json.load(f)
+        print(f"[EMAIL-INGEST] Loaded {len(MAILBOXES)} mailbox(es) from {path}")
+    except Exception as e:
+        print(f"[EMAIL-INGEST] No mailboxes.json file and MAILBOXES_JSON not set: {e}")
+        MAILBOXES = []
+
+# ----------------------
+# Mongo connection helper
+# ----------------------
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB = os.getenv("MONGO_DB", "Activlink")
+RECEIPTS_COLLECTION = os.getenv("RECEIPTS_COLLECTION", "Receipts")
+
+_mclient: Optional[AsyncIOMotorAsyncClient] = None  # type: ignore[name-defined]
+try:
+    from motor.motor_asyncio import AsyncIOMotorClient as _AsyncIOMotorClient
+    AsyncIOMotorAsyncClient = _AsyncIOMotorClient  # alias to avoid type hints error
+except Exception:
+    pass
+
+def get_db():
+    global _mclient
+    if _mclient is None:
+        _mclient = AsyncIOMotorAsyncClient(MONGO_URI)  # type: ignore[name-defined]
+    return _mclient[MONGO_DB]
+
+# ----------------------
+# Pydantic Models
+# ----------------------
+class ExtractRequest(BaseModel):
+    raw_email_text: str = Field(..., description="Full email text or HTML")
+
+class ExtractResponse(BaseModel):
+    receipt_id: Optional[str] = None
+    extracted: Dict[str, Any]
+    warnings: List[str] = Field(default_factory=list)
+
+# ----------------------
+# Utility
+# ----------------------
+def _hash_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
+
+def _first_valid_address(addr_headers: List[str]) -> Optional[str]:
+    """
+    Parse a list of address header strings (e.g., To, Delivered-To, etc.)
+    and return the first valid email address found (lowercased).
+    """
+    # filter out Nones and empties
+    addr_headers = [h for h in addr_headers if h]
+    if not addr_headers:
+        return None
+    # getaddresses can parse multiple comma-separated addresses per header
+    parsed = getaddresses(addr_headers)
+    for _, email_addr in parsed:
+        if email_addr and "@" in email_addr:
+            return email_addr.strip().lower()
+    return None
+
+def _ensure_customer_email_from_headers(extracted: Dict[str, Any], header_email: Optional[str], warnings: List[str]) -> None:
+    """
+    Enforce Customer Email from header recipient.
+    If LLM value differs or is missing, set to header_email and log a warning.
+    """
+    if not header_email:
+        return
+    current = extracted.get("Customer Email")
+    if current != header_email:
+        if current:
+            warnings.append(f"Customer Email overridden by header recipient: '{current}' -> '{header_email}'")
+        extracted["Customer Email"] = header_email
+
+# ----------------------
+# Poll a single mailbox
+# ----------------------
+async def poll_mailbox(config: dict, limit: int = 10) -> List[ExtractResponse]:
+    results: List[ExtractResponse] = []
+    mailbox_id = config["id"]
+
+    mail = imaplib.IMAP4_SSL(config["host"])
+    mail.login(config["user"], config["pass"])
+    mail.select(config.get("folder", "INBOX"))
+
+    typ, data = mail.search(None, "UNSEEN")
+    if typ != "OK":
+        raise HTTPException(500, f"IMAP search failed for {mailbox_id}")
+
+    ids = list(reversed(data[0].split()))[:limit]
+    db = get_db()
+
+    for eid in ids:
+        _, msg_data = mail.fetch(eid, "(RFC822)")
+        raw = msg_data[0][1]
+        msg = email.message_from_bytes(raw)
+
+        # ---- Extract headers ----
+        hdr_from = str(make_header(decode_header(msg.get("From", ""))))
+        hdr_to = str(make_header(decode_header(msg.get("To", ""))))
+        hdr_subject = str(make_header(decode_header(msg.get("Subject", ""))))
+        hdr_date = str(make_header(decode_header(msg.get("Date", ""))))
+        hdr_msgid = str(make_header(decode_header(msg.get("Message-ID", ""))))
+
+        # Derive recipient (customer) email from headers in priority order
+        delivered_to = msg.get_all("Delivered-To", [])
+        x_original_to = msg.get_all("X-Original-To", [])
+        envelope_to = msg.get_all("Envelope-To", [])
+        resent_to = msg.get_all("Resent-To", [])
+        to_list = msg.get_all("To", [])
+
+        header_recipient = _first_valid_address(
+            to_list + delivered_to + x_original_to + envelope_to + resent_to
+        )
+
+        # ---- Body & attachments ----
+        text, attachments, warnings = extract_text_and_attachments_from_email_message(msg)
+
+        # ---- LLM extraction with header hints ----
+        extracted, warns2 = extract_structured_fields_strict_json(
+            text,
+            hdr_from=hdr_from,
+            hdr_to=hdr_to,
+            hdr_subject=hdr_subject,
+            hdr_date=hdr_date
+        )
+        warnings.extend(warns2)
+
+        # ---- Enforce Customer Email from recipient headers ----
+        _ensure_customer_email_from_headers(extracted, header_recipient, warnings)
+
+        # ---- Persist ----
+        receipt_doc = {
+            "mailbox_id": mailbox_id,
+            "source": "imap",
+            "headers": {
+                "from": hdr_from,
+                "to": hdr_to,
+                "subject": hdr_subject,
+                "date": hdr_date,
+                "message_id": hdr_msgid,
+                "recipient_email": header_recipient,  # store for auditing
+            },
+            "extracted": extracted,
+            "attachments": attachments,
+            "raw_text_hash": _hash_text(text),
+            "created_at": int(time.time()),
+            "warnings": warnings[:],
+        }
+
+        ins = await db[RECEIPTS_COLLECTION].insert_one(receipt_doc)
+        receipt_id = str(ins.inserted_id)
+
+        mail.store(eid, "+FLAGS", "\\Seen")
+
+        results.append(ExtractResponse(
+            receipt_id=receipt_id,
+            extracted=extracted,
+            warnings=warnings
+        ))
+
+    try:
+        mail.logout()
     except Exception:
-        # Soft-fail; enrichment is optional.
         pass
 
-def _normalize_purchase_prices(data: dict, warnings: List[str]) -> None:
-    """Ensure Purchase Price fields are numeric and currency codes are standardized, tolerate weird keys."""
-    try:
-        items = data.get("Items", [])
-        if not isinstance(items, list):
-            return
-        for idx, item in enumerate(items):
-            if not isinstance(item, dict):
-                continue
-            pp = item.get("Purchase Price")
-            if isinstance(pp, dict):
-                # Debug log raw keys
-                print(f"[DEBUG] Item {idx} Purchase Price keys before normalize:", list(pp.keys()))
+    return results
 
-                # Fuzzy key matching
-                amt_key = next((k for k in pp.keys() if "amount" in k.lower()), None)
-                cur_key = next((k for k in pp.keys() if "curr" in k.lower()), None)
+# ----------------------
+# Routes
+# ----------------------
 
-                if amt_key:
-                    amt = pp.get(amt_key)
-                    try:
-                        amt_clean = str(amt).replace("£", "").strip()
-                        pp[amt_key] = float(amt_clean)
-                    except Exception:
-                        warnings.append(f"Failed to normalize Amount '{amt}'")
-                        pp[amt_key] = None
+@router.post("/parse", response_model=ExtractResponse, dependencies=[Depends(verify_token)])
+async def parse_email(req: ExtractRequest):
+    """Manual test endpoint: paste raw email HTML/text (no headers available)."""
+    text = html_to_text(req.raw_email_text) if "<html" in req.raw_email_text.lower() else req.raw_email_text
+    extracted, warns = extract_structured_fields_strict_json(text)
 
-                if cur_key:
-                    cur = pp.get(cur_key)
-                    if cur:
-                        pp[cur_key] = str(cur).upper()
-    except Exception as e:
-        warnings.append(f"Normalization error: {e}")
+    receipt_doc = {
+        "source": "manual_parse",
+        "headers": {},
+        "extracted": extracted,
+        "attachments": [],
+        "raw_text_hash": _hash_text(text),
+        "created_at": int(time.time()),
+        "warnings": warns[:],
+    }
 
-# --- GPT extraction to strict JSON ---
-def extract_structured_fields_strict_json(
-    email_text: str,
-    hdr_from: str = "",
-    hdr_to: str = "",
-    hdr_subject: str = "",
-    hdr_date: str = ""
-) -> Tuple[Dict[str, Any], List[str]]:
-    warnings: List[str] = []
-    prompt = STRICT_PROMPT_TEMPLATE.format(
-        email_text=email_text,
-        hdr_from=hdr_from or "",
-        hdr_to=hdr_to or "",
-        hdr_subject=hdr_subject or "",
-        hdr_date=hdr_date or "",
+    db = get_db()
+    ins = await db[RECEIPTS_COLLECTION].insert_one(receipt_doc)
+    receipt_id = str(ins.inserted_id)
+
+    return ExtractResponse(
+        receipt_id=receipt_id,
+        extracted=extracted,
+        warnings=warns
     )
 
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            response_format={"type": "json_object"},  # Force JSON output
-        )
-        raw_json = resp.choices[0].message.content
-        print("[DEBUG] Raw GPT output:", raw_json)
-
-        if not raw_json:
-            warnings.append("No response from LLM")
-            return {}, warnings
-
-        data = json.loads(raw_json)
-
-        # Debug log parsed structure
-        print("[DEBUG] Parsed top-level keys:", list(data.keys()))
-        for idx, item in enumerate(data.get("Items", [])):
-            if isinstance(item, dict):
-                print(f"[DEBUG] Item {idx} keys:", list(item.keys()))
-                pp = item.get("Purchase Price")
-                if isinstance(pp, dict):
-                    print(f"[DEBUG] Item {idx} Purchase Price keys:", list(pp.keys()))
-
-        # Enrich retailer reference with ASIN if available
-        _maybe_enrich_retailer_ref(email_text, data)
-
-        # Normalize purchase prices
-        _normalize_purchase_prices(data, warnings)
-
-        return data, warnings
-
-    except Exception as e:
-        warnings.append(f"LLM extraction failed: {e}")
-        return {}, warnings
+@router.post("/poll", response_model=List[ExtractResponse], dependencies=[Depends(verify_token)])
+async def poll(id: str, limit: int = Query(10, ge=1, le=200)):
+    """Poll a specific mailbox by id (configured via MAILBOXES_JSON or mailboxes.json)."""
+    config = next((c for c in MAILBOXES if c["id"] == id), None)
+    if not config:
+        raise HTTPException(404, f"No mailbox config found for id={id}")
+    return await poll_mailbox(config, limit)
