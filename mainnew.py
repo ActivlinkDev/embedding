@@ -1,5 +1,6 @@
 # main.py
 
+import asyncio
 from fastapi import FastAPI
 
 # Import routers (grouped for clarity)
@@ -24,16 +25,29 @@ from routers import (
     generate_payment_links_from_quote,
     props_lookup,
     stripe_webook,
-    email_injest,
 )
-from routers.enrich import (ice_lookup,
+from routers.enrich import (
+    ice_lookup,
     go_upc,
-    scale_lookup,)
+    scale_lookup,
+)
 
-from routers.sku import (lookup_custom_sku,
-    lookup_master_sku,lookup_custom_sku_all,
+from routers.sku import (
+    lookup_custom_sku,
+    lookup_master_sku,
+    lookup_custom_sku_all,
     create_custom_sku,
-    lookup_master_sku_all,create_master_sku,)
+    lookup_master_sku_all,
+    create_master_sku,
+)
+
+# Try to import poll_imap
+#try:
+#    from routers.email_injest import poll_imap
+#    print("[DEBUG] poll_imap imported successfully")
+#except Exception as e:
+#    print(f"[DEBUG] Could not import poll_imap: {e}")
+#    poll_imap = None
 
 
 # Initialize FastAPI app
@@ -42,6 +56,8 @@ app = FastAPI(
     description="Match natural language queries to device categories using OpenAI embeddings.",
     version="1.0.0",
 )
+
+print("[DEBUG] FastAPI app object created")
 
 # Include all route modules
 app.include_router(match.router)
@@ -73,4 +89,28 @@ app.include_router(assign_device_collection.router)
 app.include_router(generate_payment_links_from_quote.router)
 app.include_router(props_lookup.router)
 app.include_router(stripe_webook.router)
-app.include_router(email_injest.router)
+
+print("[DEBUG] Routers registered")
+
+
+# Background task: poll inbox every 20 seconds
+#@app.on_event("startup")
+#async def start_email_polling():
+#    print("[DEBUG] Startup event triggered")
+#    if poll_imap is None:
+#        print("[DEBUG] poll_imap not available, skipping poller")
+#        return
+
+#    async def poll_task():
+#        print("[DEBUG] Poll task created")
+#        while True:
+#            try:
+#                print("[DEBUG] Poll loop iteration starting")
+#                await poll_imap(limit=1)  # keep it small for debug
+#                print("[DEBUG] poll_imap finished one run")
+#            except Exception as e:
+#                print(f"[DEBUG] Poll task error: {e}")
+#            await asyncio.sleep(10)  # shorter delay while debugging
+
+#    asyncio.create_task(poll_task())
+#    print("[DEBUG] Startup event finished (poll_task scheduled)")
