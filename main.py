@@ -81,6 +81,8 @@ ROUTERS = {
 
     # email ingest 
     "email_ingest": "routers.email_ingest",
+     # QA
+    "qa": "routers.qa",
 }
 
 print(f"[STARTUP] SKIP_ROUTERS={sorted(skip)}")
