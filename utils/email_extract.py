@@ -1,14 +1,13 @@
-# utils/email_extract.py
 import re, json, base64
 from typing import Tuple, Dict, Any, List, Optional
 from bs4 import BeautifulSoup
 from openai import OpenAI
 import phonenumbers
 from phonenumbers import PhoneNumberFormat
+from email.utils import parseaddr
 
 client = OpenAI()
 
-# --- HTML to Text ---
 def html_to_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all(["br", "p", "div"]):
@@ -16,10 +15,8 @@ def html_to_text(html: str) -> str:
     text = soup.get_text("\n")
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
-# --- Extract text and attachments from email ---
 def extract_text_and_attachments_from_email_message(msg) -> Tuple[str, List[Dict[str, Any]], List[str]]:
     warnings, text_parts, attachments = [], [], []
-
     try:
         if msg.is_multipart():
             for part in msg.walk():
@@ -58,12 +55,11 @@ def extract_text_and_attachments_from_email_message(msg) -> Tuple[str, List[Dict
     text = "\n\n".join(p for p in text_parts if p).strip()
     return text, attachments, warnings
 
-# --- Prompt for GPT ---
 STRICT_PROMPT_TEMPLATE = """Extract the following details from the order confirmation email and return strict JSON.
 
 Top-level fields:
 Customer Name
-Customer Email
+Customer Email (this should be from the {hdr_from})
 Customer Phone
 Customer Address -> object with:
   Street
@@ -104,7 +100,6 @@ Email text:
 {email_text}
 """
 
-# --- ASIN enrichment ---
 def _maybe_enrich_retailer_ref(email_text: str, data: dict) -> None:
     m = re.search(r'(?:dp|gp/product)/([A-Z0-9]{10})', email_text or "")
     asin = m.group(1) if m else None
@@ -115,7 +110,6 @@ def _maybe_enrich_retailer_ref(email_text: str, data: dict) -> None:
         if isinstance(item, dict) and not item.get("RetailerReference"):
             item["RetailerReference"] = asin
 
-# --- Normalize Purchase Price ---
 def _normalize_purchase_prices(data: dict, warnings: List[str]) -> None:
     try:
         items = data.get("Items", [])
@@ -132,12 +126,11 @@ def _normalize_purchase_prices(data: dict, warnings: List[str]) -> None:
     except Exception as e:
         warnings.append(f"Price normalization error: {e}")
 
-# --- Normalize Locale to ll_CC ---
 def _normalize_locale(data: dict, warnings: List[str]) -> None:
     try:
         val = data.get("Locale")
         if isinstance(val, str) and re.match(r"^[a-z]{2}_[A-Z]{2}$", val):
-            return  # already ok
+            return
         m = re.match(r"^([a-zA-Z]{2})[-_]?([a-zA-Z]{2})$", str(val))
         if m:
             ll, cc = m.group(1).lower(), m.group(2).upper()
@@ -148,7 +141,6 @@ def _normalize_locale(data: dict, warnings: List[str]) -> None:
         warnings.append(f"Locale normalization error: {e}")
         data["Locale"] = None
 
-# --- Country name → ISO ---
 _COUNTRY_HINTS = {
     "united kingdom": "GB", "uk": "GB", "england": "GB",
     "united states": "US", "usa": "US",
@@ -163,7 +155,6 @@ def _infer_region_from_data(data: dict) -> Optional[str]:
     country = ((data.get("Customer Address") or {}).get("Country") or "").lower()
     return _COUNTRY_HINTS.get(country)
 
-# --- Scan text for best phone number in E.164 ---
 def _extract_best_e164_from_text(text: str, region_hint: Optional[str]) -> Optional[str]:
     try:
         for match in phonenumbers.PhoneNumberMatcher(text, region_hint):
@@ -174,7 +165,6 @@ def _extract_best_e164_from_text(text: str, region_hint: Optional[str]) -> Optio
         pass
     return None
 
-# --- Normalize/Extract E.164 phone number into "Customer Phone" ---
 def _normalize_customer_phone(data: dict, email_text: str, warnings: List[str]) -> None:
     try:
         raw = data.get("Customer Phone")
@@ -201,7 +191,6 @@ def _normalize_customer_phone(data: dict, email_text: str, warnings: List[str]) 
         warnings.append(f"Phone normalization failed: {e}")
         data["Customer Phone"] = None
 
-# --- Main extraction function ---
 def extract_structured_fields_strict_json(
     email_text: str,
     hdr_from: str = "",
@@ -228,6 +217,11 @@ def extract_structured_fields_strict_json(
         )
         content = response.choices[0].message.content or "{}"
         data = json.loads(content)
+
+        # ✅ Force "Customer Email" from header
+        parsed_email = parseaddr(hdr_from or "")[1]
+        if parsed_email:
+            data["Customer Email"] = parsed_email
 
         _maybe_enrich_retailer_ref(email_text, data)
         _normalize_purchase_prices(data, warnings)

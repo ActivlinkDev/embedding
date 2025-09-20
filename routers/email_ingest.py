@@ -1,9 +1,4 @@
 # routers/email_ingest.py
-# ==========================
-# Purpose: Ingest order-confirmation emails via IMAP (or raw pasted email),
-#          extract structured JSON via GPT, include attachments (base64),
-#          and save into MongoDB collection "Receipts".
-# ==========================
 
 import os, imaplib, email, time, hashlib, json
 from email.header import decode_header, make_header
@@ -80,15 +75,6 @@ def _first_valid_address(addr_headers: List[str]) -> Optional[str]:
             return email_addr.strip().lower()
     return None
 
-def _ensure_customer_email_from_headers(extracted: Dict[str, Any], header_email: Optional[str], warnings: List[str]) -> None:
-    if not header_email:
-        return
-    current = extracted.get("Customer Email")
-    if current != header_email:
-        if current:
-            warnings.append(f"Customer Email overridden by header recipient: '{current}' -> '{header_email}'")
-        extracted["Customer Email"] = header_email
-
 # ----------------------
 # Poll a single mailbox (LAZY imports to avoid circulars)
 # ----------------------
@@ -137,13 +123,10 @@ async def poll_mailbox(config: dict, limit: int = 10) -> List[ExtractResponse]:
         )
         warnings.extend(warns2)
 
-        # ---- Enforce Customer Email ----
-        _ensure_customer_email_from_headers(extracted, header_recipient, warnings)
-
         # ---- Persist ----
         receipt_doc = {
             "mailbox_id": mailbox_id,
-            "client_key": config.get("ClientKey"),   # ✅ include ClientKey
+            "client_key": config.get("ClientKey"),
             "source": "imap",
             "headers": {
                 "from": hdr_from,
@@ -151,7 +134,7 @@ async def poll_mailbox(config: dict, limit: int = 10) -> List[ExtractResponse]:
                 "subject": hdr_subject,
                 "date": hdr_date,
                 "message_id": hdr_msgid,
-                "recipient_email": header_recipient,
+                "recipient_email": header_recipient,  # stored for reference only
             },
             "extracted": extracted,
             "attachments": attachments,
