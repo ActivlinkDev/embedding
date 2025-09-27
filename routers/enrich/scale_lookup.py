@@ -1,71 +1,81 @@
-from fastapi import APIRouter, HTTPException, Query, Depends
-import requests
 import os
-from dotenv import load_dotenv
-from pymongo import MongoClient
-from utils.dependencies import verify_token
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Optional
 
-load_dotenv()
+router = APIRouter(prefix="/scale", tags=["ScaleSERP"])
 
-router = APIRouter(
-    prefix="/scale",
-    tags=["Enrich"]
-)
-
-mongo_client = MongoClient(os.getenv("MONGO_URI"))
-db = mongo_client["Activlink"]
-locale_collection = db["Locale_Params"]
-
-SCALE_SERP_API_KEY = os.getenv("SCALE_SERP_KEY")
-BASE_URL = "https://api.scaleserp.com/search"
-REQUEST_TIMEOUT = 10
+SCALE_SERP_API_KEY = os.getenv("SCALE_SERP_API_KEY")
+SCALE_SERP_BASE_URL = "https://api.scaleserp.com/search"
 
 
-@router.get("/shopping", dependencies=[Depends(verify_token)])
-def lookup_shopping_trimmed(
-    query: str = Query(..., description="Search query (e.g. brand + model)"),
-    locale: str = Query(..., description="Locale (e.g. en_GB)")
+class ScaleShoppingResponse(BaseModel):
+    query: str
+    locale: str
+    title: Optional[str]
+    merchant: Optional[str]
+    price: Optional[str]
+    price_value: Optional[float]
+    currency: Optional[str]
+    rating: Optional[float]
+    reviews: Optional[int]
+    link: Optional[str]
+    image: Optional[str]
+    gpc_id: Optional[str]   # ✅ added mapping for Google Product Category ID
+    source: str = "ScaleSERP"
+
+
+@router.get("/shopping", response_model=ScaleShoppingResponse)
+async def get_shopping_result(
+    query: str = Query(..., description="Product search query"),
+    locale: str = Query("en_GB", description="Locale for search results")
 ):
+    """
+    Proxy to ScaleSERP Shopping API.
+    Returns a trimmed single-result payload including gpc_id.
+    """
     if not SCALE_SERP_API_KEY:
-        raise HTTPException(status_code=500, detail="SERP API key is not set")
-
-    # 🔍 Lookup locale info from DB
-    locale_data = locale_collection.find_one(
-        {"locale": locale}, {"_id": 0, "google_domain": 1, "hl": 1, "gl": 1}
-    )
-    if not locale_data:
-        raise HTTPException(status_code=404, detail=f"No locale details found for {locale}")
-
-    google_domain = locale_data.get("google_domain", "google.com")
-    hl = locale_data.get("hl", "en")
-    gl = locale_data.get("gl", "us")
+        raise HTTPException(status_code=500, detail="Missing SCALE_SERP_API_KEY")
 
     params = {
         "api_key": SCALE_SERP_API_KEY,
         "search_type": "shopping",
         "q": query,
-        "google_domain": google_domain,
-        "hl": hl,
-        "gl": gl,
         "shopping_condition": "new",
-        "num": 1,
-        "output": "json"
+        "gl": "uk",  # hard-coded for now; could map locale -> gl if needed
+        "google_domain": "google.co.uk",
+        "engine": "google",
+        "num": 1,  # limit to 1 result
     }
 
-    try:
-        response = requests.get(BASE_URL, params=params, timeout=REQUEST_TIMEOUT)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            response = await client.get(SCALE_SERP_BASE_URL, params=params)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=e.response.status_code, detail=str(e))
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=500, detail=f"ScaleSERP request failed: {str(e)}")
 
-        if response.status_code == 200:
-            data = response.json()
-            # ✅ Limit shopping_results to 1 (if exists)
-            if "shopping_results" in data and isinstance(data["shopping_results"], list):
-                data["shopping_results"] = data["shopping_results"][:1]
-            return data
+    data = response.json()
+    item = (data.get("shopping_results") or [None])[0] or {}
 
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=f"ScaleSERP API error {response.status_code}: {response.text}"
-        )
+    trimmed = {
+        "query": query,
+        "locale": locale,
+        "title": item.get("title"),
+        "merchant": item.get("merchant"),
+        "price": item.get("price_parsed", {}).get("raw") or item.get("price_raw"),
+        "price_value": item.get("price_parsed", {}).get("value"),
+        "currency": item.get("price_parsed", {}).get("currency"),
+        "rating": item.get("rating"),
+        "reviews": item.get("reviews"),
+        "link": item.get("link"),
+        "image": item.get("image"),
+        "gpc_id": item.get("gpc_id"),   # ✅ new mapping
+        "source": "ScaleSERP",
+    }
 
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Error reaching ScaleSERP API: {str(e)}")
+    return JSONResponse(content=trimmed)
