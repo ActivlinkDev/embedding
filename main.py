@@ -78,6 +78,7 @@ ROUTERS = {
     "create_customer": "routers.create_customer",
     "generate_payment_links_from_quote": "routers.generate_payment_links_from_quote",
     "props_lookup": "routers.props_lookup",
+    "locale_infos": "routers.locale_infos",
 
     # email ingest 
     "email_ingest": "routers.email_ingest",
