@@ -1,68 +1,18 @@
-from fastapi import APIRouter, HTTPException, Query, Depends
-from typing import Optional, List
-import httpx
-import os
-from pydantic import BaseModel
-
-from utils.dependencies import verify_token
-
-router = APIRouter(tags=["Locale Infos"])
-
-STRAPI_BASE_URL = "https://strapi-production-5603.up.railway.app/api/locale-infos"
-STRAPI_BEARER_TOKEN = os.getenv("STRAPI_BEARER_TOKEN")
-if not STRAPI_BEARER_TOKEN:
-    raise RuntimeError("STRAPI_BEARER_TOKEN environment variable must be set")
-
-
-# ---------- Pydantic Models ----------
-class LocaleAttributes(BaseModel):
-    Lang_Code: str
-    API_Locale: str
-    DescriptionEN: str
-    Strapi_Locale: str
-    createdAt: str
-    updatedAt: str
-    publishedAt: str
-    Description_Local: str
-    Change_Lang: str
-    Currency_Name: str
-    Currency_Icon: str
-    Stripe_Locale: Optional[str]
-
-
-class LocaleInfo(BaseModel):
-    id: int
-    attributes: LocaleAttributes
-
-
-class Pagination(BaseModel):
-    page: int
-    pageSize: int
-    pageCount: int
-    total: int
-
-
-class LocaleInfoResponse(BaseModel):
-    data: List[LocaleInfo]
-    meta: dict
-
-
-# ---------- Endpoint ----------
 @router.get("/locale_infos", response_model=LocaleInfoResponse)
 async def locale_infos(
-    locale: Optional[str] = Query(None, description="Filter by locale (optional)"),
+    api_locale: Optional[str] = Query(None, description="Filter by API_Locale (e.g. en_GB)"),
     _: None = Depends(verify_token)
 ):
     """
-    Fetch locale-infos from Strapi and return the structured response.
+    Fetch locale-infos from Strapi.
+    Supports optional filtering by API_Locale.
     """
     params = {}
-    if locale:
-        params["locale"] = locale
+    if api_locale:
+        # Use $eq operator so Strapi applies the filter
+        params["filters[API_Locale][$eq]"] = api_locale
 
-    headers = {
-        "Authorization": f"Bearer {STRAPI_BEARER_TOKEN}"
-    }
+    headers = {"Authorization": f"Bearer {STRAPI_BEARER_TOKEN}"}
 
     try:
         async with httpx.AsyncClient() as client:
