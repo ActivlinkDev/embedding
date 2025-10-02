@@ -25,6 +25,7 @@ async def props_lookup(
 ):
     """
     Proxies props query to Strapi using strapi_locale (from Locale_Params), returns the result.
+    Includes populate=* so that file/media fields (e.g., TermsLink, Manual_Link) are returned.
     """
     # Step 1: Convert to strapi_locale using MongoDB
     locale_doc = locale_params_collection.find_one({"locale": locale})
@@ -33,8 +34,8 @@ async def props_lookup(
 
     strapi_locale = locale_doc["strapi_locale"]
 
-    # Step 2: Build query params for Strapi
-    params = [("locale", strapi_locale)]
+    # Step 2: Build query params for Strapi (add populate=*)
+    params = [("locale", strapi_locale), ("populate", "*")]
     for idx, pid in enumerate(product_ids):
         params.append((f"filters[Product_ID][$in][{idx}]", pid))
 
