@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, HttpUrl
 from typing import List, Optional, Dict
 from enum import Enum
 import stripe
@@ -17,13 +17,30 @@ class ModeEnum(str, Enum):
     subscription = "subscription"
 
 class CheckoutSessionRequest(BaseModel):
+    # Core product info
     product_name: str = Field(..., example="Test Product")
-    unit_amount: int = Field(..., example=2500, description="Amount in the smallest currency unit (e.g. cents)")
+    product_description: Optional[str] = Field(   # ✅ NEW
+        default=None, example="Extended 3-year protection for your device"
+    )
+    product_images: Optional[List[HttpUrl]] = Field(  # ✅ NEW
+        default=None, example=["https://yourcdn.com/images/product.png"]
+    )
+
+    unit_amount: int = Field(
+        ..., example=2500, description="Amount in the smallest currency unit (e.g. cents)"
+    )
     currency: str = Field(..., example="usd")
     quantity: int = Field(..., gt=0, example=1)
+
     # Subscription fields (ignored for payments)
-    recurring_interval: Optional[str] = Field(default=None, example="month", description="For subscriptions: 'day', 'week', 'month', or 'year'")
-    recurring_interval_count: Optional[int] = Field(default=1, example=1, description="For subscriptions: Number of intervals between billings")
+    recurring_interval: Optional[str] = Field(
+        default=None, example="month", description="For subscriptions: 'day', 'week', 'month', or 'year'"
+    )
+    recurring_interval_count: Optional[int] = Field(
+        default=1, example=1, description="For subscriptions: Number of intervals between billings"
+    )
+
+    # Customer / session details
     customer_email: Optional[EmailStr] = Field(default=None, example="customer@email.com")
     allow_promotion_codes: bool = Field(default=False)
     success_url: str = Field(..., example="https://yourdomain.com/success")
@@ -38,14 +55,26 @@ class CheckoutSessionRequest(BaseModel):
 def build_line_items(request: CheckoutSessionRequest):
     price_data = {
         "currency": request.currency,
-        "product_data": {"name": request.product_name},
+        "product_data": {
+            "name": request.product_name,
+        },
         "unit_amount": request.unit_amount,
     }
+
+    # ✅ Add description if provided
+    if request.product_description:
+        price_data["product_data"]["description"] = request.product_description
+
+    # ✅ Add images if provided
+    if request.product_images:
+        price_data["product_data"]["images"] = request.product_images
+
     if request.mode == "subscription":
         price_data["recurring"] = {
             "interval": request.recurring_interval or "month",
             "interval_count": request.recurring_interval_count or 1
         }
+
     return [{
         "price_data": price_data,
         "quantity": request.quantity
