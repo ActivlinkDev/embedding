@@ -1,19 +1,46 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, EmailStr, HttpUrl
 from typing import List, Optional, Dict
+from enum import Enum
 import stripe
 import os
 import requests
 
-router = APIRouter(tags=["Stripe Checkout"])
+router = APIRouter(tags=["Payment Links"])
 
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 TINYURL_API_KEY = os.getenv("TINYURL_API_KEY")
 TINYURL_API_URL = "https://api.tinyurl.com/create"
 
+class ModeEnum(str, Enum):
+    payment = "payment"
+    subscription = "subscription"
+
 class CheckoutSessionRequest(BaseModel):
-    price_id: str = Field(..., example="price_1NE5HZGsjgCM...")
+    # Core product info
+    product_name: str = Field(..., example="Test Product")
+    product_description: Optional[str] = Field(   # ✅ NEW
+        default=None, example="Extended 3-year protection for your device"
+    )
+    product_images: Optional[List[HttpUrl]] = Field(  # ✅ NEW
+        default=None, example=["https://yourcdn.com/images/product.png"]
+    )
+
+    unit_amount: int = Field(
+        ..., example=2500, description="Amount in the smallest currency unit (e.g. cents)"
+    )
+    currency: str = Field(..., example="usd")
     quantity: int = Field(..., gt=0, example=1)
+
+    # Subscription fields (ignored for payments)
+    recurring_interval: Optional[str] = Field(
+        default=None, example="month", description="For subscriptions: 'day', 'week', 'month', or 'year'"
+    )
+    recurring_interval_count: Optional[int] = Field(
+        default=1, example=1, description="For subscriptions: Number of intervals between billings"
+    )
+
+    # Customer / session details
     customer_email: Optional[EmailStr] = Field(default=None, example="customer@email.com")
     allow_promotion_codes: bool = Field(default=False)
     success_url: str = Field(..., example="https://yourdomain.com/success")
@@ -21,20 +48,39 @@ class CheckoutSessionRequest(BaseModel):
     phone_number_collection: bool = Field(default=False)
     internal_reference: str = Field(..., example="order-12345")
     payment_method_types: Optional[List[str]] = Field(default=["card"], example=["card", "alipay"])
-    mode: str = Field(..., example="payment", description="Stripe session mode: payment, setup, or subscription")
+    mode: ModeEnum = Field(..., example="payment", description="Stripe session mode: payment or subscription")
     metadata: Optional[Dict[str, str]] = Field(default_factory=dict, example={"order_id": "1234"})
     locale: Optional[str] = Field(default=None, example="fr")
 
 def build_line_items(request: CheckoutSessionRequest):
+    price_data = {
+        "currency": request.currency,
+        "product_data": {
+            "name": request.product_name,
+        },
+        "unit_amount": request.unit_amount,
+    }
+
+    # ✅ Add description if provided
+    if request.product_description:
+        price_data["product_data"]["description"] = request.product_description
+
+    # ✅ Add images if provided
+    if request.product_images:
+        price_data["product_data"]["images"] = request.product_images
+
+    if request.mode == "subscription":
+        price_data["recurring"] = {
+            "interval": request.recurring_interval or "month",
+            "interval_count": request.recurring_interval_count or 1
+        }
+
     return [{
-        "price": request.price_id,
+        "price_data": price_data,
         "quantity": request.quantity
     }]
 
 def shorten_with_tinyurl(long_url: str) -> str:
-    """
-    Shorten a URL using TinyURL API. Returns the short URL or raises HTTPException.
-    """
     headers = {
         "Authorization": f"Bearer {TINYURL_API_KEY}",
         "Content-Type": "application/json",
@@ -61,7 +107,7 @@ def generate_checkout_session(request: CheckoutSessionRequest):
         session_params = {
             "payment_method_types": request.payment_method_types or ["card"],
             "line_items": build_line_items(request),
-            "mode": request.mode,
+            "mode": request.mode.value,  # Enum to string
             "allow_promotion_codes": request.allow_promotion_codes,
             "success_url": request.success_url + "?session_id={CHECKOUT_SESSION_ID}",
             "cancel_url": request.cancel_url,
@@ -74,7 +120,6 @@ def generate_checkout_session(request: CheckoutSessionRequest):
 
         session = stripe.checkout.Session.create(**session_params)
         checkout_url = session.url
-        # Shorten the checkout URL using TinyURL
         short_url = shorten_with_tinyurl(checkout_url)
         return {
             "checkout_url": checkout_url,
