@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, EmailStr, HttpUrl
 from typing import List, Optional, Dict
 from enum import Enum
 import stripe
@@ -19,10 +19,10 @@ class ModeEnum(str, Enum):
 class CheckoutSessionRequest(BaseModel):
     # Core product info
     product_name: str = Field(..., example="Test Product")
-    product_description: Optional[str] = Field(
+    product_description: Optional[str] = Field(   # ✅ NEW
         default=None, example="Extended 3-year protection for your device"
     )
-    product_images: Optional[List[HttpUrl]] = Field(
+    product_images: Optional[List[HttpUrl]] = Field(  # ✅ NEW
         default=None, example=["https://yourcdn.com/images/product.png"]
     )
 
@@ -41,8 +41,7 @@ class CheckoutSessionRequest(BaseModel):
     )
 
     # Customer / session details
-    # ✅ relaxed: plain string or None (no EmailStr enforcement)
-    customer_email: Optional[str] = Field(default=None, example="customer@email.com or null")
+    customer_email: Optional[EmailStr] = Field(default=None, example="customer@email.com")
     allow_promotion_codes: bool = Field(default=False)
     success_url: str = Field(..., example="https://yourdomain.com/success")
     cancel_url: str = Field(..., example="https://yourdomain.com/cancel")
@@ -62,9 +61,11 @@ def build_line_items(request: CheckoutSessionRequest):
         "unit_amount": request.unit_amount,
     }
 
+    # ✅ Add description if provided
     if request.product_description:
         price_data["product_data"]["description"] = request.product_description
 
+    # ✅ Add images if provided
     if request.product_images:
         price_data["product_data"]["images"] = request.product_images
 
@@ -106,7 +107,7 @@ def generate_checkout_session(request: CheckoutSessionRequest):
         session_params = {
             "payment_method_types": request.payment_method_types or ["card"],
             "line_items": build_line_items(request),
-            "mode": request.mode.value,
+            "mode": request.mode.value,  # Enum to string
             "allow_promotion_codes": request.allow_promotion_codes,
             "success_url": request.success_url + "?session_id={CHECKOUT_SESSION_ID}",
             "cancel_url": request.cancel_url,
@@ -114,7 +115,7 @@ def generate_checkout_session(request: CheckoutSessionRequest):
             "metadata": {**(request.metadata or {}), "internal_reference": request.internal_reference},
             "locale": request.locale if request.locale else None
         }
-        if request.customer_email is not None:
+        if request.customer_email:
             session_params["customer_email"] = request.customer_email
 
         session = stripe.checkout.Session.create(**session_params)

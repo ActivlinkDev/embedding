@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional, List, Union
+from typing import Optional
 from bson import ObjectId
 from routers.generate_payment_link import generate_checkout_session, CheckoutSessionRequest, ModeEnum
 from pymongo import MongoClient
@@ -16,16 +16,11 @@ class PaymentLinkRequest(BaseModel):
     quote_id: str
     product_id: str
     optionref: int
-    email: Union[str, None] = None             # can be string or null
-    product_name: Optional[str] = None
-    product_description: Optional[str] = None
-    product_images: Optional[List[str]] = None
-
-    class Config:
-        extra = "ignore"
+    email: Optional[str] = None  # Optional email field
 
 @router.post("/generate_payment_link")
 def generate_quote_payment_link(req: PaymentLinkRequest):
+    # 1. Load quote from DB
     try:
         clean_id = req.quote_id.strip()
         quote = quotes_collection.find_one({"_id": ObjectId(clean_id)})
@@ -35,35 +30,37 @@ def generate_quote_payment_link(req: PaymentLinkRequest):
     if not quote:
         raise HTTPException(status_code=404, detail="Quote not found")
 
+    # 2. Find the product in responses by product_id
     responses = quote.get("responses", [])
     product = next((r for r in responses if r.get("product_id") == req.product_id), None)
     if not product:
         raise HTTPException(status_code=404, detail="Product not found in quote responses")
 
+    # 3. Get the correct option
     options = product.get("options", [])
     if req.optionref < 0 or req.optionref >= len(options):
         raise HTTPException(status_code=400, detail="Optionref out of range for this product")
 
     option = options[req.optionref]
 
+    # 4. Build CheckoutSessionRequest
     try:
         unit_amount = int(option["rounded_price_pence"])
     except (ValueError, KeyError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid or missing rounded_price_pence in option")
 
+    # Do not fallback to "en" for locale; only set if it exists
     locale = product.get("lang") if "lang" in product else None
 
     req_checkout = CheckoutSessionRequest(
-        product_name=req.product_name if req.product_name else product.get("product_id", "Product"),
-        product_description=req.product_description if req.product_description else None,
-        product_images=req.product_images if req.product_images else None,
+        product_name=product.get("product_id", "Product"),
         unit_amount=unit_amount,
         currency=product.get("currency", "gbp").lower(),
         quantity=1,
         mode=ModeEnum(option.get("mode", "payment")),
         success_url="https://yourdomain.com/success",
         cancel_url="https://yourdomain.com/cancel",
-        locale=locale,
+        locale=locale,  # Only set if it exists
         internal_reference=str(quote["_id"]),
         metadata={
             "client": product.get("client", ""),
@@ -72,11 +69,10 @@ def generate_quote_payment_link(req: PaymentLinkRequest):
             "product_id": req.product_id,
             "optionref": str(req.optionref),
         },
-        # ✅ allow None to flow through
-        customer_email=req.email
+        customer_email=req.email if req.email else None
     )
 
     try:
         return generate_checkout_session(req_checkout)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal error during Stripe session creation: {e}")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal error during Stripe session creation.")
