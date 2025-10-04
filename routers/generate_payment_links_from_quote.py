@@ -65,7 +65,7 @@ def generate_quote_payment_link(req: PaymentLinkRequest):
         quantity=1,
         mode=ModeEnum(option.get("mode", "payment")),
         success_url="https://yourdomain.com/success",
-        cancel_url="https://yourdomain.com/cancel",
+        cancel_url="https://frontend-production-7798.up.railway.app/lookup",
         locale=locale,
         internal_reference=str(quote["_id"]),
         metadata={
