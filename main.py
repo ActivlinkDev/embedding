@@ -81,8 +81,9 @@ ROUTERS = {
     "otp": "routers.otp",
 
     # cms
-    "props_lookup": "routers.props_lookup",
-    "cms_display_offer": "routers.cms_display_offer",
+    "props_lookup": "routers.cms.props_lookup",
+    "cms_display_offer": "routers.cms.cms_display_offer",
+    "validate_customer": "routers.cms.validate_customer",
 
     # email ingest 
     "email_ingest": "routers.email_ingest",
