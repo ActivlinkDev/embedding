@@ -3,6 +3,7 @@ import httpx
 import os
 from pymongo import MongoClient
 from utils.dependencies import verify_token
+from utils.locale import resolve_strapi_locale, LocaleNotSupportedError
 
 router = APIRouter(tags=["CMS Display Offer"]) 
 
@@ -21,10 +22,10 @@ async def cms_display_offer(
     _: None = Depends(verify_token)
 ):
     locale_doc = locale_params_collection.find_one({"locale": locale})
-    if not locale_doc or "strapi_locale" not in locale_doc:
-        raise HTTPException(status_code=400, detail=f"Locale '{locale}' is not supported or has no strapi_locale mapping.")
-
-    strapi_locale = locale_doc["strapi_locale"]
+    try:
+        _, strapi_locale = resolve_strapi_locale(locale, locale_doc)
+    except LocaleNotSupportedError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     params = {"locale": strapi_locale}
     headers = {"Authorization": f"Bearer {STRAPI_BEARER_TOKEN}"}
 
