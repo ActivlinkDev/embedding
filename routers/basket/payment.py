@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field, EmailStr
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from bson import ObjectId
 from pymongo import MongoClient
 import os
@@ -22,6 +22,9 @@ basket_collection = db["Basket_Quotes"]
 class BasketPaymentRequest(BaseModel):
     basket_id: str = Field(..., description="Basket_Quotes _id as string")
     email: Optional[EmailStr] = Field(None, description="Customer email for Stripe session")
+    product_name: Optional[str] = Field(None, description="Override product name for Stripe")
+    product_description: Optional[str] = Field(None, description="Override product description for Stripe")
+    product_images: Optional[List[str]] = Field(None, description="Override product images (URLs) for Stripe")
 
 
 def _extract_currency(items: list[dict[str, Any]]) -> str:
@@ -104,12 +107,15 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
         mode_enum = ModeEnum.payment
 
     # 4) Build request for Stripe
-    product_name = basket.get("name") or "Basket checkout"
-    product_description = basket.get("description") or "Basket items checkout"
+    best_rule = basket.get("best_rule") or {}
+    product_name = req.product_name or best_rule.get("name") or basket.get("name") or "Basket checkout"
+    product_description = req.product_description or basket.get("description") or "Basket items checkout"
+    product_images = req.product_images
 
     req_checkout = CheckoutSessionRequest(
         product_name=product_name,
         product_description=product_description,
+        product_images=product_images,
         unit_amount=int(amount_minor),
         currency=currency,
         quantity=1,
