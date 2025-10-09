@@ -23,16 +23,16 @@ class RuleResult(BaseModel):
     name: str
     priority: int
     ruleType: str
-    discount_pence: int
+    discount: int
     explanation: Optional[str] = None
 
 
 class RateBasketResponse(BaseModel):
     basket_id: str
-    subtotal_pence: int
+    subtotal: int
     eligible_rules: List[RuleResult]
     best: Optional[RuleResult] = None
-    final_total_pence: int
+    final_total: int
 
 
 # ---- helpers ----
@@ -132,10 +132,10 @@ def _apply_tiered_percent(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> 
         subtotal = sum(_price_pence(it) for it in gitems)
         d = int(subtotal * percent / 100)
         total_discount += d
-        parts.append(f"{count} items in {gkey} -> {percent}% of {subtotal}p = {d}p")
+        parts.append(f"{count} items in {gkey} -> {percent}% of {subtotal} = {d}")
 
     if cap > 0 and total_discount > cap:
-        parts.append(f"cap {cap}p applied (was {total_discount}p)")
+        parts.append(f"cap {cap} applied (was {total_discount})")
         total_discount = cap
 
     return total_discount, "; ".join(parts)
@@ -239,7 +239,7 @@ def _apply_fixed_price_bundle(rule: Dict[str, Any], items: List[Dict[str, Any]])
                     disc = max(0, s - fp)
                     group_disc += disc
                     caps_used[ti] += 1
-                    expl_bits.append(f"bundle(size {bs}) {tuple(block)} -> (sum {s}p - fixed {fp}p) = {disc}p")
+                    expl_bits.append(f"bundle(size {bs}) {tuple(block)} -> (sum {s} - fixed {fp}) = {disc}")
                     idx += bs
                     progressed = True
                     break  # restart from largest tier again
@@ -259,7 +259,7 @@ def _apply_fixed_price_bundle(rule: Dict[str, Any], items: List[Dict[str, Any]])
                 disc = max(0, s - fp)
                 if disc > best_disc:
                     best_disc = disc
-                    best_msg = f"bundle(size {bs}) {tuple(block)} -> (sum {s}p - fixed {fp}p) = {disc}p"
+                    best_msg = f"bundle(size {bs}) {tuple(block)} -> (sum {s} - fixed {fp}) = {disc}"
             group_disc += best_disc
             if best_msg:
                 expl_bits.append(best_msg)
@@ -291,7 +291,7 @@ def _evaluate_rule(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> RuleRes
         name=rule.get("name", ""),
         priority=int(rule.get("priority", 0)),
         ruleType=rtype or "",
-        discount_pence=int(discount),
+        discount=int(discount),
         explanation=explanation,
     )
 
@@ -317,20 +317,42 @@ def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
     # Evaluate all rules
     results = [_evaluate_rule(r, items) for r in rules]
 
-    # Choose best rule by discount_pence then priority (higher priority wins if same discount)
+    # Choose best rule by discount then priority (higher priority wins if same discount)
     best: Optional[RuleResult] = None
-    for r in sorted(results, key=lambda rr: (-rr.discount_pence, -rr.priority)):
-        if r.discount_pence > 0:
+    for r in sorted(results, key=lambda rr: (-rr.discount, -rr.priority)):
+        if r.discount > 0:
             best = r
             break
 
-    discount = best.discount_pence if best else 0
+    discount = best.discount if best else 0
     final_total = max(0, subtotal_pence - discount)
+
+    # Determine mode summary (single mode or 'mixed')
+    modes = {it.get("mode") for it in items if it.get("mode") is not None}
+    mode_value = next(iter(modes)) if len(modes) == 1 else "mixed"
+
+    # Persist summary back to Basket_Quotes document
+    try:
+        basket_collection.update_one(
+            {"_id": bid},
+            {
+                "$set": {
+                    "subtotal": int(subtotal_pence),
+                    "final_total": int(final_total),
+                    "discount": int(discount),
+                    "best_rule": best.dict() if best else None,
+                    "mode": mode_value,
+                }
+            }
+        )
+    except Exception:
+        # Non-blocking: still return computed response
+        pass
 
     return RateBasketResponse(
         basket_id=str(basket["_id"]),
-        subtotal_pence=int(subtotal_pence),
+        subtotal=int(subtotal_pence),
         eligible_rules=results,
         best=best,
-        final_total_pence=int(final_total),
+        final_total=int(final_total),
     )
