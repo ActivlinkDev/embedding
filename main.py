@@ -73,6 +73,7 @@ ROUTERS = {
     # basket
     "basket": "routers.basket",
     "ratebasket": "routers.basket.ratebasket",
+    "basket_payment": "routers.basket.payment",
 
     # misc features
     "generate_faults": "routers.generate_faults",
