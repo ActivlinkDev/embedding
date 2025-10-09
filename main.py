@@ -72,6 +72,7 @@ ROUTERS = {
     "stripe_webook": "routers.stripe_webook",
     # basket
     "basket": "routers.basket",
+    "ratebasket": "routers.basket.ratebasket",
 
     # misc features
     "generate_faults": "routers.generate_faults",
