@@ -70,6 +70,8 @@ ROUTERS = {
     "generate_payment_link": "routers.generate_payment_link",
     "sync_stripe_prices": "routers.sync_stripe_prices",
     "stripe_webook": "routers.stripe_webook",
+    # basket
+    "basket": "routers.basket",
 
     # misc features
     "generate_faults": "routers.generate_faults",
