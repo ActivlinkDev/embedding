@@ -141,19 +141,150 @@ def _apply_tiered_percent(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> 
     return total_discount, "; ".join(parts)
 
 
+def _apply_fixed_price_bundle(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> Tuple[int, str]:
+    """Apply FIXED_PRICE_BUNDLE rule.
+    ruleParams supports two shapes:
+      Single-tier (backward compatible):
+        - bundleSize (int): number of items per bundle
+        - fixedPricePence (int): target price in pence for each full bundle
+        - repeatable (bool): apply for each full bundle or only once
+        - capBundles (int): optional max bundles to apply (0 = unlimited)
+      Multi-tier:
+        - bundles: [ { bundleSize, fixedPricePence, capBundles? }, ... ]
+        - repeatable (bool): apply greedily across tiers if true; else apply only the single best tier once
+
+    Notes:
+      - Items are grouped according to constraints (sameModeRequired, etc.).
+      - Within each group, items are sorted by price descending.
+      - Discount per bundle = max(0, sum(block) - fixedPricePence).
+      - Multi-tier algorithm: greedy largest-first by bundleSize; honors per-tier capBundles and repeatable.
+    Returns (discount_pence, explanation).
+    """
+    constraints = rule.get("constraints", {}) or {}
+    params = rule.get("ruleParams", {}) or {}
+
+    # Normalize into multi-tier structure if needed
+    bundles_cfg = params.get("bundles")
+    repeatable = bool(params.get("repeatable", True))
+    if bundles_cfg and isinstance(bundles_cfg, list) and len(bundles_cfg) > 0:
+        tiers = []
+        for b in bundles_cfg:
+            bs = _as_int((b or {}).get("bundleSize", 0), 0)
+            fp = _as_int((b or {}).get("fixedPricePence", 0), 0)
+            cap = _as_int((b or {}).get("capBundles", 0), 0)
+            if bs > 0 and fp > 0:
+                tiers.append({"bundleSize": bs, "fixedPricePence": fp, "capBundles": cap})
+        # Sort tiers by bundleSize desc (greedy largest-first)
+        tiers = sorted(tiers, key=lambda t: t["bundleSize"], reverse=True)
+        if not tiers:
+            return 0, "Invalid bundles configuration"
+        smallest_bundle = min(t["bundleSize"] for t in tiers)
+    else:
+        # Single-tier fallback
+        bs = _as_int(params.get("bundleSize", 0), 0)
+        fp = _as_int(params.get("fixedPricePence", 0), 0)
+        cap = _as_int(params.get("capBundles", 0), 0)
+        if bs <= 0 or fp <= 0:
+            return 0, "Invalid bundleSize/fixedPricePence"
+        tiers = [{"bundleSize": max(1, bs), "fixedPricePence": fp, "capBundles": cap}]
+        smallest_bundle = tiers[0]["bundleSize"]
+
+    min_items_req = _as_int(constraints.get("minItems", 0), 0)
+
+    # Group items per constraints
+    groups: Dict[Tuple, List[Dict[str, Any]]] = {}
+    for it in items:
+        k = _group_key(it, constraints)
+        groups.setdefault(k, []).append(it)
+
+    total_discount = 0
+    parts: List[str] = []
+
+    for gkey, gitems in groups.items():
+        count = len(gitems)
+        need = max(min_items_req, smallest_bundle)
+        if count < need:
+            continue
+
+        prices = sorted([_price_pence(it) for it in gitems if _price_pence(it) > 0], reverse=True)
+        if not prices:
+            continue
+
+        group_disc = 0
+        expl_bits: List[str] = []
+
+        if repeatable:
+            # Greedy largest-first across tiers
+            # Track per-tier caps consumption
+            caps_used = {i: 0 for i in range(len(tiers))}
+            idx = 0
+            # While we can fit any bundle from remaining items
+            while True:
+                progressed = False
+                remaining = len(prices) - idx
+                if remaining < smallest_bundle:
+                    break
+                for ti, t in enumerate(tiers):
+                    bs = t["bundleSize"]
+                    fp = t["fixedPricePence"]
+                    cap = t.get("capBundles", 0)
+                    if remaining < bs:
+                        continue
+                    if cap > 0 and caps_used[ti] >= cap:
+                        continue
+                    block = prices[idx: idx + bs]
+                    if len(block) < bs:
+                        continue
+                    s = sum(block)
+                    disc = max(0, s - fp)
+                    group_disc += disc
+                    caps_used[ti] += 1
+                    expl_bits.append(f"bundle(size {bs}) {tuple(block)} -> (sum {s}p - fixed {fp}p) = {disc}p")
+                    idx += bs
+                    progressed = True
+                    break  # restart from largest tier again
+                if not progressed:
+                    break
+        else:
+            # Apply only the single best bundle once (choose tier with highest discount on top prices)
+            best_disc = 0
+            best_msg = None
+            for t in tiers:
+                bs = t["bundleSize"]
+                fp = t["fixedPricePence"]
+                if len(prices) < bs:
+                    continue
+                block = prices[:bs]
+                s = sum(block)
+                disc = max(0, s - fp)
+                if disc > best_disc:
+                    best_disc = disc
+                    best_msg = f"bundle(size {bs}) {tuple(block)} -> (sum {s}p - fixed {fp}p) = {disc}p"
+            group_disc += best_disc
+            if best_msg:
+                expl_bits.append(best_msg)
+
+        total_discount += group_disc
+        parts.append(f"{count} items in {gkey} -> {len(expl_bits)} bundle(s): " + "; ".join(expl_bits))
+
+    return total_discount, "; ".join(parts)
+
 def _evaluate_rule(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> RuleResult:
     # Filter items that match appliesTo
     matched = [it for it in items if _match_applies_to(rule, it)]
     discount = 0
     explanation = None
     rtype = rule.get("ruleType")
+    rkind = (rtype or "").strip().upper()
 
-    if rtype == "TIERED_PERCENT":
+    if rkind == "TIERED_PERCENT":
         discount, explanation = _apply_tiered_percent(rule, matched)
+    elif rkind == "FIXED_PRICE_BUNDLE":
+        discount, explanation = _apply_fixed_price_bundle(rule, matched)
     else:
         # Unknown rule: no discount
         discount = 0
-        explanation = "Unsupported ruleType"
+        explanation = f"Unsupported ruleType '{rtype}'"
 
     return RuleResult(
         rule_id=str(rule.get("_id")),
