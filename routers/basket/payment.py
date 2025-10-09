@@ -12,7 +12,7 @@ from routers.generate_payment_link import (
     ModeEnum,
 )
 
-router = APIRouter(tags=["Basket Payments"])
+router = APIRouter(tags=["Basket"])
 
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
