@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 from pymongo import MongoClient, ReturnDocument
@@ -137,15 +137,41 @@ def get_basket(basket_id: str, _: None = Depends(verify_token)):
 
 
 @router.delete("/basket/{basket_id}/item/{device_id}")
-def delete_basket_item(basket_id: str, device_id: str, _: None = Depends(verify_token)):
-    """Delete all items in Basket array with matching deviceId and return updated doc."""
+def delete_basket_item(
+    basket_id: str,
+    device_id: str,
+    poc: Optional[int] = Query(None, description="Filter by term (months) to target a single item"),
+    product_id: Optional[str] = Query(None, description="Filter by product_id to target a single item"),
+    rounded_price_pence: Optional[int] = Query(None, description="Filter by rounded_price_pence to target a single item"),
+    mode: Optional[str] = Query(None, description="Filter by mode to target a single item"),
+    quote_id: Optional[str] = Query(None, description="Filter by originating quote id to target a single item"),
+    _: None = Depends(verify_token),
+):
+    """Delete a single item in Basket array by deviceId and optional narrowing filters, then return updated doc.
+
+    Note: MongoDB $pull removes all matches. With provided filters (e.g. deviceId + poc), we expect to uniquely match 1 item.
+    For absolute precision, consider migrating to per-line unique IDs in future.
+    """
     try:
         bid = ObjectId(basket_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid basket_id; must be a valid ObjectId string")
 
-    # Pull all items with the deviceId
-    update_result = basket_collection.update_one({"_id": bid}, {"$pull": {"Basket": {"deviceId": device_id}}})
+    # Build precise pull criteria
+    pull_criteria: Dict[str, Any] = {"deviceId": device_id}
+    if poc is not None:
+        pull_criteria["poc"] = int(poc)
+    if product_id:
+        pull_criteria["product_id"] = product_id
+    if rounded_price_pence is not None:
+        pull_criteria["rounded_price_pence"] = int(rounded_price_pence)
+    if mode:
+        pull_criteria["mode"] = mode
+    if quote_id:
+        pull_criteria["quote_id"] = quote_id
+
+    # Pull items matching the criteria (ideally 1)
+    update_result = basket_collection.update_one({"_id": bid}, {"$pull": {"Basket": pull_criteria}})
     if update_result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Basket not found")
 

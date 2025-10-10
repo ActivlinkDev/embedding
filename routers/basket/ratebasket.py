@@ -29,7 +29,6 @@ class RuleResult(BaseModel):
 
 class RateBasketResponse(BaseModel):
     basket_id: str
-    quote_id: Optional[str] = Field(None, description="Originating quote id for this basket")
     subtotal: int
     eligible_rules: List[RuleResult]
     best: Optional[RuleResult] = None
@@ -287,10 +286,17 @@ def _evaluate_rule(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> RuleRes
         discount = 0
         explanation = f"Unsupported ruleType '{rtype}'"
 
+    # Safe conversions to avoid runtime errors on null/invalid fields
+    rid = rule.get("_id")
+    rule_id = str(rid) if rid is not None else ""
+    name_val = rule.get("name")
+    name = str(name_val) if name_val is not None else ""
+    prio = _as_int(rule.get("priority", 0), 0)
+
     return RuleResult(
-        rule_id=str(rule.get("_id")),
-        name=rule.get("name", ""),
-        priority=int(rule.get("priority", 0)),
+        rule_id=rule_id,
+        name=name,
+        priority=prio,
         ruleType=rtype or "",
         discount=int(discount),
         explanation=explanation,
@@ -352,7 +358,6 @@ def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
 
     return RateBasketResponse(
         basket_id=str(basket["_id"]),
-        quote_id=str(basket.get("quote_id")) if basket.get("quote_id") else None,
         subtotal=int(subtotal_pence),
         eligible_rules=results,
         best=best,
