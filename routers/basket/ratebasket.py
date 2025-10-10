@@ -29,6 +29,7 @@ class RuleResult(BaseModel):
 
 class RateBasketResponse(BaseModel):
     basket_id: str
+    quote_id: Optional[str] = Field(None, description="Originating quote id for this basket")
     subtotal: int
     eligible_rules: List[RuleResult]
     best: Optional[RuleResult] = None
@@ -351,6 +352,7 @@ def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
 
     return RateBasketResponse(
         basket_id=str(basket["_id"]),
+        quote_id=str(basket.get("quote_id")) if basket.get("quote_id") else None,
         subtotal=int(subtotal_pence),
         eligible_rules=results,
         best=best,

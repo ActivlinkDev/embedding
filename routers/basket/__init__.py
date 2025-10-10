@@ -69,6 +69,7 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
     # Core fields expected in example
     basket_item = {
         "deviceId": device_id,
+        "quote_id": payload.quote_id,
         "product_id": product.get("product_id"),
         "client": product.get("client"),
         "currency": product.get("currency"),

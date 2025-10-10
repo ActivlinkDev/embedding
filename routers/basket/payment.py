@@ -126,6 +126,7 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
         internal_reference=str(basket["_id"]),
         metadata={
             "basket_id": str(basket["_id"]),
+            "quote_id": str(basket.get("quote_id")) if basket.get("quote_id") else "",
             "client": _extract_client(items),
             "source": _extract_source(items),
         },
