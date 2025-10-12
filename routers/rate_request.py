@@ -46,6 +46,7 @@ class RateRequest(BaseModel):
 
 class RateRequestBatch(BaseModel):
     deviceId: Optional[str] = Field(None, example="abc-123")
+    clientKey: Optional[str] = Field(None, description="Client key associated with this quote")
     requests: List[RateRequest]
 
 # --- Utilities (Unchanged) ---
@@ -242,6 +243,7 @@ def rate_request(
     # Store grouped responses in Quotes collection
     quote_insert = quotes_collection.insert_one({
         "deviceId": device_id,
+        "clientKey": payload.clientKey,
         "responses": grouped,
         "created_at": datetime.utcnow()
     })
