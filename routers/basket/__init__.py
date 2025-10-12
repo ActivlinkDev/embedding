@@ -19,8 +19,16 @@ basket_collection = db["Basket_Quotes"]
 
 class AddToBasketRequest(BaseModel):
     quote_id: str = Field(..., description="Quotes._id as string")
-    product_id: str = Field(..., description="Group product_id inside quote.responses")
-    optionref: int = Field(..., ge=0, description="Index into the group's options array")
+    # product_id/optionref are required only when add_to_basket is true
+    product_id: Optional[str] = Field(
+        default=None,
+        description="Group product_id inside quote.responses (required when add_to_basket=true)",
+    )
+    optionref: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Index into the group's options array (required when add_to_basket=true)",
+    )
     # Optional root-level metadata to persist when creating a new Basket_Quotes document
     client: Optional[str] = Field(
         default=None,
@@ -53,6 +61,11 @@ class AddToBasketRequest(BaseModel):
         default=True,
         description="If true, append as a basket line item. If false, store quote/device in 'skipped_items' instead.",
     )
+    # Optional category for skipped items when product_id is not provided
+    category: Optional[str] = Field(
+        default=None,
+        description="Optional category used when adding a skipped item without specifying product_id",
+    )
     # Basket control: pass basket_id to append to an existing basket document
     basket_id: Optional[str] = Field(None, description="Existing Basket_Quotes _id to append to")
 
@@ -81,72 +94,75 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
     if not quote:
         raise HTTPException(status_code=404, detail="Quote not found")
 
-    # 2) Find the grouped product and option within the quote
+    # 2) Branch based on action
     responses = quote.get("responses", [])
-    product = next((r for r in responses if r.get("product_id") == payload.product_id), None)
-    if not product:
-        raise HTTPException(status_code=404, detail="Product not found in quote responses")
-
-    options = product.get("options", [])
-    if payload.optionref < 0 or payload.optionref >= len(options):
-        raise HTTPException(status_code=400, detail="optionref out of range for this product")
-
-    option = options[payload.optionref]
-
-    # 3) Build the basket line-item (or skipped entry) from quote fields
-    # Quote created by rate_request stores deviceId at root and grouped response fields in product/option
+    # Quote created by rate_request stores deviceId at root
     device_id = quote.get("deviceId")
-
-    # Core fields for normal basket items
     # Respect optional make/model from payload when provided
     payload_make = (payload.make or "").strip() or None
     payload_model = (payload.model or "").strip() or None
 
-    basket_item = {
-        "deviceId": device_id,
-        "quote_id": payload.quote_id,
-        "product_id": product.get("product_id"),
-        # Optional display text for downstream UIs
-        "product_name": payload.product_name,
-        "product_description": payload.product_description,
-        "product_images": payload.product_images,
-        "currency": product.get("currency"),
-        "category": product.get("category"),
-        "make": payload_make
-                 or (quote.get("make") if isinstance(quote.get("make"), str) else None)
-                 or (quote.get("identifiers", {}) or {}).get("make"),
-        "model": payload_model
-                  or (quote.get("model") if isinstance(quote.get("model"), str) else None)
-                  or (quote.get("identifiers", {}) or {}).get("model"),
-        "age": product.get("age"),
-        "price": product.get("price"),
-        "multi_count": product.get("multi_count"),
-        "source": product.get("source"),
-        "lang": product.get("lang"),
-        # Option-level
-        "poc": option.get("poc"),
-        "mode": option.get("mode"),
-        "rate": option.get("rate"),
-        "rounded_price": option.get("rounded_price"),
-        "rounded_price_pence": option.get("rounded_price_pence"),
-    }
+    if payload.add_to_basket is False:
+        # Build minimal skipped entry without requiring product_id/optionref
+        locale_val = (payload.locale or (responses[0].get("locale") if responses else None) or quote.get("locale"))
+        category_val = (payload.category or (responses[0].get("category") if responses else None))
+        skipped_item = {
+            "quote_id": payload.quote_id,
+            "deviceId": device_id,
+            "locale": locale_val,
+            "category": category_val,
+            "make": payload_make
+                     or (quote.get("make") if isinstance(quote.get("make"), str) else None)
+                     or (quote.get("identifiers", {}) or {}).get("make"),
+            "model": payload_model
+                      or (quote.get("model") if isinstance(quote.get("model"), str) else None)
+                      or (quote.get("identifiers", {}) or {}).get("model"),
+            "created_at": datetime.utcnow(),
+        }
+    else:
+        # Validate requirements for adding to basket
+        if not payload.product_id:
+            raise HTTPException(status_code=400, detail="product_id is required when add_to_basket=true")
+        if payload.optionref is None:
+            raise HTTPException(status_code=400, detail="optionref is required when add_to_basket=true")
+        product = next((r for r in responses if r.get("product_id") == payload.product_id), None)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found in quote responses")
+        options = product.get("options", [])
+        if payload.optionref < 0 or payload.optionref >= len(options):
+            raise HTTPException(status_code=400, detail="optionref out of range for this product")
+        option = options[payload.optionref]
 
-    # Minimal record for skipped items
-    skipped_item = {
-        "quote_id": payload.quote_id,
-        "deviceId": device_id,
-        "locale": product.get("locale") or quote.get("locale"),
-        "category": product.get("category"),
-        "make": payload_make
-                 or (quote.get("make") if isinstance(quote.get("make"), str) else None)
-                 or (quote.get("identifiers", {}) or {}).get("make"),
-        "model": payload_model
-                  or (quote.get("model") if isinstance(quote.get("model"), str) else None)
-                  or (quote.get("identifiers", {}) or {}).get("model"),
-        "created_at": datetime.utcnow(),
-    }
+        basket_item = {
+            "deviceId": device_id,
+            "quote_id": payload.quote_id,
+            "product_id": product.get("product_id"),
+            # Optional display text for downstream UIs
+            "product_name": payload.product_name,
+            "product_description": payload.product_description,
+            "product_images": payload.product_images,
+            "currency": product.get("currency"),
+            "category": product.get("category"),
+            "make": payload_make
+                     or (quote.get("make") if isinstance(quote.get("make"), str) else None)
+                     or (quote.get("identifiers", {}) or {}).get("make"),
+            "model": payload_model
+                      or (quote.get("model") if isinstance(quote.get("model"), str) else None)
+                      or (quote.get("identifiers", {}) or {}).get("model"),
+            "age": product.get("age"),
+            "price": product.get("price"),
+            "multi_count": product.get("multi_count"),
+            "source": product.get("source"),
+            "lang": product.get("lang"),
+            # Option-level
+            "poc": option.get("poc"),
+            "mode": option.get("mode"),
+            "rate": option.get("rate"),
+            "rounded_price": option.get("rounded_price"),
+            "rounded_price_pence": option.get("rounded_price_pence"),
+        }
 
-    # 4) Create or append to Basket_Quotes by _id (basket_id)
+    # 3) Create or append to Basket_Quotes by _id (basket_id)
     if payload.basket_id:
         # Append to existing basket or skipped list
         try:
@@ -195,10 +211,11 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
                 pass
     else:
         # Create new basket document depending on action
-        # Choose root-level client/locale for the basket document (payload preferred, fallback to product/quote)
-        root_client = (payload.client or "").strip() or product.get("client") or quote.get("client")
-        root_locale = (payload.locale or "").strip() or product.get("locale") or quote.get("locale")
+        # Choose root-level client/locale for the basket document
         if payload.add_to_basket is False:
+            # For skipped only, prefer payload.client/locale else quote/responses[0]
+            root_client = (payload.client or "").strip() or quote.get("client")
+            root_locale = (payload.locale or "").strip() or (responses[0].get("locale") if responses else None) or quote.get("locale")
             doc = {
                 "Basket": [],
                 "skipped_items": [skipped_item],
@@ -208,6 +225,10 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
                 "locale": root_locale,
             }
         else:
+            # Adding an item requires product context
+            product_for_root = next((r for r in responses if r.get("product_id") == payload.product_id), None)
+            root_client = (payload.client or "").strip() or (product_for_root or {}).get("client") or quote.get("client")
+            root_locale = (payload.locale or "").strip() or (product_for_root or {}).get("locale") or quote.get("locale")
             doc = {
                 "Basket": [basket_item],
                 "status": "draft",
