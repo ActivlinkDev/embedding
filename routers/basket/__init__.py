@@ -27,6 +27,10 @@ class AddToBasketRequest(BaseModel):
         description="Array of product image URLs to persist on the basket line-item",
         example=["https://cdn.example.com/img1.jpg", "https://cdn.example.com/img2.jpg"],
     )
+    add_to_basket: Optional[bool] = Field(
+        default=True,
+        description="If true, append as a basket line item. If false, store quote/device in 'skipped_items' instead.",
+    )
     # Basket control: pass basket_id to append to an existing basket document
     basket_id: Optional[str] = Field(None, description="Existing Basket_Quotes _id to append to")
 
@@ -67,19 +71,27 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
 
     option = options[payload.optionref]
 
-    # 3) Build the basket line-item from quote fields
+    # 3) Build the basket line-item (or skipped entry) from quote fields
     # Quote created by rate_request stores deviceId at root and grouped response fields in product/option
     device_id = quote.get("deviceId")
 
-    # Core fields expected in example
+    # Core fields for normal basket items
     basket_item = {
         "deviceId": device_id,
         "quote_id": payload.quote_id,
         "product_id": product.get("product_id"),
+        # Optional display text for downstream UIs
+        "product_name": payload.product_name,
+        "product_description": payload.product_description,
+        "product_images": payload.product_images,
         "client": product.get("client"),
         "currency": product.get("currency"),
         "locale": product.get("locale"),
         "category": product.get("category"),
+        "make": (quote.get("make") if isinstance(quote.get("make"), str) else None)
+                 or (quote.get("identifiers", {}) or {}).get("make"),
+        "model": (quote.get("model") if isinstance(quote.get("model"), str) else None)
+                  or (quote.get("identifiers", {}) or {}).get("model"),
         "age": product.get("age"),
         "price": product.get("price"),
         "multi_count": product.get("multi_count"),
@@ -91,19 +103,32 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
         "rate": option.get("rate"),
         "rounded_price": option.get("rounded_price"),
         "rounded_price_pence": option.get("rounded_price_pence"),
-        # Optional visuals for downstream UI/checkout context
-        "product_images": payload.product_images,
+    }
+
+    # Minimal record for skipped items
+    skipped_item = {
+        "quote_id": payload.quote_id,
+        "deviceId": device_id,
+        "locale": product.get("locale") or quote.get("locale"),
+        "category": product.get("category"),
+        "make": (quote.get("make") if isinstance(quote.get("make"), str) else None) or (quote.get("identifiers", {}) or {}).get("make"),
+        "model": (quote.get("model") if isinstance(quote.get("model"), str) else None) or (quote.get("identifiers", {}) or {}).get("model"),
+        "created_at": datetime.utcnow(),
     }
 
     # 4) Create or append to Basket_Quotes by _id (basket_id)
     if payload.basket_id:
-        # Append to existing basket
+        # Append to existing basket or skipped list
         try:
             bid = ObjectId(payload.basket_id)
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid basket_id; must be a valid ObjectId string")
 
-        update: Dict[str, Any] = {"$push": {"Basket": basket_item}}
+        update: Dict[str, Any]
+        if payload.add_to_basket is False:
+            update = {"$push": {"skipped_items": skipped_item}}
+        else:
+            update = {"$push": {"Basket": basket_item}}
 
         result = basket_collection.find_one_and_update(
             {"_id": bid},
@@ -113,12 +138,20 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
         if not result:
             raise HTTPException(status_code=404, detail="Basket not found for provided basket_id")
     else:
-        # Create new basket document
-        doc = {
-            "Basket": [basket_item],
-            "status": "draft",
-            "created_at": datetime.utcnow(),
-        }
+        # Create new basket document depending on action
+        if payload.add_to_basket is False:
+            doc = {
+                "Basket": [],
+                "skipped_items": [skipped_item],
+                "status": "draft",
+                "created_at": datetime.utcnow(),
+            }
+        else:
+            doc = {
+                "Basket": [basket_item],
+                "status": "draft",
+                "created_at": datetime.utcnow(),
+            }
         insert = basket_collection.insert_one(doc)
         result = basket_collection.find_one({"_id": insert.inserted_id})
 
