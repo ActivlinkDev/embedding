@@ -328,3 +328,42 @@ def delete_basket_item(
     if not doc:
         raise HTTPException(status_code=404, detail="Basket not found after update")
     return _serialize_basket_doc(doc)
+
+
+@router.delete("/basket/{basket_id}/skipped/{device_id}")
+def delete_skipped_item(
+    basket_id: str,
+    device_id: str,
+    quote_id: Optional[str] = Query(None, description="Filter by originating quote id to target a single skipped entry"),
+    category: Optional[str] = Query(None, description="Filter by category to target a single skipped entry"),
+    make: Optional[str] = Query(None, description="Filter by make to target a single skipped entry"),
+    model: Optional[str] = Query(None, description="Filter by model to target a single skipped entry"),
+    _: None = Depends(verify_token),
+):
+    """Delete a single entry in skipped_items by deviceId and optional narrowing filters, then return updated doc.
+
+    Note: MongoDB $pull removes all matches. With provided filters (e.g. deviceId + quote_id), we expect to uniquely match 1 entry.
+    """
+    try:
+        bid = ObjectId(basket_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid basket_id; must be a valid ObjectId string")
+
+    pull_criteria: Dict[str, Any] = {"deviceId": device_id}
+    if quote_id:
+        pull_criteria["quote_id"] = quote_id
+    if category:
+        pull_criteria["category"] = category
+    if make:
+        pull_criteria["make"] = make
+    if model:
+        pull_criteria["model"] = model
+
+    update_result = basket_collection.update_one({"_id": bid}, {"$pull": {"skipped_items": pull_criteria}})
+    if update_result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Basket not found")
+
+    doc = basket_collection.find_one({"_id": bid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Basket not found after update")
+    return _serialize_basket_doc(doc)
