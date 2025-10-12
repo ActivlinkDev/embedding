@@ -6,6 +6,7 @@ from bson import ObjectId
 from datetime import datetime
 import os
 from utils.dependencies import verify_token
+from .ratebasket import rate_basket, RateBasketRequest
 
 router = APIRouter(tags=["Basket"])
 
@@ -20,12 +21,33 @@ class AddToBasketRequest(BaseModel):
     quote_id: str = Field(..., description="Quotes._id as string")
     product_id: str = Field(..., description="Group product_id inside quote.responses")
     optionref: int = Field(..., ge=0, description="Index into the group's options array")
+    # Optional root-level metadata to persist when creating a new Basket_Quotes document
+    client: Optional[str] = Field(
+        default=None,
+        description="Client identifier to store on the Basket_Quotes root when creating a new basket",
+        example="activlink",
+    )
+    locale: Optional[str] = Field(
+        default=None,
+        description="Locale to store on the Basket_Quotes root when creating a new basket",
+        example="en-GB",
+    )
     product_name: Optional[str] = None
     product_description: Optional[str] = None
     product_images: Optional[List[str]] = Field(
         default=None,
         description="Array of product image URLs to persist on the basket line-item",
         example=["https://cdn.example.com/img1.jpg", "https://cdn.example.com/img2.jpg"],
+    )
+    make: Optional[str] = Field(
+        default=None,
+        description="Optional device make to store on the basket line item (overrides value derived from quote if provided)",
+        example="Apple",
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="Optional device model to store on the basket line item (overrides value derived from quote if provided)",
+        example="iPhone 13",
     )
     add_to_basket: Optional[bool] = Field(
         default=True,
@@ -76,6 +98,10 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
     device_id = quote.get("deviceId")
 
     # Core fields for normal basket items
+    # Respect optional make/model from payload when provided
+    payload_make = (payload.make or "").strip() or None
+    payload_model = (payload.model or "").strip() or None
+
     basket_item = {
         "deviceId": device_id,
         "quote_id": payload.quote_id,
@@ -84,13 +110,13 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
         "product_name": payload.product_name,
         "product_description": payload.product_description,
         "product_images": payload.product_images,
-        "client": product.get("client"),
         "currency": product.get("currency"),
-        "locale": product.get("locale"),
         "category": product.get("category"),
-        "make": (quote.get("make") if isinstance(quote.get("make"), str) else None)
+        "make": payload_make
+                 or (quote.get("make") if isinstance(quote.get("make"), str) else None)
                  or (quote.get("identifiers", {}) or {}).get("make"),
-        "model": (quote.get("model") if isinstance(quote.get("model"), str) else None)
+        "model": payload_model
+                  or (quote.get("model") if isinstance(quote.get("model"), str) else None)
                   or (quote.get("identifiers", {}) or {}).get("model"),
         "age": product.get("age"),
         "price": product.get("price"),
@@ -111,8 +137,12 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
         "deviceId": device_id,
         "locale": product.get("locale") or quote.get("locale"),
         "category": product.get("category"),
-        "make": (quote.get("make") if isinstance(quote.get("make"), str) else None) or (quote.get("identifiers", {}) or {}).get("make"),
-        "model": (quote.get("model") if isinstance(quote.get("model"), str) else None) or (quote.get("identifiers", {}) or {}).get("model"),
+        "make": payload_make
+                 or (quote.get("make") if isinstance(quote.get("make"), str) else None)
+                 or (quote.get("identifiers", {}) or {}).get("make"),
+        "model": payload_model
+                  or (quote.get("model") if isinstance(quote.get("model"), str) else None)
+                  or (quote.get("identifiers", {}) or {}).get("model"),
         "created_at": datetime.utcnow(),
     }
 
@@ -137,23 +167,80 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
         )
         if not result:
             raise HTTPException(status_code=404, detail="Basket not found for provided basket_id")
+        # Re-rate only if item was added to Basket (not when skipping)
+        if payload.add_to_basket is not False:
+            try:
+                rb = rate_basket(RateBasketRequest(basket_id=str(bid)))
+                # Persist totals explicitly as a safeguard
+                # Compute mode from current items
+                doc_now = basket_collection.find_one({"_id": bid}) or {}
+                items_now = (doc_now.get("Basket") or [])
+                modes = {it.get("mode") for it in items_now if it.get("mode") is not None}
+                mode_value = next(iter(modes)) if len(modes) == 1 else "mixed"
+                basket_collection.update_one(
+                    {"_id": bid},
+                    {
+                        "$set": {
+                            "subtotal": int(getattr(rb, "subtotal", 0)),
+                            "final_total": int(getattr(rb, "final_total", 0)),
+                            "discount": max(0, int(getattr(rb, "subtotal", 0)) - int(getattr(rb, "final_total", 0))),
+                            "best_rule": (getattr(rb, "best").dict() if getattr(rb, "best", None) else None),
+                            "mode": mode_value,
+                        }
+                    },
+                )
+                # Refresh result with updated totals
+                result = basket_collection.find_one({"_id": bid})
+            except Exception:
+                pass
     else:
         # Create new basket document depending on action
+        # Choose root-level client/locale for the basket document (payload preferred, fallback to product/quote)
+        root_client = (payload.client or "").strip() or product.get("client") or quote.get("client")
+        root_locale = (payload.locale or "").strip() or product.get("locale") or quote.get("locale")
         if payload.add_to_basket is False:
             doc = {
                 "Basket": [],
                 "skipped_items": [skipped_item],
                 "status": "draft",
                 "created_at": datetime.utcnow(),
+                "client": root_client,
+                "locale": root_locale,
             }
         else:
             doc = {
                 "Basket": [basket_item],
                 "status": "draft",
                 "created_at": datetime.utcnow(),
+                "client": root_client,
+                "locale": root_locale,
             }
         insert = basket_collection.insert_one(doc)
-        result = basket_collection.find_one({"_id": insert.inserted_id})
+        bid_new = insert.inserted_id
+        # If we created a basket with an item, rate it now
+        if payload.add_to_basket is not False:
+            try:
+                rb = rate_basket(RateBasketRequest(basket_id=str(bid_new)))
+                # Persist totals explicitly as a safeguard
+                doc_now = basket_collection.find_one({"_id": bid_new}) or {}
+                items_now = (doc_now.get("Basket") or [])
+                modes = {it.get("mode") for it in items_now if it.get("mode") is not None}
+                mode_value = next(iter(modes)) if len(modes) == 1 else "mixed"
+                basket_collection.update_one(
+                    {"_id": bid_new},
+                    {
+                        "$set": {
+                            "subtotal": int(getattr(rb, "subtotal", 0)),
+                            "final_total": int(getattr(rb, "final_total", 0)),
+                            "discount": max(0, int(getattr(rb, "subtotal", 0)) - int(getattr(rb, "final_total", 0))),
+                            "best_rule": (getattr(rb, "best").dict() if getattr(rb, "best", None) else None),
+                            "mode": mode_value,
+                        }
+                    },
+                )
+            except Exception:
+                pass
+        result = basket_collection.find_one({"_id": bid_new})
 
     if not result:
         # Extremely unlikely with upsert+return_document, but handle defensively

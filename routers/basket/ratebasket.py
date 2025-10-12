@@ -286,17 +286,10 @@ def _evaluate_rule(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> RuleRes
         discount = 0
         explanation = f"Unsupported ruleType '{rtype}'"
 
-    # Safe conversions to avoid runtime errors on null/invalid fields
-    rid = rule.get("_id")
-    rule_id = str(rid) if rid is not None else ""
-    name_val = rule.get("name")
-    name = str(name_val) if name_val is not None else ""
-    prio = _as_int(rule.get("priority", 0), 0)
-
     return RuleResult(
-        rule_id=rule_id,
-        name=name,
-        priority=prio,
+        rule_id=str(rule.get("_id")),
+        name=rule.get("name", ""),
+        priority=int(rule.get("priority", 0)),
         ruleType=rtype or "",
         discount=int(discount),
         explanation=explanation,
@@ -316,13 +309,24 @@ def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
         raise HTTPException(status_code=404, detail="Basket not found")
 
     items: List[Dict[str, Any]] = basket.get("Basket", []) or []
+    # Fallback client/locale from basket root for rules matching if missing on items
+    root_client = basket.get("client")
+    root_locale = basket.get("locale")
+    items_for_rules: List[Dict[str, Any]] = []
+    for it in items:
+        it2 = dict(it)
+        if it2.get("client") is None and root_client is not None:
+            it2["client"] = root_client
+        if it2.get("locale") is None and root_locale is not None:
+            it2["locale"] = root_locale
+        items_for_rules.append(it2)
     subtotal_pence = sum(_price_pence(it) for it in items)
 
     # Load active rules
     rules = list(rules_collection.find({"active": True}))
 
     # Evaluate all rules
-    results = [_evaluate_rule(r, items) for r in rules]
+    results = [_evaluate_rule(r, items_for_rules) for r in rules]
 
     # Choose best rule by discount then priority (higher priority wins if same discount)
     best: Optional[RuleResult] = None
