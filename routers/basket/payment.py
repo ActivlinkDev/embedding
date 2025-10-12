@@ -59,6 +59,25 @@ def _extract_source(items: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _collect_product_images(items: list[dict[str, Any]], limit: int = 6) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for it in items:
+        imgs = (it or {}).get("product_images") or []
+        if isinstance(imgs, list):
+            for url in imgs:
+                if not isinstance(url, str):
+                    continue
+                u = url.strip()
+                if not u or u in seen:
+                    continue
+                seen.add(u)
+                out.append(u)
+                if len(out) >= limit:
+                    return out
+    return out
+
+
 @router.post("/basket/payment/create")
 def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(verify_token)):
     # 1) Load basket
@@ -110,7 +129,8 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
     best_rule = basket.get("best_rule") or {}
     product_name = req.product_name or best_rule.get("name") or basket.get("name") or "Basket checkout"
     product_description = req.product_description or basket.get("description") or "Basket items checkout"
-    product_images = req.product_images
+    # Prefer provided images; else gather from basket items if present
+    product_images = req.product_images or _collect_product_images(items)
 
     req_checkout = CheckoutSessionRequest(
         product_name=product_name,

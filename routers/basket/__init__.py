@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from pymongo import MongoClient, ReturnDocument
 from bson import ObjectId
 from datetime import datetime
@@ -22,6 +22,11 @@ class AddToBasketRequest(BaseModel):
     optionref: int = Field(..., ge=0, description="Index into the group's options array")
     product_name: Optional[str] = None
     product_description: Optional[str] = None
+    product_images: Optional[List[str]] = Field(
+        default=None,
+        description="Array of product image URLs to persist on the basket line-item",
+        example=["https://cdn.example.com/img1.jpg", "https://cdn.example.com/img2.jpg"],
+    )
     # Basket control: pass basket_id to append to an existing basket document
     basket_id: Optional[str] = Field(None, description="Existing Basket_Quotes _id to append to")
 
@@ -86,6 +91,8 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
         "rate": option.get("rate"),
         "rounded_price": option.get("rounded_price"),
         "rounded_price_pence": option.get("rounded_price_pence"),
+        # Optional visuals for downstream UI/checkout context
+        "product_images": payload.product_images,
     }
 
     # 4) Create or append to Basket_Quotes by _id (basket_id)
