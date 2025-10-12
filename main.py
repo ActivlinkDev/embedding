@@ -3,6 +3,7 @@ import os
 import importlib
 import asyncio, traceback
 from fastapi import FastAPI
+from routers.quote import router as quote_router
 
 app = FastAPI(
     title="Activlink API Suite",
@@ -104,6 +105,7 @@ for name, module_path in ROUTERS.items():
         print(f"[ROUTER-IMPORT] Skipping '{name}' ({module_path}) per SKIP_ROUTERS")
         continue
     _include_router(module_path)
+app.include_router(quote_router)
 
 # -------- Background poller (multi-mailbox) --------
 if os.getenv("ENABLE_EMAIL_POLL", "false").lower() == "true":
