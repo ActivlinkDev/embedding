@@ -12,16 +12,31 @@ STRAPI_BEARER_TOKEN = os.getenv("STRAPI_BEARER_TOKEN")
 if not STRAPI_BEARER_TOKEN:
     raise RuntimeError("STRAPI_BEARER_TOKEN environment variable must be set")
 
-client = MongoClient(os.getenv("MONGO_URI"))
-db = client["Activlink"]
-locale_params_collection = db["Locale_Params"]
+# Lazily create Mongo client at request time to avoid DNS/SRV lookups during module import
+_mongo_client = None
+
+def _get_locale_params_collection():
+    global _mongo_client
+    try:
+        if _mongo_client is None:
+            _mongo_client = MongoClient(os.getenv("MONGO_URI"), connect=False)
+        db = _mongo_client["Activlink"]
+        return db["Locale_Params"]
+    except Exception:
+        return None
 
 @router.get("/cms_display_offer")
 async def cms_display_offer(
     locale: str = Query(..., example="en_GB"),
     _: None = Depends(verify_token)
 ):
-    locale_doc = locale_params_collection.find_one({"locale": locale})
+    locale_doc = None
+    try:
+        col = _get_locale_params_collection()
+        if col is not None:
+            locale_doc = col.find_one({"locale": locale})
+    except Exception:
+        locale_doc = None
     try:
         _, strapi_locale = resolve_strapi_locale(locale, locale_doc)
     except LocaleNotSupportedError as e:

@@ -53,6 +53,7 @@ ROUTERS = {
     "lookup_master_sku": "routers.sku.lookup_master_sku",
     "lookup_master_sku_all": "routers.sku.lookup_master_sku_all",
     "create_master_sku": "routers.sku.create_master_sku",
+    "quick_search": "routers.sku.quick_search",
 
     # enrich
     "ice_lookup": "routers.enrich.ice_lookup",
