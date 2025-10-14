@@ -18,7 +18,11 @@ basket_collection = db["Basket_Quotes"]
 
 
 class AddToBasketRequest(BaseModel):
-    quote_id: str = Field(..., description="Quotes._id as string")
+    # When add_to_basket is true, quote_id is required. For skipped items (add_to_basket=false), quote_id is optional.
+    quote_id: Optional[str] = Field(
+        default=None,
+        description="Quotes._id as string (required when add_to_basket=true; optional for skipped items)",
+    )
     # product_id/optionref are required only when add_to_basket is true
     product_id: Optional[str] = Field(
         default=None,
@@ -66,6 +70,11 @@ class AddToBasketRequest(BaseModel):
         default=None,
         description="Optional category used when adding a skipped item without specifying product_id",
     )
+    # Optional deviceId to support creating skipped entries without a quote
+    deviceId: Optional[str] = Field(
+        default=None,
+        description="Device identifier to store on the basket entry (used when quote_id is not provided)",
+    )
     # Basket control: pass basket_id to append to an existing basket document
     basket_id: Optional[str] = Field(None, description="Existing Basket_Quotes _id to append to")
 
@@ -84,39 +93,43 @@ def _serialize_basket_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
 
 @router.post("/basket/add")
 def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
-    # 1) Load and validate the quote
-    try:
-        qid = ObjectId(payload.quote_id.strip())
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid quote_id; must be a valid ObjectId string")
-
-    quote = quotes_collection.find_one({"_id": qid})
-    if not quote:
-        raise HTTPException(status_code=404, detail="Quote not found")
+    # 1) Load and validate the quote if provided
+    quote = None
+    if payload.quote_id:
+        try:
+            qid = ObjectId(payload.quote_id.strip())
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid quote_id; must be a valid ObjectId string")
+        quote = quotes_collection.find_one({"_id": qid})
+        if not quote:
+            raise HTTPException(status_code=404, detail="Quote not found")
 
     # 2) Branch based on action
-    responses = quote.get("responses", [])
-    # Quote created by rate_request stores deviceId at root
-    device_id = quote.get("deviceId")
+    responses = (quote.get("responses", []) if quote else [])
+    # deviceId: from quote if available, otherwise from payload
+    device_id = (quote.get("deviceId") if quote else None) or (payload.deviceId or None)
     # Respect optional make/model from payload when provided
     payload_make = (payload.make or "").strip() or None
     payload_model = (payload.model or "").strip() or None
 
     if payload.add_to_basket is False:
         # Build minimal skipped entry without requiring product_id/optionref
-        locale_val = (payload.locale or (responses[0].get("locale") if responses else None) or quote.get("locale"))
+        locale_val = (payload.locale or (responses[0].get("locale") if responses else None) or (quote.get("locale") if quote else None))
         category_val = (payload.category or (responses[0].get("category") if responses else None))
+        # Ensure we have a deviceId for the skipped entry
+        if not device_id:
+            raise HTTPException(status_code=400, detail="deviceId is required when quote_id is not provided for skipped items")
         skipped_item = {
             "quote_id": payload.quote_id,
             "deviceId": device_id,
             "locale": locale_val,
             "category": category_val,
             "make": payload_make
-                     or (quote.get("make") if isinstance(quote.get("make"), str) else None)
-                     or (quote.get("identifiers", {}) or {}).get("make"),
+                     or ((quote.get("make") if isinstance(quote.get("make"), str) else None) if quote else None)
+                     or ((quote.get("identifiers", {}) or {}).get("make") if quote else None),
             "model": payload_model
-                      or (quote.get("model") if isinstance(quote.get("model"), str) else None)
-                      or (quote.get("identifiers", {}) or {}).get("model"),
+                      or ((quote.get("model") if isinstance(quote.get("model"), str) else None) if quote else None)
+                      or ((quote.get("identifiers", {}) or {}).get("model") if quote else None),
             "created_at": datetime.utcnow(),
         }
     else:
@@ -125,6 +138,8 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
             raise HTTPException(status_code=400, detail="product_id is required when add_to_basket=true")
         if payload.optionref is None:
             raise HTTPException(status_code=400, detail="optionref is required when add_to_basket=true")
+        if not quote:
+            raise HTTPException(status_code=400, detail="quote_id is required when add_to_basket=true")
         product = next((r for r in responses if r.get("product_id") == payload.product_id), None)
         if not product:
             raise HTTPException(status_code=404, detail="Product not found in quote responses")
