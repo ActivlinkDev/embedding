@@ -15,6 +15,7 @@ client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
 quotes_collection = db["Quotes"]
 basket_collection = db["Basket_Quotes"]
+devices_collection = db["Devices"]
 
 
 class AddToBasketRequest(BaseModel):
@@ -108,6 +109,17 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
     responses = (quote.get("responses", []) if quote else [])
     # deviceId: from quote if available, otherwise from payload
     device_id = (quote.get("deviceId") if quote else None) or (payload.deviceId or None)
+    # Load registered device to enrich make/model when missing in quote/payload
+    dev_doc = None
+    if device_id:
+        try:
+            dev_doc = devices_collection.find_one({"_id": ObjectId(str(device_id))})
+        except Exception:
+            # If device_id isn't a valid ObjectId string, ignore silently
+            dev_doc = None
+    dev_identifiers = (dev_doc or {}).get("identifiers", {}) if isinstance((dev_doc or {}).get("identifiers", {}), dict) else {}
+    dev_make = dev_identifiers.get("make") if isinstance(dev_identifiers.get("make"), str) else None
+    dev_model = dev_identifiers.get("model") if isinstance(dev_identifiers.get("model"), str) else None
     # Respect optional make/model from payload when provided
     payload_make = (payload.make or "").strip() or None
     payload_model = (payload.model or "").strip() or None
@@ -126,10 +138,12 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
             "category": category_val,
             "make": payload_make
                      or ((quote.get("make") if isinstance(quote.get("make"), str) else None) if quote else None)
-                     or ((quote.get("identifiers", {}) or {}).get("make") if quote else None),
+                     or ((quote.get("identifiers", {}) or {}).get("make") if quote else None)
+                     or dev_make,
             "model": payload_model
                       or ((quote.get("model") if isinstance(quote.get("model"), str) else None) if quote else None)
-                      or ((quote.get("identifiers", {}) or {}).get("model") if quote else None),
+                      or ((quote.get("identifiers", {}) or {}).get("model") if quote else None)
+                      or dev_model,
             "created_at": datetime.utcnow(),
         }
     else:
@@ -160,10 +174,12 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
             "category": product.get("category"),
             "make": payload_make
                      or (quote.get("make") if isinstance(quote.get("make"), str) else None)
-                     or (quote.get("identifiers", {}) or {}).get("make"),
+                     or (quote.get("identifiers", {}) or {}).get("make")
+                     or dev_make,
             "model": payload_model
                       or (quote.get("model") if isinstance(quote.get("model"), str) else None)
-                      or (quote.get("identifiers", {}) or {}).get("model"),
+                      or (quote.get("identifiers", {}) or {}).get("model")
+                      or dev_model,
             "age": product.get("age"),
             "price": product.get("price"),
             "multi_count": product.get("multi_count"),
