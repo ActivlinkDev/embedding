@@ -65,15 +65,11 @@ def pair_customer(
             device_status_map.setdefault(did, "registered")
 
     if not device_ids:
-        return {"updated": 0, "deviceIds": []}
+        return {"customer_update": {"matched": 0, "modified": 0}, "device_update": {"attempted": 0, "matched": 0, "modified": 0, "errors": []}, "deviceIds": []}
 
-    # Update customer: addToSet each device id (avoid duplicates)
-    res = customer_collection.update_one(
-        {"_id": customer_objid},
-        {"$addToSet": {"deviceIds": {"$each": list(device_ids)}}},
-    )
-
-    if res.matched_count == 0:
+    # Ensure customer exists (we will manage device objects in `devices` array)
+    cust_doc = customer_collection.find_one({"_id": customer_objid})
+    if not cust_doc:
         raise HTTPException(status_code=404, detail="Customer not found")
 
     # For each deviceId, update Devices.registrationParameters
@@ -105,7 +101,6 @@ def pair_customer(
                     "$set": {
                         "registrationParameters.registrationStatus": "assigned",
                         "registrationParameters.customerId": customer_id,
-                        "registrationParameters.customeId": customer_id,
                     }
                 },
             )
@@ -117,22 +112,25 @@ def pair_customer(
         # Update the Customer.devices array to reflect the device-specific status
         status = device_status_map.get(did, "registered")
         try:
-            # Remove any existing entry for this deviceId then push the new status object
-            cust_res = customer_collection.update_one(
+            # First remove any existing entry for this deviceId
+            pull_res = customer_collection.update_one(
                 {"_id": customer_objid},
-                {
-                    "$pull": {"devices": {"deviceId": did}},
-                    "$push": {"devices": {"deviceId": did, "status": status}},
-                },
+                {"$pull": {"devices": {"deviceId": did}}},
             )
-            customer_device_updates["matched"] += int(cust_res.matched_count)
-            customer_device_updates["modified"] += int(cust_res.modified_count)
+            # Then push the new status object (separate operations avoid Mongo conflict)
+            push_res = customer_collection.update_one(
+                {"_id": customer_objid},
+                {"$push": {"devices": {"deviceId": did, "status": status}}},
+            )
+            # Count push as the matched indicator for the presence of the customer doc
+            customer_device_updates["matched"] += int(push_res.matched_count)
+            customer_device_updates["modified"] += int(pull_res.modified_count) + int(push_res.modified_count)
         except Exception as e:
             customer_device_updates["errors"].append({"deviceId": did, "error": str(e)})
 
     return {
-        "customer_update": {"matched": int(res.matched_count), "modified": int(res.modified_count)},
+        "customer_update": {"matched": 1, "modified": int(customer_device_updates["modified"])},
         "customer_device_updates": customer_device_updates,
         "device_update": device_update_summary,
-        "deviceIds": list(device_ids),
+        "devices": [ {"deviceId": d, "status": device_status_map.get(d)} for d in list(device_ids) ],
     }

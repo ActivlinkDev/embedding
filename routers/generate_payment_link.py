@@ -45,7 +45,7 @@ class CheckoutSessionRequest(BaseModel):
     allow_promotion_codes: bool = Field(default=False)
     success_url: str = Field(..., example="https://yourdomain.com/success")
     cancel_url: str = Field(..., example="https://yourdomain.com/cancel")
-    phone_number_collection: bool = Field(default=False)
+    phone_number_collection: bool = Field(default=True)
     internal_reference: str = Field(..., example="order-12345")
     payment_method_types: Optional[List[str]] = Field(default=["card"], example=["card", "alipay"])
     mode: ModeEnum = Field(..., example="payment", description="Stripe session mode: payment or subscription")
