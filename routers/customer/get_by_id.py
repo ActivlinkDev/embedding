@@ -17,18 +17,22 @@ customer_collection = db["Customer"]
 
 
 def _serialize_doc(doc: dict) -> dict:
+    # Recursively serialize a document, converting ObjectId to str anywhere in the structure.
+    from bson import ObjectId as _ObjectId
+
+    def _serialize_value(value):
+        if isinstance(value, _ObjectId):
+            return str(value)
+        if isinstance(value, dict):
+            return {k: _serialize_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_serialize_value(v) for v in value]
+        # leave other types (datetime, numbers, strings) as-is
+        return value
+
     if not doc:
         return {}
-    out = {}
-    for k, v in doc.items():
-        if k == "_id":
-            try:
-                out["_id"] = str(v)
-            except Exception:
-                out["_id"] = v
-        else:
-            out[k] = v
-    return out
+    return _serialize_value(doc)
 
 
 @router.get("/customer/by-id")
@@ -38,12 +42,18 @@ def get_customer_by_id(customer_id: str = Query(..., alias="customer_id"), _=Dep
     Query param: ?customer_id=<hexid>
     """
     try:
-        objid = ObjectId(customer_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid customer_id")
+        try:
+            objid = ObjectId(customer_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid customer_id")
 
-    doc = customer_collection.find_one({"_id": objid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Customer not found")
+        doc = customer_collection.find_one({"_id": objid})
+        if not doc:
+            raise HTTPException(status_code=404, detail="Customer not found")
 
-    return {"data": _serialize_doc(doc)}
+        return {"data": _serialize_doc(doc)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Development helper: return exception details for debugging
+        raise HTTPException(status_code=500, detail=f"Internal error: {type(e).__name__}: {e}")
