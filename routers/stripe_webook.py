@@ -119,10 +119,29 @@ async def stripe_webhook(
                     try:
                         customer_collection.update_one(
                             {"_id": ObjectId(customer_id)},
-                            {"$push": {"Transaction_log": record}}
+                            {"$push": {"transaction_log": record}}
                         )
                     except Exception as e:
                         print(f"[Stripe Webhook] Failed to append Transaction_log on customer: {e}", file=sys.stderr)
+                    # Also add a contract entry into customer's contracts array if basket_id present
+                    try:
+                        basket_id_meta = data.get("metadata", {}).get("basket_id")
+                        if basket_id_meta:
+                            contract_obj = {
+                                "basket_id": basket_id_meta,
+                                "type": "bundle",
+                                "status": "active",
+                            }
+                            try:
+                                customer_collection.update_one(
+                                    {"_id": ObjectId(customer_id)},
+                                    {"$push": {"contracts": contract_obj}}
+                                )
+                                print(f"[Stripe Webhook] Added contract to customer: {contract_obj}", file=sys.stderr)
+                            except Exception as c_err:
+                                print(f"[Stripe Webhook] Failed to append contract on customer: {c_err}", file=sys.stderr)
+                    except Exception as e:
+                        print(f"[Stripe Webhook] Error while preparing contract object: {e}", file=sys.stderr)
                     # After customer exists/updated, attempt to pair customer to basket if metadata present
                     try:
                         basket_id = data.get("metadata", {}).get("basket_id")
