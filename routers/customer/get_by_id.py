@@ -51,6 +51,14 @@ def get_customer_by_id(customer_id: str = Query(..., alias="customer_id"), _=Dep
         if not doc:
             raise HTTPException(status_code=404, detail="Customer not found")
 
+        # Exclude transaction_log from API responses
+        if isinstance(doc, dict) and "transaction_log" in doc:
+            try:
+                del doc["transaction_log"]
+            except Exception:
+                # ignore if deletion fails for any reason
+                pass
+
         return {"data": _serialize_doc(doc)}
     except HTTPException:
         raise
