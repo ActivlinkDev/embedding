@@ -127,7 +127,9 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
     if payload.add_to_basket is False:
         # Build minimal skipped entry without requiring product_id/optionref
         locale_val = (payload.locale or (responses[0].get("locale") if responses else None) or (quote.get("locale") if quote else None))
-        category_val = (payload.category or (responses[0].get("category") if responses else None))
+        # Normalize category: treat empty string as None
+        raw_cat = (payload.category or (responses[0].get("category") if responses else None))
+        category_val = raw_cat if (raw_cat is not None and str(raw_cat).strip() != "") else None
         # Ensure we have a deviceId for the skipped entry
         if not device_id:
             raise HTTPException(status_code=400, detail="deviceId is required when quote_id is not provided for skipped items")
@@ -135,7 +137,8 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
             "quote_id": payload.quote_id,
             "deviceId": device_id,
             "locale": locale_val,
-            "category": category_val,
+            # Only include category if present (non-empty)
+            **({"category": category_val} if category_val is not None else {}),
             "make": payload_make
                      or ((quote.get("make") if isinstance(quote.get("make"), str) else None) if quote else None)
                      or ((quote.get("identifiers", {}) or {}).get("make") if quote else None)
@@ -247,6 +250,7 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
             # For skipped only, prefer payload.client/locale else quote/responses[0]
             root_client = (payload.client or "").strip() or quote.get("client")
             root_locale = (payload.locale or "").strip() or (responses[0].get("locale") if responses else None) or quote.get("locale")
+            # When building root doc, omit empty category values (already normalized on skipped_item)
             doc = {
                 "Basket": [],
                 "skipped_items": [skipped_item],
