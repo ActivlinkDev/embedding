@@ -1,11 +1,17 @@
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pymongo import MongoClient
 from bson import ObjectId
 import os
 
-router = APIRouter(tags=["Customer"])
+from utils.dependencies import verify_token
 
-client = MongoClient(os.getenv("MONGO_URI"))
+router = APIRouter(tags=["Customer"], prefix="")
+
+MONGO_URI = os.getenv("MONGO_URI")
+if not MONGO_URI:
+    raise RuntimeError("MONGO_URI not set in environment")
+
+client = MongoClient(MONGO_URI)
 db = client["Activlink"]
 customer_collection = db["Customer"]
 
@@ -25,26 +31,19 @@ def _serialize_doc(doc: dict) -> dict:
     return out
 
 
-@router.get("/customer/by-id")
-def get_customer_by_id(customer_id: str = Query(..., alias="customer_id")):
-    """Return a customer document by its id (string).
+@router.get("/customer/lookup/by-id")
+def get_customer_by_id(customer_id: str, _=Depends(verify_token)):
+    """Simple authenticated endpoint to return a Customer document by id.
 
-    Query param: ?customer_id=<hexid>
+    Query: /customer/lookup/by-id?customer_id=<hexid>
     """
     try:
-        try:
-            objid = ObjectId(customer_id)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid customer_id")
+        objid = ObjectId(customer_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid customer_id")
 
-        doc = customer_collection.find_one({"_id": objid})
-        if not doc:
-            raise HTTPException(status_code=404, detail="Customer not found")
+    doc = customer_collection.find_one({"_id": objid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Customer not found")
 
-        return {"data": _serialize_doc(doc)}
-    except HTTPException:
-        # re-raise expected HTTPExceptions
-        raise
-    except Exception as e:
-        # Development-only: return exception details to help debugging (replace with logging in prod)
-        raise HTTPException(status_code=500, detail=f"Internal error: {type(e).__name__}: {str(e)}")
+    return {"data": _serialize_doc(doc)}
