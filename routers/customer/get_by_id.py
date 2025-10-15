@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Query, HTTPException, Depends
 from pymongo import MongoClient
 from bson import ObjectId
 import os
@@ -31,11 +31,11 @@ def _serialize_doc(doc: dict) -> dict:
     return out
 
 
-@router.get("/customer/lookup/by-id")
-def get_customer_by_id(customer_id: str, _=Depends(verify_token)):
-    """Simple authenticated endpoint to return a Customer document by id.
+@router.get("/customer/by-id")
+def get_customer_by_id(customer_id: str = Query(..., alias="customer_id"), _=Depends(verify_token)):
+    """Return a customer document by its id (string).
 
-    Query: /customer/lookup/by-id?customer_id=<hexid>
+    Query param: ?customer_id=<hexid>
     """
     try:
         objid = ObjectId(customer_id)
