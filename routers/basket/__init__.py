@@ -248,8 +248,8 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
         # Choose root-level client/locale for the basket document
         if payload.add_to_basket is False:
             # For skipped only, prefer payload.client/locale else quote/responses[0]
-            root_client = (payload.client or "").strip() or quote.get("client")
-            root_locale = (payload.locale or "").strip() or (responses[0].get("locale") if responses else None) or quote.get("locale")
+            root_client = (payload.client or "").strip() or (quote.get("client") if quote else None)
+            root_locale = (payload.locale or "").strip() or (responses[0].get("locale") if responses else None) or (quote.get("locale") if quote else None)
             # When building root doc, omit empty category values (already normalized on skipped_item)
             doc = {
                 "Basket": [],
@@ -262,8 +262,8 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
         else:
             # Adding an item requires product context
             product_for_root = next((r for r in responses if r.get("product_id") == payload.product_id), None)
-            root_client = (payload.client or "").strip() or (product_for_root or {}).get("client") or quote.get("client")
-            root_locale = (payload.locale or "").strip() or (product_for_root or {}).get("locale") or quote.get("locale")
+            root_client = (payload.client or "").strip() or (product_for_root or {}).get("client") or (quote.get("client") if quote else None)
+            root_locale = (payload.locale or "").strip() or (product_for_root or {}).get("locale") or (quote.get("locale") if quote else None)
             doc = {
                 "Basket": [basket_item],
                 "status": "draft",
