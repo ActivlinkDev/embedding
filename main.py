@@ -83,6 +83,7 @@ ROUTERS = {
     "vision": "routers.vision",
     "sms": "routers.sms",
     "create_customer": "routers.customer.create_customer",
+    "get_customer_by_id": "routers.customer.get_customer_by_id",
     "pair_customer": "routers.customer.pair_customer",
     "generate_payment_links_from_quote": "routers.generate_payment_links_from_quote",
     "locale_infos": "routers.locale_infos",

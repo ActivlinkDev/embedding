@@ -32,12 +32,19 @@ def get_customer_by_id(customer_id: str = Query(..., alias="customer_id")):
     Query param: ?customer_id=<hexid>
     """
     try:
-        objid = ObjectId(customer_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid customer_id")
+        try:
+            objid = ObjectId(customer_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid customer_id")
 
-    doc = customer_collection.find_one({"_id": objid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Customer not found")
+        doc = customer_collection.find_one({"_id": objid})
+        if not doc:
+            raise HTTPException(status_code=404, detail="Customer not found")
 
-    return {"data": _serialize_doc(doc)}
+        return {"data": _serialize_doc(doc)}
+    except HTTPException:
+        # re-raise expected HTTPExceptions
+        raise
+    except Exception as e:
+        # Development-only: return exception details to help debugging (replace with logging in prod)
+        raise HTTPException(status_code=500, detail=f"Internal error: {type(e).__name__}: {str(e)}")
