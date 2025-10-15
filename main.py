@@ -63,7 +63,7 @@ ROUTERS = {
     # registration / assignment
     "embedded_register_device": "routers.embedded_register_device",
     "device_register": "routers.device_register",
-    "device": "routers.device",
+    "devices": "routers.devices.get_device_by_id",
     "assign_product_by_device_id": "routers.assign_product_by_device_id",
     "assign_device_collection": "routers.assign_device_collection",
     "product_assignment": "routers.product_assignment",
