@@ -95,6 +95,7 @@ ROUTERS = {
     # cms
     "props_lookup": "routers.cms.props_lookup",
     "cms_display_offer": "routers.cms.cms_display_offer",
+    "strapi_proxy": "routers.cms.strapi",
     "validate_customer": "routers.cms.validate_customer",
 
     # email ingest 
