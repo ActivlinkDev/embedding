@@ -13,6 +13,7 @@ from typing import Dict, Any, Tuple
 
 _LOCALE_MAP = {
     "en": {"fastapi": "en_GB", "cms": "en-GB", "label": "English"},
+    "en_IE": {"fastapi": "en_IE", "cms": "en-IE", "label": "English (Ireland)"},
     "es": {"fastapi": "es_ES", "cms": "es-ES", "label": "Español"},
     "it": {"fastapi": "it_IT", "cms": "it-IT", "label": "Italiano"},
     "fr": {"fastapi": "fr_FR", "cms": "fr-FR", "label": "Français"},
