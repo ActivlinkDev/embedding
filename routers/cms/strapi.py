@@ -9,6 +9,9 @@ if not STRAPI_BASE:
     # Allow app to import even if not configured; endpoint will return 500 if called without config
     STRAPI_BASE = None
 
+# Optional server-side token to authenticate to Strapi
+STRAPI_BEARER_TOKEN = os.getenv("STRAPI_BEARER_TOKEN")
+
 
 @router.get("/cms/strapi")
 async def proxy_strapi(route: str = Query(...), locale: str | None = Query(None), request: Request = None):
@@ -31,7 +34,15 @@ async def proxy_strapi(route: str = Query(...), locale: str | None = Query(None)
     if locale:
         params['locale'] = locale
 
-    headers = {k: v for k, v in request.headers.items() if k.lower() in ('authorization', 'accept')}
+    # Build headers: prefer a server-side bearer token if configured, otherwise forward incoming Authorization
+    headers = {k: v for k, v in request.headers.items() if k.lower() in ('accept',)}
+    if STRAPI_BEARER_TOKEN:
+        headers['Authorization'] = f"Bearer {STRAPI_BEARER_TOKEN}"
+    else:
+        # forward incoming Authorization if no server token configured
+        incoming_auth = request.headers.get('authorization')
+        if incoming_auth:
+            headers['Authorization'] = incoming_auth
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
