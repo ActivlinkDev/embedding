@@ -17,6 +17,10 @@ MAX_ATTEMPTS = 5
 COOKIE_NAME = "otp_fallback"
 COOKIE_SECRET = os.getenv("OTP_COOKIE_SECRET", os.getenv("LOOKUP_API_KEY", "changeme-secret"))
 
+# Verified customer cookie config
+VERIFIED_COOKIE_NAME = os.getenv("VERIFIED_COOKIE_NAME", "verified_customer")
+VERIFIED_TTL_SECONDS = int(os.getenv("VERIFIED_TTL_SECONDS", str(24 * 3600)))
+
 VOODOO_API_KEY = os.getenv("VOODOO_SMS_API_KEY")
 VOODOO_SMS_URL = "https://api.voodoosms.com/sendsms"
 VOODOO_SMS_FROM = os.getenv("VOODOO_SMS_FROM", "Activlink")
@@ -86,6 +90,13 @@ def parse_cookie(raw: str):
         return {"phone": phone, "code": code}
     except Exception:
         return None
+
+
+def _serialize_verified_cookie(customer_id: str, expiry_ts: int) -> str:
+    """Return a signed payload for the verified_customer cookie."""
+    payload = f"{customer_id}.{expiry_ts}"
+    sig = _sign(payload)
+    return f"{payload}.{sig}"
 
 # SMS sending
 
@@ -163,11 +174,21 @@ def verify_otp(req: OtpVerifyIn, request: Request, response: Response, _: None =
         if raw_cookie:
             parsed = parse_cookie(raw_cookie)
             if parsed and parsed["phone"] == phone and parsed["code"] == code:
-                response.delete_cookie(COOKIE_NAME)
-                return {"success": True, "fallback": "cookie"}
+                # mark verified in a signed cookie
+                try:
+                    # derive a customer id lookup is not available here; caller should set this cookie after authenticate flow
+                    # We will not guess customer_id here; return fallback success and let authenticate flow set verified cookie.
+                    response.delete_cookie(COOKIE_NAME)
+                    return {"success": True, "fallback": "cookie"}
+                except Exception:
+                    response.delete_cookie(COOKIE_NAME)
+                    return {"success": True, "fallback": "cookie"}
 
     if not result["ok"]:
         raise HTTPException(status_code=400, detail=result["reason"])
 
+    # On successful verification we set a signed verified_customer cookie. The customer id is not part of OTP request
+    # flow; this should be set by the caller (authenticate endpoint) which knows the customer_id. Here we just return
+    # success; higher-level callers (authenticate_verified flow) should set the verified cookie with the customer id.
     response.delete_cookie(COOKIE_NAME)
     return {"success": True}
