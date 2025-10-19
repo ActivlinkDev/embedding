@@ -147,7 +147,9 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
                       or ((quote.get("model") if isinstance(quote.get("model"), str) else None) if quote else None)
                       or ((quote.get("identifiers", {}) or {}).get("model") if quote else None)
                       or dev_model,
-            "created_at": datetime.utcnow(),
+        "created_at": datetime.utcnow(),
+        # Per-line unique id to allow precise deletes
+        "line_id": str(ObjectId()),
         }
     else:
         # Validate requirements for adding to basket
@@ -194,6 +196,8 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
             "rate": option.get("rate"),
             "rounded_price": option.get("rounded_price"),
             "rounded_price_pence": option.get("rounded_price_pence"),
+            # Per-line unique id to allow precise deletes
+            "line_id": str(ObjectId()),
         }
 
     # 3) Create or append to Basket_Quotes by _id (basket_id)
@@ -328,6 +332,7 @@ def delete_basket_item(
     rounded_price_pence: Optional[int] = Query(None, description="Filter by rounded_price_pence to target a single item"),
     mode: Optional[str] = Query(None, description="Filter by mode to target a single item"),
     quote_id: Optional[str] = Query(None, description="Filter by originating quote id to target a single item"),
+    line_id: Optional[str] = Query(None, description="Optional per-line id to delete a single line precisely"),
     _: None = Depends(verify_token),
 ):
     """Delete a single item in Basket array by deviceId and optional narrowing filters, then return updated doc.
@@ -340,18 +345,21 @@ def delete_basket_item(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid basket_id; must be a valid ObjectId string")
 
-    # Build precise pull criteria
-    pull_criteria: Dict[str, Any] = {"deviceId": device_id}
-    if poc is not None:
-        pull_criteria["poc"] = int(poc)
-    if product_id:
-        pull_criteria["product_id"] = product_id
-    if rounded_price_pence is not None:
-        pull_criteria["rounded_price_pence"] = int(rounded_price_pence)
-    if mode:
-        pull_criteria["mode"] = mode
-    if quote_id:
-        pull_criteria["quote_id"] = quote_id
+    # If a per-line id is provided, target that specifically. Otherwise build precise pull criteria
+    if line_id:
+        pull_criteria: Dict[str, Any] = {"line_id": line_id}
+    else:
+        pull_criteria: Dict[str, Any] = {"deviceId": device_id}
+        if poc is not None:
+            pull_criteria["poc"] = int(poc)
+        if product_id:
+            pull_criteria["product_id"] = product_id
+        if rounded_price_pence is not None:
+            pull_criteria["rounded_price_pence"] = int(rounded_price_pence)
+        if mode:
+            pull_criteria["mode"] = mode
+        if quote_id:
+            pull_criteria["quote_id"] = quote_id
 
     # Pull items matching the criteria (ideally 1)
     update_result = basket_collection.update_one({"_id": bid}, {"$pull": {"Basket": pull_criteria}})
@@ -373,26 +381,32 @@ def delete_skipped_item(
     category: Optional[str] = Query(None, description="Filter by category to target a single skipped entry"),
     make: Optional[str] = Query(None, description="Filter by make to target a single skipped entry"),
     model: Optional[str] = Query(None, description="Filter by model to target a single skipped entry"),
+    line_id: Optional[str] = Query(None, description="Optional per-line id to delete a single skipped line precisely"),
     _: None = Depends(verify_token),
 ):
     """Delete a single entry in skipped_items by deviceId and optional narrowing filters, then return updated doc.
 
     Note: MongoDB $pull removes all matches. With provided filters (e.g. deviceId + quote_id), we expect to uniquely match 1 entry.
+    For absolute precision, you can provide a per-line `line_id` to remove a specific entry.
     """
     try:
         bid = ObjectId(basket_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid basket_id; must be a valid ObjectId string")
 
-    pull_criteria: Dict[str, Any] = {"deviceId": device_id}
-    if quote_id:
-        pull_criteria["quote_id"] = quote_id
-    if category:
-        pull_criteria["category"] = category
-    if make:
-        pull_criteria["make"] = make
-    if model:
-        pull_criteria["model"] = model
+    # If a per-line id is provided, target that specifically. Otherwise build precise pull criteria
+    if line_id:
+        pull_criteria: Dict[str, Any] = {"line_id": line_id}
+    else:
+        pull_criteria: Dict[str, Any] = {"deviceId": device_id}
+        if quote_id:
+            pull_criteria["quote_id"] = quote_id
+        if category:
+            pull_criteria["category"] = category
+        if make:
+            pull_criteria["make"] = make
+        if model:
+            pull_criteria["model"] = model
 
     update_result = basket_collection.update_one({"_id": bid}, {"$pull": {"skipped_items": pull_criteria}})
     if update_result.matched_count == 0:

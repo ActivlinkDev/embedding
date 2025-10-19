@@ -14,7 +14,13 @@ STRAPI_BEARER_TOKEN = os.getenv("STRAPI_BEARER_TOKEN")
 
 
 @router.get("/cms/strapi")
-async def proxy_strapi(route: str = Query(...), locale: str | None = Query(None), request: Request = None):
+async def proxy_strapi(
+    route: str = Query(...),
+    locale: str | None = Query(None),
+    filter_field: str | None = Query(None, description="Optional collection field to filter on (Strapi field name)"),
+    filter_value: list[str] | str | None = Query(None, description="Value(s) to match for filter_field. Provide multiple values to use $in operator."),
+    request: Request = None,
+):
     """Proxy a GET request to Strapi.
 
     Query parameters:
@@ -30,9 +36,20 @@ async def proxy_strapi(route: str = Query(...), locale: str | None = Query(None)
     # Build upstream URL
     route_clean = route.lstrip('/')
     upstream = f"{STRAPI_BASE.rstrip('/')}/{route_clean}"
-    params = {}
+    # Build query params for Strapi: include locale, optional filters, and always populate all relations
+    params = {"populate": "*"}
     if locale:
         params['locale'] = locale
+    # If both filter_field and filter_value provided, add Strapi filters[<field>][$eq]=<value>
+    if filter_field and filter_value is not None:
+        # If filter_value is a list or multiple query params, use $in operator;
+        # otherwise use $eq.
+        if isinstance(filter_value, (list, tuple)):
+            # Strapi accepts comma-separated values for $in
+            joined = ",".join(str(x) for x in filter_value)
+            params[f"filters[{filter_field}][$in]"] = joined
+        else:
+            params[f"filters[{filter_field}][$eq]"] = str(filter_value)
 
     # Build headers: prefer a server-side bearer token if configured, otherwise forward incoming Authorization
     headers = {k: v for k, v in request.headers.items() if k.lower() in ('accept',)}
