@@ -181,6 +181,7 @@ class CustomSKURequest(BaseModel):
     Model: Optional[str] = ""
     Category: Optional[str] = ""
     Locale_Details: Optional[LocaleDetails] = None
+    Global_Promotion: Optional[str] = None
 
 @router.post("/create_custom_sku")
 def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
@@ -342,6 +343,7 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                     "Identifiers": identifiers,
                     "MasterSKU": mastersku_id,
                     "Category": category_root,
+                    "Global_Promotion": data.Global_Promotion if getattr(data, 'Global_Promotion', None) is not None else None,
                     "Locale_Specific_Data": [locale_data],
                 }
                 result = customsku_collection.insert_one(doc)
@@ -397,6 +399,7 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                     "Identifiers": identifiers,
                     "MasterSKU": mastersku_id,
                     "Category": category_root,
+                    "Global_Promotion": data.Global_Promotion if getattr(data, 'Global_Promotion', None) is not None else None,
                     "Locale_Specific_Data": [locale_data],
                 }
                 result = customsku_collection.insert_one(doc)
@@ -449,6 +452,7 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                 "Identifiers": identifiers,
                 "MasterSKU": mastersku_id,
                 "Category": category_root,
+                "Global_Promotion": data.Global_Promotion if getattr(data, 'Global_Promotion', None) is not None else None,
                 "Locale_Specific_Data": [locale_data],
             }
             result = customsku_collection.insert_one(doc)
