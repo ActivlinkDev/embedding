@@ -62,6 +62,11 @@ class AddToBasketRequest(BaseModel):
         description="Optional device model to store on the basket line item (overrides value derived from quote if provided)",
         example="iPhone 13",
     )
+    promo_id: Optional[str] = Field(
+        default=None,
+        description="Optional PromoID to attach to the basket line or skipped item",
+        example="10YP",
+    )
     add_to_basket: Optional[bool] = Field(
         default=True,
         description="If true, append as a basket line item. If false, store quote/device in 'skipped_items' instead.",
@@ -199,6 +204,12 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
             # Per-line unique id to allow precise deletes
             "line_id": str(ObjectId()),
         }
+        # Attach promo_id if provided
+        if payload.promo_id:
+            skipped_item["promo_id"] = payload.promo_id
+        # Attach promo_id if provided
+        if payload.promo_id:
+            basket_item["promo_id"] = payload.promo_id
 
     # 3) Create or append to Basket_Quotes by _id (basket_id)
     if payload.basket_id:
