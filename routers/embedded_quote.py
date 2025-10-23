@@ -7,7 +7,6 @@ from utils.dependencies import verify_token
 # Import the existing assignment and rating logic
 from .assign_product_by_device_id import assign_product_for_device
 from .rate_request import RateRequest as RateReqModel, RateRequestBatch, rate_request
-from .cms.props_lookup import fetch_props
 
 router = APIRouter(tags=["Embedded Quote"])
 
@@ -70,26 +69,9 @@ async def embedded_quote(payload: EmbeddedQuoteRequest, _: None = Depends(verify
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Rate request error: {str(e)}")
 
-    # 4) Optionally fetch product props from CMS (Strapi) for the assigned product IDs
-    props_result = None
-    try:
-        product_ids = [p.get("product_id") for p in products if p.get("product_id")]
-        # Determine a locale to query props_lookup with: prefer the first product locale or the batch locale
-        lookup_locale = products[0].get("locale") if products and products[0].get("locale") else None
-        if product_ids and lookup_locale:
-                # Call the in-process helper (avoid an HTTP call)
-                props_result = await fetch_props(lookup_locale, product_ids)
-    except HTTPException:
-        # Bubble up HTTPExceptions from props_lookup
-        raise
-    except Exception:
-        # Non-fatal: if props lookup fails, continue without props
-        props_result = None
-
     # Return quote id and the grouped rate responses produced by rate_request.
     return {
         "quote_id": rate_resp.get("quote_id"),
         "responses": rate_resp.get("responses"),
         "assignment": assignment_result,
-        "props": props_result,
     }
