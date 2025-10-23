@@ -66,6 +66,7 @@ ROUTERS = {
     "devices": "routers.devices.get_device_by_id",
     "assign_product_by_device_id": "routers.assign_product_by_device_id",
     "assign_device_collection": "routers.assign_device_collection",
+    "embedded_quote": "routers.embedded_quote",
     "product_assignment": "routers.product_assignment",
 
     # payments / pricing
