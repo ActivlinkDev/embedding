@@ -34,6 +34,22 @@ async def props_lookup(
     product_ids: List[str] = Query(..., alias="product_ids[]", example=["EX1", "WF1"]),
     _: None = Depends(verify_token)
 ):
+    # Delegate to the in-process helper so other modules can call this
+    # without going through FastAPI dependency injection.
+    try:
+        result = await fetch_props(locale, product_ids)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def fetch_props(locale: str, product_ids: List[str]):
+    """In-process helper that performs the Strapi props lookup and returns parsed JSON.
+
+    This mirrors the endpoint behavior but is callable directly by other routers.
+    """
     locale_doc = None
     try:
         col = _get_locale_params_collection()
@@ -52,11 +68,8 @@ async def props_lookup(
 
     headers = {"Authorization": f"Bearer {STRAPI_BEARER_TOKEN}"}
 
-    try:
-        async with httpx.AsyncClient() as client_http:
-            response = await client_http.get(STRAPI_BASE_URL, params=params, headers=headers, timeout=15.0)
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=f"Strapi error: {response.text}")
-        return response.json()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    async with httpx.AsyncClient() as client_http:
+        response = await client_http.get(STRAPI_BASE_URL, params=params, headers=headers, timeout=15.0)
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail=f"Strapi error: {response.text}")
+    return response.json()
