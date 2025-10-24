@@ -1,6 +1,9 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import List, Optional
+from pymongo import MongoClient
+from bson import ObjectId
+import os
 
 from utils.dependencies import verify_token
 
@@ -60,8 +63,25 @@ async def embedded_quote(payload: EmbeddedQuoteRequest, _: None = Depends(verify
             # Skip malformed product entries but log / surface an error
             raise HTTPException(status_code=500, detail=f"Failed to build rate request for product: {str(e)}")
 
-    # Use clientKey from request payload if provided; otherwise leave None
-    batch = RateRequestBatch(deviceId=device_id, clientKey=getattr(payload, 'clientKey', None), requests=requests)
+    # Determine clientKey: prefer explicit payload.clientKey, else fall back
+    # to device.registrationParameters.clientRef (if available).
+    client_key = getattr(payload, 'clientKey', None)
+    if not client_key:
+        try:
+            mongo = MongoClient(os.getenv('MONGO_URI'))
+            db = mongo['Activlink']
+            devices_col = db['Devices']
+            try:
+                dev = devices_col.find_one({'_id': ObjectId(device_id)})
+                if dev:
+                    client_key = dev.get('registrationParameters', {}).get('clientRef')
+            except Exception:
+                # If device_id is not a valid ObjectId or lookup fails, ignore and leave client_key None
+                client_key = None
+        except Exception:
+            client_key = None
+
+    batch = RateRequestBatch(deviceId=device_id, clientKey=client_key, requests=requests)
 
     # 3) Call the rate_request logic which will store quotes and return quote_id
     try:
