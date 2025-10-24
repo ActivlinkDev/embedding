@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 
 from utils.dependencies import verify_token
 
@@ -13,6 +13,7 @@ router = APIRouter(tags=["Embedded Quote"])
 
 class EmbeddedQuoteRequest(BaseModel):
     device_id: str = Field(..., example="64f7a1e4b9c1f2a3d4e5f6a7")
+    clientKey: Optional[str] = Field(None, description="Optional clientKey to pass through to rate_request")
 
 
 @router.post("/embedded_quote")
@@ -59,7 +60,8 @@ async def embedded_quote(payload: EmbeddedQuoteRequest, _: None = Depends(verify
             # Skip malformed product entries but log / surface an error
             raise HTTPException(status_code=500, detail=f"Failed to build rate request for product: {str(e)}")
 
-    batch = RateRequestBatch(deviceId=device_id, requests=requests)
+    # Use clientKey from request payload if provided; otherwise leave None
+    batch = RateRequestBatch(deviceId=device_id, clientKey=getattr(payload, 'clientKey', None), requests=requests)
 
     # 3) Call the rate_request logic which will store quotes and return quote_id
     try:
