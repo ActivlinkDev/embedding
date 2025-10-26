@@ -1,6 +1,7 @@
 # master_sku_router.py
 
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
+import threading
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import requests
@@ -342,7 +343,7 @@ def add_serp_match_flag(locale_block: Dict, model: str):
 # --- Main Endpoint ---
 
 @router.post("/create_master_sku")
-def create_master_sku(data: MasterSKURequest, background_tasks: BackgroundTasks, _: None = Depends(verify_token)):
+def create_master_sku(data: MasterSKURequest, background_tasks: Optional[BackgroundTasks] = None, _: None = Depends(verify_token)):
     # Validate
     if data.GTIN.strip() and not is_valid_gtin(data.GTIN):
         raise HTTPException(status_code=400, detail="Invalid GTIN format")
@@ -401,7 +402,12 @@ def create_master_sku(data: MasterSKURequest, background_tasks: BackgroundTasks,
         # Enqueue background SERP enrichment to replace the placeholder
         try:
             master_id = str(existing.get("_id"))
-            background_tasks.add_task(run_serp_and_update, master_id, localized_title, data.locale, locale_category_for_block, data.Model, extra)
+            if background_tasks:
+                background_tasks.add_task(run_serp_and_update, master_id, localized_title, data.locale, locale_category_for_block, data.Model, extra)
+            else:
+                t = threading.Thread(target=run_serp_and_update, args=(master_id, localized_title, data.locale, locale_category_for_block, data.Model, extra))
+                t.daemon = True
+                t.start()
         except Exception as e:
             print(f"[enqueue error] {e}")
 
@@ -491,7 +497,12 @@ def create_master_sku(data: MasterSKURequest, background_tasks: BackgroundTasks,
 
     # Enqueue background SERP enrichment to update the placeholder block
     try:
-        background_tasks.add_task(run_serp_and_update, str(result.inserted_id), title, data.locale, locale_category_for_block, data.Model, extra)
+        if background_tasks:
+            background_tasks.add_task(run_serp_and_update, str(result.inserted_id), title, data.locale, locale_category_for_block, data.Model, extra)
+        else:
+            t = threading.Thread(target=run_serp_and_update, args=(str(result.inserted_id), title, data.locale, locale_category_for_block, data.Model, extra))
+            t.daemon = True
+            t.start()
     except Exception as e:
         print(f"[enqueue error] {e}")
 
