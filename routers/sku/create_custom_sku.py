@@ -14,18 +14,9 @@ from dotenv import load_dotenv
 from utils.dependencies import verify_token
 from .create_master_sku import create_master_sku, MasterSKURequest
 
-# === QR CODE SUPPORT ===
-import qrcode
-import io
-import base64
-
-def generate_qr_code_base64(url: str) -> str:
-    qr = qrcode.make(url)
-    buffered = io.BytesIO()
-    qr.save(buffered, format="PNG")
-    img_str = base64.b64encode(buffered.getvalue()).decode()
-    return img_str
-# === END QR CODE SUPPORT ===
+# QR code generation removed — previously generated PNG/base64 inline which blocked request path.
+# If QR images are required later, generate them asynchronously in a background worker and store
+# the result (or serve via a CDN) instead of generating synchronously during request handling.
 
 # ==== HELPERS ====
 
@@ -214,15 +205,7 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
 
         if locale_match:
             existing["_id"] = str(existing["_id"])
-            # === Add QR Code URL for existing ===
-            qr_url = f"http://www.activlink.io/qr?{existing['_id']}"
-            qr_code_base64 = generate_qr_code_base64(qr_url)
-            # Persist qr_code_image into the existing document in MongoDB
-            customsku_collection.update_one(
-                {"_id": ObjectId(existing["_id"])},
-                {"$set": {"qr_code_image": f"data:image/png;base64,{qr_code_base64}"}}
-            )
-            # Refresh the document to return the stored value
+            # Refresh the document to return the stored value (QR generation removed)
             persisted = customsku_collection.find_one({"_id": ObjectId(existing["_id"])})
             if persisted:
                 persisted["_id"] = str(persisted["_id"])
@@ -231,8 +214,6 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                     "existing": persisted
                 }
             else:
-                # fallback to returning the in-memory object with qr_code_image attached
-                existing["qr_code_image"] = f"data:image/png;base64,{qr_code_base64}"
                 return {
                     "message": "SKU exists already for client and locale",
                     "existing": existing
@@ -282,14 +263,7 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
             updated_doc = customsku_collection.find_one({"_id": ObjectId(str_existing_id)})
             if updated_doc:
                 updated_doc["_id"] = str(updated_doc["_id"])
-                # === Generate and persist QR Code for updated document ===
-                qr_url = f"http://www.activlink.io/qr?{updated_doc['_id']}"
-                qr_code_base64 = generate_qr_code_base64(qr_url)
-                customsku_collection.update_one(
-                    {"_id": ObjectId(str_existing_id)},
-                    {"$set": {"qr_code_image": f"data:image/png;base64,{qr_code_base64}"}}
-                )
-                # Refresh
+                # Refresh and return updated document (QR generation removed)
                 persisted = customsku_collection.find_one({"_id": ObjectId(str_existing_id)})
                 if persisted:
                     persisted["_id"] = str(persisted["_id"])
@@ -297,8 +271,6 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                         "message": "Locale added to existing CustomSKU",
                         "customsku": persisted
                     }
-                # fallback
-                updated_doc["qr_code_image"] = f"data:image/png;base64,{qr_code_base64}"
                 return {
                     "message": "Locale added to existing CustomSKU",
                     "customsku": updated_doc
@@ -348,20 +320,11 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                 }
                 result = customsku_collection.insert_one(doc)
                 doc["_id"] = str(result.inserted_id)
-                # === Generate and persist QR Code for new doc ===
-                qr_url = f"http://www.activlink.io/qr?{doc['_id']}"
-                qr_code_base64 = generate_qr_code_base64(qr_url)
-                customsku_collection.update_one(
-                    {"_id": ObjectId(doc["_id"])},
-                    {"$set": {"qr_code_image": f"data:image/png;base64,{qr_code_base64}"}}
-                )
-                # Refresh
-                persisted = customsku_collection.find_one({"_id": ObjectId(doc["_id"])})
+                # Refresh and return new persisted document (QR generation removed)
+                persisted = customsku_collection.find_one({"_id": ObjectId(doc['_id'])})
                 if persisted:
                     persisted["_id"] = str(persisted["_id"])
                     return persisted
-                # fallback
-                doc["qr_code_image"] = f"data:image/png;base64,{qr_code_base64}"
                 return doc
             else:
                 # Call master sku creation to add this locale, and poll
@@ -404,17 +367,10 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                 }
                 result = customsku_collection.insert_one(doc)
                 doc["_id"] = str(result.inserted_id)
-                qr_url = f"http://www.activlink.io/qr?{doc['_id']}"
-                qr_code_base64 = generate_qr_code_base64(qr_url)
-                customsku_collection.update_one(
-                    {"_id": ObjectId(doc["_id"])},
-                    {"$set": {"qr_code_image": f"data:image/png;base64,{qr_code_base64}"}}
-                )
                 persisted = customsku_collection.find_one({"_id": ObjectId(doc["_id"])})
                 if persisted:
                     persisted["_id"] = str(persisted["_id"])
                     return persisted
-                doc["qr_code_image"] = f"data:image/png;base64,{qr_code_base64}"
                 return doc
         else:
             # No master SKU found, create master SKU and poll
@@ -457,17 +413,10 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
             }
             result = customsku_collection.insert_one(doc)
             doc["_id"] = str(result.inserted_id)
-            qr_url = f"http://www.activlink.io/qr?{doc['_id']}"
-            qr_code_base64 = generate_qr_code_base64(qr_url)
-            customsku_collection.update_one(
-                {"_id": ObjectId(doc["_id"])},
-                {"$set": {"qr_code_image": f"data:image/png;base64,{qr_code_base64}"}}
-            )
-            persisted = customsku_collection.find_one({"_id": ObjectId(doc["_id"] )})
+            persisted = customsku_collection.find_one({"_id": ObjectId(doc['_id'] )})
             if persisted:
                 persisted["_id"] = str(persisted["_id"])
                 return persisted
-            doc["qr_code_image"] = f"data:image/png;base64,{qr_code_base64}"
             return doc
 
     return {
