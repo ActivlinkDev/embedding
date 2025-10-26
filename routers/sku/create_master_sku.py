@@ -310,7 +310,7 @@ def add_serp_match_flag(locale_block: Dict, model: str):
 # --- Main Endpoint ---
 
 @router.post("/create_master_sku")
-def create_master_sku(data: MasterSKURequest, _: None = Depends(verify_token)):
+def create_master_sku(data: MasterSKURequest, addSERP: Optional[bool] = False, _: None = Depends(verify_token)):
     # Validate
     if data.GTIN.strip() and not is_valid_gtin(data.GTIN):
         raise HTTPException(status_code=400, detail="Invalid GTIN format")
@@ -342,10 +342,43 @@ def create_master_sku(data: MasterSKURequest, _: None = Depends(verify_token)):
         locale_category_for_block = choose_locale_category(icecat_data_locale, upc_data_locale, data)
 
         extra = extract_multimedia_urls(icecat_data_locale) if icecat_data_locale else {}
-        locale_block = build_locale_data_from_serp(localized_title, data.locale, locale_category_for_block, data.Model, extra=extra)
-        add_serp_match_flag(locale_block, data.Model)
+        if addSERP:
+            locale_block = build_locale_data_from_serp(localized_title, data.locale, locale_category_for_block, data.Model, extra=extra)
+            add_serp_match_flag(locale_block, data.Model)
+            # mark master serp status as completed for this locale
+            try:
+                master_collection.update_one({"_id": existing["_id"]}, {"$set": {"serp_status": "completed", "serp_last_updated": utc_now_iso()}})
+            except Exception:
+                pass
+        else:
+            locale_info = fetch_locale_info(data.locale) or {}
+            currency_code = locale_info.get("currency")
+            locale_block = {
+                "locale": data.locale,
+                "Category": locale_category_for_block,
+                "Input_Title": localized_title,
+                "SERP_Title": None,
+                "Google_ID": None,
+                "Google_URL": None,
+                "Merchant": None,
+                "Currency": currency_code,
+                "Price": None,
+                "MSRP_Source": "Skipped",
+                "created_at": utc_now_iso(),
+                "serp_pending": False,
+                "Serp_match": False
+            }
+            if extra:
+                locale_block.update(extra)
 
         updated = update_existing_sku(existing, data, locale_block)
+        # ensure returned document reflects serp_status
+        try:
+            status_val = "completed" if addSERP else "skipped"
+            master_collection.update_one({"_id": existing["_id"]}, {"$set": {"serp_status": status_val}})
+            existing["serp_status"] = status_val
+        except Exception:
+            pass
         updated["_id"] = str(updated["_id"])
         return {
             "source": "master-update",
@@ -388,8 +421,31 @@ def create_master_sku(data: MasterSKURequest, _: None = Depends(verify_token)):
     # --- PER-LOCALE CATEGORY LOGIC ---
     locale_category_for_block = choose_locale_category(icecat_data, upc_data, data)
     extra = extract_multimedia_urls(icecat_data) if icecat_data else {}
-    locale_block = build_locale_data_from_serp(title, data.locale, locale_category_for_block, data.Model, extra=extra)
-    add_serp_match_flag(locale_block, data.Model)
+    if addSERP:
+        locale_block = build_locale_data_from_serp(title, data.locale, locale_category_for_block, data.Model, extra=extra)
+        add_serp_match_flag(locale_block, data.Model)
+        serp_status_val = "completed"
+    else:
+        serp_status_val = "skipped"
+        locale_info = fetch_locale_info(data.locale) or {}
+        currency_code = locale_info.get("currency")
+        locale_block = {
+            "locale": data.locale,
+            "Category": locale_category_for_block,
+            "Input_Title": title,
+            "SERP_Title": None,
+            "Google_ID": None,
+            "Google_URL": None,
+            "Merchant": None,
+            "Currency": currency_code,
+            "Price": None,
+            "MSRP_Source": "Skipped",
+            "created_at": utc_now_iso(),
+            "serp_pending": False,
+            "Serp_match": False
+        }
+        if extra:
+            locale_block.update(extra)
 
     now_iso = utc_now_iso()
     doc = {
@@ -405,7 +461,8 @@ def create_master_sku(data: MasterSKURequest, _: None = Depends(verify_token)):
         "Image_URL": image_url,
         "brand_logo": brand_logo,
         "Source": "CAT" if icecat_data else ("UPC" if upc_data else "INPUT"),
-        "Locale_Specific_Data": [locale_block]
+        "Locale_Specific_Data": [locale_block],
+        "serp_status": serp_status_val
     }
 
     result = master_collection.insert_one(doc)

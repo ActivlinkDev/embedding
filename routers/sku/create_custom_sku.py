@@ -173,6 +173,7 @@ class CustomSKURequest(BaseModel):
     Category: Optional[str] = ""
     Locale_Details: Optional[LocaleDetails] = None
     Global_Promotion: Optional[str] = None
+    addSERP: Optional[bool] = False
 
 @router.post("/create_custom_sku")
 def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
@@ -242,7 +243,7 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                     locale=data.Locale,
                     Category=data.Category
                 )
-                create_master_sku(master_data)
+                create_master_sku(master_data, addSERP=data.addSERP)
                 mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
                 mastersku_locale_data = find_locale_data(
                     mastersku.get("Locale_Specific_Data", []), data.Locale
@@ -335,7 +336,7 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                     locale=data.Locale,
                     Category=data.Category
                 )
-                create_master_sku(master_data)
+                create_master_sku(master_data, addSERP=data.addSERP)
                 mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
                 if not mastersku:
                     return {
@@ -381,7 +382,7 @@ def create_custom_sku(data: CustomSKURequest, _: None = Depends(verify_token)):
                 locale=data.Locale,
                 Category=data.Category
             )
-            create_master_sku(master_data)
+            create_master_sku(master_data, addSERP=data.addSERP)
             mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
             if not mastersku:
                 return {
