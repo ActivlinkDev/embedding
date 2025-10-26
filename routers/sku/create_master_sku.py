@@ -5,9 +5,13 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import requests
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from uuid import uuid4
 from pymongo import MongoClient
+from pymongo import ReturnDocument, errors
+import re
 from dotenv import load_dotenv
+from fastapi.responses import RedirectResponse
 
 from utils.dependencies import verify_token
 from utils.common import embed_query, find_best_match, category_embeddings, device_categories
@@ -19,12 +23,48 @@ router = APIRouter(
     tags=["SKU"]
 )
 
+
+@router.get("/r/{key}")
+def redirect_masked(key: str):
+    """Redirect endpoint for masked URLs stored in `url_map`.
+    Returns a 307 Temporary Redirect to the original Icecat (or other) URL.
+    """
+    try:
+        doc = url_map_collection.find_one({"_id": key})
+    except Exception:
+        doc = None
+    if not doc:
+        raise HTTPException(status_code=404, detail="Not found")
+    # Optional expiry check
+    expires_at = doc.get("expires_at")
+    if expires_at and isinstance(expires_at, datetime) and expires_at < datetime.utcnow():
+        raise HTTPException(status_code=404, detail="Not found")
+    url = doc.get("url")
+    if not url:
+        raise HTTPException(status_code=404, detail="Not found")
+    return RedirectResponse(url, status_code=307)
+
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
 
 locale_collection = db["Locale_Params"]
 master_collection = db["MasterSKU"]
 failed_matches_collection = db["Failed_Matches"]
+url_map_collection = db["url_map"]
+
+# Ensure a uniqueness guard to reduce duplicate MasterSKU creation.
+# Use a computed `match_key` (prefers GTIN when present, otherwise normalized make|model).
+try:
+    master_collection.create_index("match_key", unique=True, sparse=True)
+except Exception:
+    # If index creation fails (permissions, etc.) continue — DB-level dedupe unavailable.
+    pass
+
+# Ensure TTL index on url_map.expires_at if present (best-effort)
+try:
+    url_map_collection.create_index("expires_at", expireAfterSeconds=0)
+except Exception:
+    pass
 
 ICECAT_USERNAME = os.getenv("ICECAT_USER")
 GO_UPC_API_KEY = os.getenv("GO_UPC_TOKEN")
@@ -134,6 +174,44 @@ def extract_multimedia_urls(icecat_data: dict) -> dict:
         "manual_url": manual_url,
         "product_fiche_url": product_fiche_url
     }
+
+
+def mask_and_store_url(url: str, ttl_seconds: int = None) -> str:
+    """
+    Create a mapping record in `url_map` and return a masked internal path.
+    The mapping document has _id set to a UUID string and stores the original URL.
+    Returns path like "/sku/r/<uuid>" which can be used in MasterSKU documents.
+    """
+    try:
+        key = str(uuid4())
+        doc = {"_id": key, "url": url, "created_at": datetime.utcnow()}
+        if ttl_seconds and isinstance(ttl_seconds, int):
+            doc["expires_at"] = datetime.utcnow() + timedelta(seconds=ttl_seconds)
+        url_map_collection.insert_one(doc)
+        # Use configured public backend base (if available) so frontend links are absolute.
+        base = os.getenv("FASTAPI_BASE_URL") or os.getenv("PUBLIC_BACKEND_URL") or "http://localhost:8000"
+        return base.rstrip('/') + f"/sku/r/{key}"
+    except Exception:
+        # On any failure, fall back to storing the original url (safer than dropping it)
+        return url
+
+
+def _mask_extra_urls(extra: dict) -> dict:
+    """Replace any Icecat manual/product_fiche URLs in `extra` with masked paths."""
+    if not extra or not isinstance(extra, dict):
+        return extra
+    out = dict(extra)
+    try:
+        for k in ("manual_url", "product_fiche_url"):
+            if out.get(k):
+                try:
+                    out[k] = mask_and_store_url(out[k])
+                except Exception:
+                    # leave original if masking fails
+                    pass
+    except Exception:
+        return extra
+    return out
 
 def build_locale_data_from_serp(title: str, locale: str, category: str, model: str, extra: dict = None) -> Dict:
     locale_info = fetch_locale_info(locale)
@@ -342,6 +420,8 @@ def create_master_sku(data: MasterSKURequest, addSERP: Optional[bool] = False, _
         locale_category_for_block = choose_locale_category(icecat_data_locale, upc_data_locale, data)
 
         extra = extract_multimedia_urls(icecat_data_locale) if icecat_data_locale else {}
+        # Mask any Icecat URLs so we don't persist raw upstream links
+        extra = _mask_extra_urls(extra)
         if addSERP:
             locale_block = build_locale_data_from_serp(localized_title, data.locale, locale_category_for_block, data.Model, extra=extra)
             add_serp_match_flag(locale_block, data.Model)
@@ -370,6 +450,18 @@ def create_master_sku(data: MasterSKURequest, addSERP: Optional[bool] = False, _
             }
             if extra:
                 locale_block.update(extra)
+
+        # Ensure existing doc has a match_key so future upserts can find it atomically.
+        try:
+            if data.GTIN and data.GTIN.strip():
+                mk = f"gtin:{data.GTIN.strip()}"
+            else:
+                mk = f"mm:{(data.Make or '').strip().lower()}|{(data.Model or '').strip().lower()}"
+            master_collection.update_one({"_id": existing["_id"]}, {"$set": {"match_key": mk}})
+            existing["match_key"] = mk
+        except Exception:
+            # best-effort only
+            pass
 
         updated = update_existing_sku(existing, data, locale_block)
         # ensure returned document reflects serp_status
@@ -421,6 +513,8 @@ def create_master_sku(data: MasterSKURequest, addSERP: Optional[bool] = False, _
     # --- PER-LOCALE CATEGORY LOGIC ---
     locale_category_for_block = choose_locale_category(icecat_data, upc_data, data)
     extra = extract_multimedia_urls(icecat_data) if icecat_data else {}
+    # Mask any Icecat URLs so we don't persist raw upstream links
+    extra = _mask_extra_urls(extra)
     if addSERP:
         locale_block = build_locale_data_from_serp(title, data.locale, locale_category_for_block, data.Model, extra=extra)
         add_serp_match_flag(locale_block, data.Model)
@@ -465,6 +559,42 @@ def create_master_sku(data: MasterSKURequest, addSERP: Optional[bool] = False, _
         "serp_status": serp_status_val
     }
 
-    result = master_collection.insert_one(doc)
-    doc["_id"] = str(result.inserted_id)
-    return doc
+    # Compute a stable match_key for this product (prefer GTIN when available)
+    if data.GTIN and data.GTIN.strip():
+        match_key = f"gtin:{data.GTIN.strip()}"
+    else:
+        match_key = f"mm:{(data.Make or '').strip().lower()}|{(data.Model or '').strip().lower()}"
+    doc["match_key"] = match_key
+
+    # Use an atomic upsert to avoid race-condition duplicate inserts.
+    try:
+        update = {
+            "$setOnInsert": doc,
+            # Ensure GTIN array contains any gtins we discovered
+            "$addToSet": {"GTIN": {"$each": gtin_from_icecat}, "Locale_Specific_Data": locale_block}
+        }
+        res = master_collection.find_one_and_update({"match_key": match_key}, update, upsert=True, return_document=ReturnDocument.AFTER)
+        # If the returned doc came from DB, ensure _id is a string
+        if res:
+            try:
+                res["_id"] = str(res["_id"])
+            except Exception:
+                pass
+            return res
+    except errors.DuplicateKeyError:
+        # Rare race: another process created the doc between our check and upsert. Fetch the existing doc.
+        existing_doc = master_collection.find_one({"match_key": match_key})
+        if existing_doc:
+            try:
+                existing_doc["_id"] = str(existing_doc["_id"])
+            except Exception:
+                pass
+            return existing_doc
+    except Exception as e:
+        # As a fallback, attempt a plain insert (so we don't fail hard for unexpected DB errors)
+        try:
+            result = master_collection.insert_one(doc)
+            doc["_id"] = str(result.inserted_id)
+            return doc
+        except Exception:
+            raise HTTPException(status_code=500, detail=f"Failed to create MasterSKU: {str(e)}")
