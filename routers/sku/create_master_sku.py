@@ -1,6 +1,6 @@
 # master_sku_router.py
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import requests
@@ -11,7 +11,8 @@ from pymongo import MongoClient
 from pymongo import ReturnDocument, errors
 import re
 from dotenv import load_dotenv
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
+import httpx
 
 from utils.dependencies import verify_token
 from utils.common import embed_query, find_best_match, category_embeddings, device_categories
@@ -25,9 +26,10 @@ router = APIRouter(
 
 
 @router.get("/r/{key}")
-def redirect_masked(key: str):
-    """Redirect endpoint for masked URLs stored in `url_map`.
-    Returns a 307 Temporary Redirect to the original Icecat (or other) URL.
+async def proxy_masked(key: str):
+    """Proxy endpoint for masked URLs stored in `url_map`.
+    Fetches the upstream resource server-side and streams it back so the
+    browser remains on the masked URL (upstream host is not exposed).
     """
     try:
         doc = url_map_collection.find_one({"_id": key})
@@ -35,14 +37,29 @@ def redirect_masked(key: str):
         doc = None
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
+
     # Optional expiry check
     expires_at = doc.get("expires_at")
     if expires_at and isinstance(expires_at, datetime) and expires_at < datetime.utcnow():
         raise HTTPException(status_code=404, detail="Not found")
+
     url = doc.get("url")
     if not url:
         raise HTTPException(status_code=404, detail="Not found")
-    return RedirectResponse(url, status_code=307)
+
+    # Stream the upstream response back to the client
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            upstream = await client.get(url, follow_redirects=True)
+
+            # Filter hop-by-hop headers
+            hop_by_hop = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade", "content-encoding"}
+            headers = {k: v for k, v in upstream.headers.items() if k.lower() not in hop_by_hop}
+
+            media_type = upstream.headers.get("content-type")
+            return StreamingResponse(upstream.aiter_bytes(), status_code=upstream.status_code, headers=headers, media_type=media_type)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {str(e)}")
 
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
@@ -176,7 +193,7 @@ def extract_multimedia_urls(icecat_data: dict) -> dict:
     }
 
 
-def mask_and_store_url(url: str, ttl_seconds: int = None) -> str:
+def mask_and_store_url(url: str, base_url: str = None, ttl_seconds: int = None) -> str:
     """
     Create a mapping record in `url_map` and return a masked internal path.
     The mapping document has _id set to a UUID string and stores the original URL.
@@ -188,15 +205,15 @@ def mask_and_store_url(url: str, ttl_seconds: int = None) -> str:
         if ttl_seconds and isinstance(ttl_seconds, int):
             doc["expires_at"] = datetime.utcnow() + timedelta(seconds=ttl_seconds)
         url_map_collection.insert_one(doc)
-        # Use configured public backend base (if available) so frontend links are absolute.
-        base = os.getenv("FASTAPI_BASE_URL") or os.getenv("PUBLIC_BACKEND_URL") or "http://localhost:8000"
+        # Use provided base_url, then configured env, then fallback to localhost:8000
+        base = (base_url and str(base_url).strip()) or os.getenv("FASTAPI_BASE_URL") or os.getenv("PUBLIC_BACKEND_URL") or "http://localhost:8000"
         return base.rstrip('/') + f"/sku/r/{key}"
     except Exception:
         # On any failure, fall back to storing the original url (safer than dropping it)
         return url
 
 
-def _mask_extra_urls(extra: dict) -> dict:
+def _mask_extra_urls(extra: dict, base_url: str = None) -> dict:
     """Replace any Icecat manual/product_fiche URLs in `extra` with masked paths."""
     if not extra or not isinstance(extra, dict):
         return extra
@@ -205,7 +222,7 @@ def _mask_extra_urls(extra: dict) -> dict:
         for k in ("manual_url", "product_fiche_url"):
             if out.get(k):
                 try:
-                    out[k] = mask_and_store_url(out[k])
+                    out[k] = mask_and_store_url(out[k], base_url=base_url)
                 except Exception:
                     # leave original if masking fails
                     pass
@@ -388,7 +405,7 @@ def add_serp_match_flag(locale_block: Dict, model: str):
 # --- Main Endpoint ---
 
 @router.post("/create_master_sku")
-def create_master_sku(data: MasterSKURequest, addSERP: Optional[bool] = False, _: None = Depends(verify_token)):
+def create_master_sku(data: MasterSKURequest, request: Request, addSERP: Optional[bool] = False, _: None = Depends(verify_token)):
     # Validate
     if data.GTIN.strip() and not is_valid_gtin(data.GTIN):
         raise HTTPException(status_code=400, detail="Invalid GTIN format")
@@ -420,8 +437,10 @@ def create_master_sku(data: MasterSKURequest, addSERP: Optional[bool] = False, _
         locale_category_for_block = choose_locale_category(icecat_data_locale, upc_data_locale, data)
 
         extra = extract_multimedia_urls(icecat_data_locale) if icecat_data_locale else {}
+        # Compute base for masked links: prefer env, else derive from incoming request
+        base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
         # Mask any Icecat URLs so we don't persist raw upstream links
-        extra = _mask_extra_urls(extra)
+        extra = _mask_extra_urls(extra, base_url=base_for_mask)
         if addSERP:
             locale_block = build_locale_data_from_serp(localized_title, data.locale, locale_category_for_block, data.Model, extra=extra)
             add_serp_match_flag(locale_block, data.Model)
@@ -513,8 +532,9 @@ def create_master_sku(data: MasterSKURequest, addSERP: Optional[bool] = False, _
     # --- PER-LOCALE CATEGORY LOGIC ---
     locale_category_for_block = choose_locale_category(icecat_data, upc_data, data)
     extra = extract_multimedia_urls(icecat_data) if icecat_data else {}
+    base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
     # Mask any Icecat URLs so we don't persist raw upstream links
-    extra = _mask_extra_urls(extra)
+    extra = _mask_extra_urls(extra, base_url=base_for_mask)
     if addSERP:
         locale_block = build_locale_data_from_serp(title, data.locale, locale_category_for_block, data.Model, extra=extra)
         add_serp_match_flag(locale_block, data.Model)
