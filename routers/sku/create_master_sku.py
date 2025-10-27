@@ -376,7 +376,7 @@ def get_gtin_from_icecat(icecat_data: Optional[Dict], default_gtin: str):
 def compute_category_embedding(category_input: str):
     embedding = embed_query(category_input)
     matched_category, similarity = find_best_match(embedding, category_embeddings, device_categories)
-    final_category = matched_category if similarity >= 0.35 else "Unknown"
+    final_category = matched_category if similarity >= 0.49 else "Unknown"
     return final_category, matched_category, similarity, embedding
 
 def log_failed_match(category_input: str, data: MasterSKURequest, embedding, similarity: float):
