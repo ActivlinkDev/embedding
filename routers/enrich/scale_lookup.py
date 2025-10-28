@@ -49,6 +49,9 @@ async def get_shopping_result(
     locale: str = Query("en_GB", description="Locale for search results"),
     masterSKUid: Optional[str] = Query(None, description="Optional MasterSKU ObjectId to update with SERP data")
 ):
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"[scale_lookup] START query='{query}' locale={locale} masterSKUid={masterSKUid}")
     """
     Proxy to ScaleSERP Shopping API.
     Returns a trimmed single-result payload including gpc_id.
@@ -196,4 +199,5 @@ async def get_shopping_result(
             # don't fail the API if updating the MasterSKU fails; swallow with trace in response
             trimmed.setdefault("master_update_error", str(e))
 
+    logger.info(f"[scale_lookup] END query='{query}' locale={locale} masterSKUid={masterSKUid}")
     return JSONResponse(content=trimmed)

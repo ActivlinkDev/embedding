@@ -504,15 +504,21 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
         except Exception:
             pass
         updated["_id"] = str(updated["_id"])
-        # schedule background ScaleSERP lookup using Make+Model via asyncio.create_task
+        # schedule background ScaleSERP lookup using Make+Model via asyncio.create_task with logging wrapper
+        async def _run_and_log(query, locale, masterSKUid):
+            try:
+                logger.info(f"[bg_scale] starting scale lookup for masterSKUid={masterSKUid} query='{query}' locale={locale}")
+                await get_shopping_result(query=query, locale=locale, masterSKUid=masterSKUid)
+                logger.info(f"[bg_scale] finished scale lookup for masterSKUid={masterSKUid}")
+            except Exception:
+                logger.exception(f"[bg_scale] error in scale lookup for masterSKUid={masterSKUid}")
         try:
             try:
                 from routers.enrich.scale_lookup import get_shopping_result
             except Exception:
                 from enrich.scale_lookup import get_shopping_result
-            # schedule on the running event loop; fire-and-forget
             try:
-                asyncio.create_task(get_shopping_result(query=f"{data.Make} {data.Model}", locale=data.locale, masterSKUid=str(updated["_id"])))
+                asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(updated["_id"])))
             except Exception:
                 logger.exception("Failed to create asyncio task for scale lookup (existing update)")
         except Exception:
@@ -625,13 +631,20 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
             except Exception:
                 pass
                 # schedule background ScaleSERP lookup for newly created/upserted MasterSKU
+                async def _run_and_log(query, locale, masterSKUid):
+                    try:
+                        logger.info(f"[bg_scale] starting scale lookup for masterSKUid={masterSKUid} query='{query}' locale={locale}")
+                        await get_shopping_result(query=query, locale=locale, masterSKUid=masterSKUid)
+                        logger.info(f"[bg_scale] finished scale lookup for masterSKUid={masterSKUid}")
+                    except Exception:
+                        logger.exception(f"[bg_scale] error in scale lookup for masterSKUid={masterSKUid}")
                 try:
                     try:
                         from routers.enrich.scale_lookup import get_shopping_result
                     except Exception:
                         from enrich.scale_lookup import get_shopping_result
                     try:
-                        asyncio.create_task(get_shopping_result(query=f"{data.Make} {data.Model}", locale=data.locale, masterSKUid=str(res["_id"])))
+                        asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(res["_id"])))
                     except Exception:
                         logger.exception("Failed to create asyncio task for scale lookup (new upsert)")
                 except Exception:
@@ -646,13 +659,20 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
             except Exception:
                 pass
                 # schedule a background lookup for the found existing doc as well
+                async def _run_and_log(query, locale, masterSKUid):
+                    try:
+                        logger.info(f"[bg_scale] starting scale lookup for masterSKUid={masterSKUid} query='{query}' locale={locale}")
+                        await get_shopping_result(query=query, locale=locale, masterSKUid=masterSKUid)
+                        logger.info(f"[bg_scale] finished scale lookup for masterSKUid={masterSKUid}")
+                    except Exception:
+                        logger.exception(f"[bg_scale] error in scale lookup for masterSKUid={masterSKUid}")
                 try:
                     try:
                         from routers.enrich.scale_lookup import get_shopping_result
                     except Exception:
                         from enrich.scale_lookup import get_shopping_result
                     try:
-                        asyncio.create_task(get_shopping_result(query=f"{data.Make} {data.Model}", locale=data.locale, masterSKUid=str(existing_doc["_id"])))
+                        asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(existing_doc["_id"])))
                     except Exception:
                         logger.exception("Failed to create asyncio task for scale lookup (duplicate key handling)")
                 except Exception:
