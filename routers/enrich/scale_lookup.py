@@ -5,6 +5,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Any
 from pymongo import MongoClient
+from bson import ObjectId
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 router = APIRouter(prefix="/scale", tags=["ScaleSERP"])
@@ -16,6 +18,11 @@ load_dotenv()
 mongo_client = MongoClient(os.getenv("MONGO_URI"))
 db = mongo_client["Activlink"]
 locale_collection = db["Locale_Params"]
+mastersku_collection = db["MasterSKU"]
+
+
+def utc_now_iso() -> str:
+    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 class ScaleShoppingResponse(BaseModel):
@@ -39,7 +46,8 @@ class ScaleShoppingResponse(BaseModel):
 @router.get("/shopping", response_model=ScaleShoppingResponse)
 async def get_shopping_result(
     query: str = Query(..., description="Product search query"),
-    locale: str = Query("en_GB", description="Locale for search results")
+    locale: str = Query("en_GB", description="Locale for search results"),
+    masterSKUid: Optional[str] = Query(None, description="Optional MasterSKU ObjectId to update with SERP data")
 ):
     """
     Proxy to ScaleSERP Shopping API.
@@ -122,5 +130,62 @@ async def get_shopping_result(
             trimmed["product_details"] = {"error": f"status {e.response.status_code}", "detail": str(e)}
         except httpx.RequestError as e:
             trimmed["product_details"] = {"error": "request_failed", "detail": str(e)}
+
+    # If masterSKUid supplied and we have a successful trimmed payload, update MasterSKU locale data
+    if masterSKUid:
+        try:
+            ms_id = ObjectId(masterSKUid)
+            # fetch master SKU document to verify model matches SERP title
+            ms_doc = mastersku_collection.find_one({"_id": ms_id})
+            if not ms_doc:
+                raise Exception("MasterSKU not found")
+            model_val = (ms_doc.get("Model") or "").strip()
+            title_val = (trimmed.get("title") or "").strip()
+
+            def _normalize(s: str) -> str:
+                return "".join([c for c in s.lower() if c.isalnum()])
+
+            if model_val and title_val:
+                norm_model = _normalize(model_val)
+                norm_title = _normalize(title_val)
+                if norm_model not in norm_title:
+                    # model does not appear to match the SERP title; skip updating
+                    trimmed.setdefault("master_update_error", f"model_mismatch: '{model_val}' not found in title")
+                    raise Exception("model_mismatch")
+            else:
+                # missing model or title - treat as mismatch
+                trimmed.setdefault("master_update_error", "model_or_title_missing")
+                raise Exception("model_or_title_missing")
+            # build locale-specific update document
+            serp_status = "found" if trimmed.get("product_details") else ("partial" if trimmed.get("gpc_id") else "skipped")
+            locale_update = {
+                "SERP_Title": trimmed.get("title"),
+                "Google_ID": trimmed.get("gpc_id"),
+                "Google_URL": trimmed.get("link"),
+                "Merchant": trimmed.get("merchant"),
+                "Currency": trimmed.get("currency"),
+                "Price": trimmed.get("price_value") or trimmed.get("price"),
+                "created_at": utc_now_iso(),
+                "serp_pending": False,
+                "Serp_match": False,
+                "serp_status": serp_status,
+            }
+
+            # Attempt to set fields on an existing locale entry
+            result = mastersku_collection.update_one(
+                {"_id": ms_id, "Locale_Specific_Data.locale": locale},
+                {"$set": {f"Locale_Specific_Data.$.{k}": v for k, v in locale_update.items()}}
+            )
+
+            if result.matched_count == 0:
+                # No existing locale entry - push a new one
+                new_locale_entry = {"locale": locale, **locale_update}
+                mastersku_collection.update_one(
+                    {"_id": ms_id},
+                    {"$push": {"Locale_Specific_Data": new_locale_entry}}
+                )
+        except Exception as e:
+            # don't fail the API if updating the MasterSKU fails; swallow with trace in response
+            trimmed.setdefault("master_update_error", str(e))
 
     return JSONResponse(content=trimmed)
