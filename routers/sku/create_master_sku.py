@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import requests
+import threading
 import os
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
@@ -91,6 +92,24 @@ SCALE_SERP_API_KEY = os.getenv("SCALE_SERP_KEY")
 def utc_now_iso():
     """Returns the current UTC time in ISO 8601 format with 'Z' suffix and milliseconds."""
     return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _bg_call_scale_lookup(query: str, locale: str, masterSKUid: str, base_url: str = None):
+    try:
+        base = (base_url and str(base_url).strip()) or os.getenv("FASTAPI_BASE_URL") or "http://localhost:8080"
+        params = {"query": query, "locale": locale, "masterSKUid": masterSKUid}
+        # fire-and-forget GET to internal scale endpoint; ignore response
+        requests.get(f"{base.rstrip('/')}/scale/shopping", params=params, timeout=15)
+    except Exception as e:
+        print(f"[background scale_lookup error] {e}")
+
+
+def schedule_scale_lookup_background(query: str, locale: str, masterSKUid: str, base_url: str = None):
+    try:
+        t = threading.Thread(target=_bg_call_scale_lookup, args=(query, locale, masterSKUid, base_url), daemon=True)
+        t.start()
+    except Exception as e:
+        print(f"[schedule scale_lookup error] {e}")
 
 
 class MasterSKURequest(BaseModel):
@@ -488,6 +507,13 @@ def create_master_sku(data: MasterSKURequest, request: Request, addSERP: Optiona
         except Exception:
             pass
         updated["_id"] = str(updated["_id"])
+        # schedule background ScaleSERP lookup using Make+Model
+        try:
+            base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
+            schedule_scale_lookup_background(f"{data.Make} {data.Model}", data.locale, str(updated["_id"]), base_url=base_for_mask)
+        except Exception:
+            pass
+
         return {
             "source": "master-update",
             "updated_locale": data.locale,
@@ -594,6 +620,12 @@ def create_master_sku(data: MasterSKURequest, request: Request, addSERP: Optiona
                 res["_id"] = str(res["_id"])
             except Exception:
                 pass
+            # schedule background ScaleSERP lookup for newly created/upserted MasterSKU
+            try:
+                base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
+                schedule_scale_lookup_background(f"{data.Make} {data.Model}", data.locale, str(res["_id"]), base_url=base_for_mask)
+            except Exception:
+                pass
             return res
     except errors.DuplicateKeyError:
         # Rare race: another process created the doc between our check and upsert. Fetch the existing doc.
@@ -603,7 +635,13 @@ def create_master_sku(data: MasterSKURequest, request: Request, addSERP: Optiona
                 existing_doc["_id"] = str(existing_doc["_id"])
             except Exception:
                 pass
-            return existing_doc
+                # schedule a background lookup for the found existing doc as well
+                try:
+                    base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
+                    schedule_scale_lookup_background(f"{data.Make} {data.Model}", data.locale, str(existing_doc["_id"]), base_url=base_for_mask)
+                except Exception:
+                    pass
+                return existing_doc
     except Exception as e:
         # As a fallback, attempt a plain insert (so we don't fail hard for unexpected DB errors)
         try:
