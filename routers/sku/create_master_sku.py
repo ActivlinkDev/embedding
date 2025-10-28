@@ -97,33 +97,59 @@ def utc_now_iso():
 
 def _bg_call_scale_lookup(query: str, locale: str, masterSKUid: str, base_url: str = None):
     try:
-        # Avoid calling the internal HTTP endpoint (can deadlock if same process).
-        # Instead, import and run the async handler directly in a new event loop.
+        # If a base_url is provided, prefer calling the ScaleSERP endpoint over HTTP.
+        # This avoids import/circular-import problems and dependency injection issues
+        # that can arise when calling FastAPI endpoint functions directly in-process.
+        if base_url and str(base_url).strip():
+            try:
+                url = str(base_url).rstrip('/') + "/scale/shopping"
+                params = {"query": query, "locale": locale, "masterSKUid": masterSKUid}
+                print(f"[bg_scale] calling ScaleSERP via HTTP {url} params={params}")
+                # use requests (sync) inside this background thread
+                resp = requests.get(url, params=params, timeout=15)
+                if resp.status_code >= 400:
+                    print(f"[bg_scale] HTTP scale lookup failed {resp.status_code}: {resp.text}")
+                else:
+                    print(f"[bg_scale] HTTP scale lookup succeeded for masterSKUid={masterSKUid}")
+                return
+            except Exception as e:
+                print(f"[bg_scale] HTTP call to scale lookup failed: {e}")
+
+        # Fallback: attempt in-process call to the async handler in a fresh event loop.
+        # Keep original behavior for environments where HTTP access to the server
+        # is not available (e.g., single-process testing).
         print(f"[bg_scale] running in-process scale lookup for masterSKUid={masterSKUid} query='{query}' locale={locale}")
         try:
             # local import to avoid circular imports at module load
-            from routers.enrich.scale_lookup import get_shopping_result
-        except Exception:
             try:
-                # alternative import path
-                from enrich.scale_lookup import get_shopping_result
-            except Exception as ie:
-                print(f"[bg_scale] failed to import scale lookup: {ie}")
-                return
+                from routers.enrich.scale_lookup import get_shopping_result
+            except Exception:
+                try:
+                    # alternative import path
+                    from enrich.scale_lookup import get_shopping_result
+                except Exception as ie:
+                    print(f"[bg_scale] failed to import scale lookup: {ie}")
+                    return
 
-        # run the async endpoint function in a fresh event loop
-        try:
-            asyncio.run(get_shopping_result(query=query, locale=locale, masterSKUid=masterSKUid))
+            # run the async endpoint function in a fresh event loop
+            try:
+                asyncio.run(get_shopping_result(query=query, locale=locale, masterSKUid=masterSKUid))
+            except Exception as e:
+                print(f"[bg_scale] error running get_shopping_result: {e}")
         except Exception as e:
-            print(f"[bg_scale] error running get_shopping_result: {e}")
+            print(f"[background scale_lookup error] {e}")
     except Exception as e:
         print(f"[background scale_lookup error] {e}")
 
 
 def schedule_scale_lookup_background(query: str, locale: str, masterSKUid: str, base_url: str = None):
     try:
-        print(f"[schedule_scale_lookup_background] scheduling background lookup for masterSKUid={masterSKUid} query='{query}' locale={locale}")
-        t = threading.Thread(target=_bg_call_scale_lookup, args=(query, locale, masterSKUid, base_url), daemon=True)
+        # Prefer FASTAPI_BASE_URL environment variable when available. This ensures
+        # background lookups consistently target the configured backend URL even
+        # if callers use request.base_url or omit the param.
+        resolved_base = os.getenv("FASTAPI_BASE_URL") or base_url
+        print(f"[schedule_scale_lookup_background] scheduling background lookup for masterSKUid={masterSKUid} query='{query}' locale={locale} base_url={resolved_base}")
+        t = threading.Thread(target=_bg_call_scale_lookup, args=(query, locale, masterSKUid, resolved_base), daemon=True)
         t.start()
     except Exception as e:
         print(f"[schedule scale_lookup error] {e}")
