@@ -72,13 +72,14 @@ locale_collection = db["Locale_Params"]
 master_collection = db["MasterSKU"]
 failed_matches_collection = db["Failed_Matches"]
 url_map_collection = db["url_map"]
-background_jobs_collection = db["Background_Jobs"]
 
 # module logger
 logger = logging.getLogger(__name__)
 # If root logging isn't configured, default to INFO so we still see messages during dev.
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO)
+logger.setLevel(logging.INFO)
+logger.propagate = True
 
 # Ensure a uniqueness guard to reduce duplicate MasterSKU creation.
 # Use a computed `match_key` (prefers GTIN when present, otherwise normalized make|model).
@@ -102,124 +103,6 @@ SCALE_SERP_API_KEY = os.getenv("SCALE_SERP_KEY")
 def utc_now_iso():
     """Returns the current UTC time in ISO 8601 format with 'Z' suffix and milliseconds."""
     return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-
-def _bg_call_scale_lookup(query: str, locale: str, masterSKUid: str, base_url: str = None, job_id: Optional[str] = None):
-    # Update job to running
-    try:
-        if job_id:
-            try:
-                background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "running", "started_at": utc_now_iso()}})
-            except Exception:
-                logger.exception("Failed to mark background job running in DB")
-
-        # If a base_url is provided, prefer calling the ScaleSERP endpoint over HTTP.
-        # This avoids import/circular-import problems and dependency injection issues
-        # that can arise when calling FastAPI endpoint functions directly in-process.
-        if base_url and str(base_url).strip():
-            try:
-                url = str(base_url).rstrip('/') + "/scale/shopping"
-                params = {"query": query, "locale": locale, "masterSKUid": masterSKUid}
-                logger.info("[bg_scale] calling ScaleSERP via HTTP %s params=%s", url, params)
-                resp = requests.get(url, params=params, timeout=15)
-                if resp.status_code >= 400:
-                    logger.error("[bg_scale] HTTP scale lookup failed %s: %s", resp.status_code, resp.text)
-                    if job_id:
-                        try:
-                            background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error": f"http_{resp.status_code}", "response": resp.text, "completed_at": utc_now_iso()}})
-                        except Exception:
-                            logger.exception("Failed to write failed job result to DB")
-                else:
-                    logger.info("[bg_scale] HTTP scale lookup succeeded for masterSKUid=%s", masterSKUid)
-                    if job_id:
-                        try:
-                            background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "success", "response_status": resp.status_code, "completed_at": utc_now_iso()}})
-                        except Exception:
-                            logger.exception("Failed to write success job result to DB")
-                return
-            except Exception:
-                logger.exception("[bg_scale] HTTP call to scale lookup failed")
-
-        # Fallback: attempt in-process call to the async handler in a fresh event loop.
-        logger.info("[bg_scale] running in-process scale lookup for masterSKUid=%s query='%s' locale=%s", masterSKUid, query, locale)
-        try:
-            # local import to avoid circular imports at module load
-            try:
-                from routers.enrich.scale_lookup import get_shopping_result
-            except Exception:
-                try:
-                    # alternative import path
-                    from enrich.scale_lookup import get_shopping_result
-                except Exception as ie:
-                    logger.exception("[bg_scale] failed to import scale lookup: %s", ie)
-                    if job_id:
-                        try:
-                            background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error": f"import_error: {str(ie)}", "completed_at": utc_now_iso()}})
-                        except Exception:
-                            logger.exception("Failed to write import error to job DB")
-                    return
-
-            # run the async endpoint function in a fresh event loop
-            try:
-                asyncio.run(get_shopping_result(query=query, locale=locale, masterSKUid=masterSKUid))
-                logger.info("[bg_scale] in-process scale lookup completed for masterSKUid=%s", masterSKUid)
-                if job_id:
-                    try:
-                        background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "success", "completed_at": utc_now_iso()}})
-                    except Exception:
-                        logger.exception("Failed to write in-process success to job DB")
-            except Exception:
-                logger.exception("[bg_scale] error running get_shopping_result")
-                if job_id:
-                    try:
-                        background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error": "execution_error", "completed_at": utc_now_iso()}})
-                    except Exception:
-                        logger.exception("Failed to write execution error to job DB")
-        except Exception:
-            logger.exception("[background scale_lookup error]")
-            if job_id:
-                try:
-                    background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error": "unexpected", "completed_at": utc_now_iso()}})
-                except Exception:
-                    logger.exception("Failed to write unexpected error to job DB")
-    except Exception as e:
-        logger.exception("[background scale_lookup unexpected error]")
-        if job_id:
-            try:
-                background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error": str(e), "completed_at": utc_now_iso()}})
-            except Exception:
-                logger.exception("Failed to write unexpected error to job DB")
-
-
-def schedule_scale_lookup_background(query: str, locale: str, masterSKUid: str, base_url: str = None):
-    try:
-        # Prefer FASTAPI_BASE_URL environment variable when available. This ensures
-        # background lookups consistently target the configured backend URL even
-        # if callers use request.base_url or omit the param.
-        resolved_base = os.getenv("FASTAPI_BASE_URL") or base_url
-        # create a background job record so failures are persisted and searchable
-        job_doc = {
-            "type": "scale_lookup",
-            "query": query,
-            "locale": locale,
-            "masterSKUid": masterSKUid,
-            "base_url": resolved_base,
-            "status": "scheduled",
-            "created_at": utc_now_iso()
-        }
-        try:
-            job_res = background_jobs_collection.insert_one(job_doc)
-            job_id = str(job_res.inserted_id)
-        except Exception:
-            logger.exception("Failed to create background job record; proceeding without job_id")
-            job_id = None
-
-        logger.info("[schedule_scale_lookup_background] scheduling background lookup for masterSKUid=%s query='%s' locale=%s base_url=%s job_id=%s", masterSKUid, query, locale, resolved_base, job_id)
-        t = threading.Thread(target=_bg_call_scale_lookup, args=(query, locale, masterSKUid, resolved_base, job_id), daemon=True)
-        t.start()
-    except Exception:
-        logger.exception("[schedule scale_lookup error]")
-
 
 class MasterSKURequest(BaseModel):
     Make: str
@@ -530,10 +413,15 @@ def add_serp_match_flag(locale_block: Dict, model: str):
     else:
         locale_block["Serp_match"] = False
 
+
+# Note: background job persistence and admin endpoints removed in favor of
+# lightweight native asyncio.create_task scheduling. This keeps the router
+# minimal and avoids cross-module import-time issues.
+
 # --- Main Endpoint ---
 
 @router.post("/create_master_sku")
-def create_master_sku(data: MasterSKURequest, request: Request, addSERP: Optional[bool] = False, _: None = Depends(verify_token)):
+async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: Optional[bool] = False, _: None = Depends(verify_token)):
     # Validate
     if data.GTIN.strip() and not is_valid_gtin(data.GTIN):
         raise HTTPException(status_code=400, detail="Invalid GTIN format")
@@ -616,12 +504,19 @@ def create_master_sku(data: MasterSKURequest, request: Request, addSERP: Optiona
         except Exception:
             pass
         updated["_id"] = str(updated["_id"])
-        # schedule background ScaleSERP lookup using Make+Model
+        # schedule background ScaleSERP lookup using Make+Model via asyncio.create_task
         try:
-            base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
-            schedule_scale_lookup_background(f"{data.Make} {data.Model}", data.locale, str(updated["_id"]), base_url=base_for_mask)
+            try:
+                from routers.enrich.scale_lookup import get_shopping_result
+            except Exception:
+                from enrich.scale_lookup import get_shopping_result
+            # schedule on the running event loop; fire-and-forget
+            try:
+                asyncio.create_task(get_shopping_result(query=f"{data.Make} {data.Model}", locale=data.locale, masterSKUid=str(updated["_id"])))
+            except Exception:
+                logger.exception("Failed to create asyncio task for scale lookup (existing update)")
         except Exception:
-            pass
+            logger.exception("Failed to import or schedule scale lookup (existing update)")
 
         return {
             "source": "master-update",
@@ -729,12 +624,18 @@ def create_master_sku(data: MasterSKURequest, request: Request, addSERP: Optiona
                 res["_id"] = str(res["_id"])
             except Exception:
                 pass
-            # schedule background ScaleSERP lookup for newly created/upserted MasterSKU
-            try:
-                base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
-                schedule_scale_lookup_background(f"{data.Make} {data.Model}", data.locale, str(res["_id"]), base_url=base_for_mask)
-            except Exception:
-                pass
+                # schedule background ScaleSERP lookup for newly created/upserted MasterSKU
+                try:
+                    try:
+                        from routers.enrich.scale_lookup import get_shopping_result
+                    except Exception:
+                        from enrich.scale_lookup import get_shopping_result
+                    try:
+                        asyncio.create_task(get_shopping_result(query=f"{data.Make} {data.Model}", locale=data.locale, masterSKUid=str(res["_id"])))
+                    except Exception:
+                        logger.exception("Failed to create asyncio task for scale lookup (new upsert)")
+                except Exception:
+                    logger.exception("Failed to import or schedule scale lookup (new upsert)")
             return res
     except errors.DuplicateKeyError:
         # Rare race: another process created the doc between our check and upsert. Fetch the existing doc.
@@ -746,10 +647,16 @@ def create_master_sku(data: MasterSKURequest, request: Request, addSERP: Optiona
                 pass
                 # schedule a background lookup for the found existing doc as well
                 try:
-                    base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
-                    schedule_scale_lookup_background(f"{data.Make} {data.Model}", data.locale, str(existing_doc["_id"]), base_url=base_for_mask)
+                    try:
+                        from routers.enrich.scale_lookup import get_shopping_result
+                    except Exception:
+                        from enrich.scale_lookup import get_shopping_result
+                    try:
+                        asyncio.create_task(get_shopping_result(query=f"{data.Make} {data.Model}", locale=data.locale, masterSKUid=str(existing_doc["_id"])))
+                    except Exception:
+                        logger.exception("Failed to create asyncio task for scale lookup (duplicate key handling)")
                 except Exception:
-                    pass
+                    logger.exception("Failed to import or schedule scale lookup (duplicate key handling)")
                 return existing_doc
     except Exception as e:
         # As a fallback, attempt a plain insert (so we don't fail hard for unexpected DB errors)

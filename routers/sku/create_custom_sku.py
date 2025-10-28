@@ -12,7 +12,8 @@ from bson import ObjectId
 from dotenv import load_dotenv
 
 from utils.dependencies import verify_token
-from .create_master_sku import create_master_sku, MasterSKURequest, schedule_scale_lookup_background
+from .create_master_sku import create_master_sku, MasterSKURequest
+import asyncio
 
 # QR code generation removed — previously generated PNG/base64 inline which blocked request path.
 # If QR images are required later, generate them asynchronously in a background worker and store
@@ -176,7 +177,7 @@ class CustomSKURequest(BaseModel):
     addSERP: Optional[bool] = False
 
 @router.post("/create_custom_sku")
-def create_custom_sku(data: CustomSKURequest, request: Request, _: None = Depends(verify_token)):
+async def create_custom_sku(data: CustomSKURequest, request: Request, _: None = Depends(verify_token)):
     # 0. Validate inputs
     missing_fields = validate_mandatory_fields(data)
     if missing_fields:
@@ -243,12 +244,18 @@ def create_custom_sku(data: CustomSKURequest, request: Request, _: None = Depend
                     locale=data.Locale,
                     Category=data.Category
                 )
-                res_master = create_master_sku(master_data, addSERP=data.addSERP, request=request)
+                res_master = await create_master_sku(master_data, addSERP=data.addSERP, request=request)
                 # schedule background SERP enrichment (best-effort)
                 try:
                     if isinstance(res_master, dict) and res_master.get("_id"):
-                        base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
-                        schedule_scale_lookup_background(f"{data.Make} {data.Model}", data.Locale, res_master.get("_id"), base_url=base_for_mask)
+                        try:
+                            from routers.enrich.scale_lookup import get_shopping_result
+                        except Exception:
+                            from enrich.scale_lookup import get_shopping_result
+                        try:
+                            asyncio.create_task(get_shopping_result(query=f"{data.Make} {data.Model}", locale=data.Locale, masterSKUid=res_master.get("_id")))
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
@@ -343,11 +350,17 @@ def create_custom_sku(data: CustomSKURequest, request: Request, _: None = Depend
                     locale=data.Locale,
                     Category=data.Category
                 )
-                res_master = create_master_sku(master_data, addSERP=data.addSERP, request=request)
+                res_master = await create_master_sku(master_data, addSERP=data.addSERP, request=request)
                 try:
                     if isinstance(res_master, dict) and res_master.get("_id"):
-                        base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
-                        schedule_scale_lookup_background(f"{data.Make} {data.Model}", data.Locale, res_master.get("_id"), base_url=base_for_mask)
+                        try:
+                            from routers.enrich.scale_lookup import get_shopping_result
+                        except Exception:
+                            from enrich.scale_lookup import get_shopping_result
+                        try:
+                            asyncio.create_task(get_shopping_result(query=f"{data.Make} {data.Model}", locale=data.Locale, masterSKUid=res_master.get("_id")))
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
@@ -395,11 +408,17 @@ def create_custom_sku(data: CustomSKURequest, request: Request, _: None = Depend
                 locale=data.Locale,
                 Category=data.Category
             )
-            res_master = create_master_sku(master_data, addSERP=data.addSERP, request=request)
+            res_master = await create_master_sku(master_data, addSERP=data.addSERP, request=request)
             try:
                 if isinstance(res_master, dict) and res_master.get("_id"):
-                    base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
-                    schedule_scale_lookup_background(f"{data.Make} {data.Model}", data.Locale, res_master.get("_id"), base_url=base_for_mask)
+                    try:
+                        from routers.enrich.scale_lookup import get_shopping_result
+                    except Exception:
+                        from enrich.scale_lookup import get_shopping_result
+                    try:
+                        asyncio.create_task(get_shopping_result(query=f"{data.Make} {data.Model}", locale=data.Locale, masterSKUid=res_master.get("_id")))
+                    except Exception:
+                        pass
             except Exception:
                 pass
             mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
