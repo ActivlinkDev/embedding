@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import requests
 import threading
+import asyncio
 import os
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
@@ -96,16 +97,25 @@ def utc_now_iso():
 
 def _bg_call_scale_lookup(query: str, locale: str, masterSKUid: str, base_url: str = None):
     try:
-        base = (base_url and str(base_url).strip()) or os.getenv("FASTAPI_BASE_URL") or "http://localhost:8080"
-        params = {"query": query, "locale": locale, "masterSKUid": masterSKUid}
-        # debug log
-        print(f"[bg_scale] calling {base.rstrip('/')}/scale/shopping with params={params}")
-        # fire-and-forget GET to internal scale endpoint; ignore response but log outcome
-        resp = requests.get(f"{base.rstrip('/')}/scale/shopping", params=params, timeout=15)
+        # Avoid calling the internal HTTP endpoint (can deadlock if same process).
+        # Instead, import and run the async handler directly in a new event loop.
+        print(f"[bg_scale] running in-process scale lookup for masterSKUid={masterSKUid} query='{query}' locale={locale}")
         try:
-            print(f"[bg_scale] response status: {resp.status_code}")
+            # local import to avoid circular imports at module load
+            from routers.enrich.scale_lookup import get_shopping_result
         except Exception:
-            print("[bg_scale] response received but failed to read status")
+            try:
+                # alternative import path
+                from enrich.scale_lookup import get_shopping_result
+            except Exception as ie:
+                print(f"[bg_scale] failed to import scale lookup: {ie}")
+                return
+
+        # run the async endpoint function in a fresh event loop
+        try:
+            asyncio.run(get_shopping_result(query=query, locale=locale, masterSKUid=masterSKUid))
+        except Exception as e:
+            print(f"[bg_scale] error running get_shopping_result: {e}")
     except Exception as e:
         print(f"[background scale_lookup error] {e}")
 

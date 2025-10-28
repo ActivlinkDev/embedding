@@ -12,7 +12,7 @@ from bson import ObjectId
 from dotenv import load_dotenv
 
 from utils.dependencies import verify_token
-from .create_master_sku import create_master_sku, MasterSKURequest
+from .create_master_sku import create_master_sku, MasterSKURequest, schedule_scale_lookup_background
 
 # QR code generation removed — previously generated PNG/base64 inline which blocked request path.
 # If QR images are required later, generate them asynchronously in a background worker and store
@@ -243,7 +243,14 @@ def create_custom_sku(data: CustomSKURequest, request: Request, _: None = Depend
                     locale=data.Locale,
                     Category=data.Category
                 )
-                create_master_sku(master_data, addSERP=data.addSERP, request=request)
+                res_master = create_master_sku(master_data, addSERP=data.addSERP, request=request)
+                # schedule background SERP enrichment (best-effort)
+                try:
+                    if isinstance(res_master, dict) and res_master.get("_id"):
+                        base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
+                        schedule_scale_lookup_background(f"{data.Make} {data.Model}", data.Locale, res_master.get("_id"), base_url=base_for_mask)
+                except Exception:
+                    pass
                 mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
                 mastersku_locale_data = find_locale_data(
                     mastersku.get("Locale_Specific_Data", []), data.Locale
@@ -336,7 +343,13 @@ def create_custom_sku(data: CustomSKURequest, request: Request, _: None = Depend
                     locale=data.Locale,
                     Category=data.Category
                 )
-                create_master_sku(master_data, addSERP=data.addSERP, request=request)
+                res_master = create_master_sku(master_data, addSERP=data.addSERP, request=request)
+                try:
+                    if isinstance(res_master, dict) and res_master.get("_id"):
+                        base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
+                        schedule_scale_lookup_background(f"{data.Make} {data.Model}", data.Locale, res_master.get("_id"), base_url=base_for_mask)
+                except Exception:
+                    pass
                 mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
                 if not mastersku:
                     return {
@@ -382,7 +395,13 @@ def create_custom_sku(data: CustomSKURequest, request: Request, _: None = Depend
                 locale=data.Locale,
                 Category=data.Category
             )
-            create_master_sku(master_data, addSERP=data.addSERP, request=request)
+            res_master = create_master_sku(master_data, addSERP=data.addSERP, request=request)
+            try:
+                if isinstance(res_master, dict) and res_master.get("_id"):
+                    base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
+                    schedule_scale_lookup_background(f"{data.Make} {data.Model}", data.Locale, res_master.get("_id"), base_url=base_for_mask)
+            except Exception:
+                pass
             mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
             if not mastersku:
                 return {
