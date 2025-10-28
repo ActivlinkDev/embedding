@@ -11,6 +11,7 @@ from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 from pymongo import MongoClient
 from pymongo import ReturnDocument, errors
+from bson import ObjectId
 import re
 from dotenv import load_dotenv
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -71,7 +72,7 @@ locale_collection = db["Locale_Params"]
 master_collection = db["MasterSKU"]
 failed_matches_collection = db["Failed_Matches"]
 url_map_collection = db["url_map"]
-background_jobs_collection = db.get("Background_Jobs") or db["Background_Jobs"]
+background_jobs_collection = db["Background_Jobs"]
 
 # module logger
 logger = logging.getLogger(__name__)
@@ -103,8 +104,15 @@ def utc_now_iso():
     return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def _bg_call_scale_lookup(query: str, locale: str, masterSKUid: str, base_url: str = None):
+def _bg_call_scale_lookup(query: str, locale: str, masterSKUid: str, base_url: str = None, job_id: Optional[str] = None):
+    # Update job to running
     try:
+        if job_id:
+            try:
+                background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "running", "started_at": utc_now_iso()}})
+            except Exception:
+                logger.exception("Failed to mark background job running in DB")
+
         # If a base_url is provided, prefer calling the ScaleSERP endpoint over HTTP.
         # This avoids import/circular-import problems and dependency injection issues
         # that can arise when calling FastAPI endpoint functions directly in-process.
@@ -112,21 +120,28 @@ def _bg_call_scale_lookup(query: str, locale: str, masterSKUid: str, base_url: s
             try:
                 url = str(base_url).rstrip('/') + "/scale/shopping"
                 params = {"query": query, "locale": locale, "masterSKUid": masterSKUid}
-                print(f"[bg_scale] calling ScaleSERP via HTTP {url} params={params}")
-                # use requests (sync) inside this background thread
+                logger.info("[bg_scale] calling ScaleSERP via HTTP %s params=%s", url, params)
                 resp = requests.get(url, params=params, timeout=15)
                 if resp.status_code >= 400:
-                    print(f"[bg_scale] HTTP scale lookup failed {resp.status_code}: {resp.text}")
+                    logger.error("[bg_scale] HTTP scale lookup failed %s: %s", resp.status_code, resp.text)
+                    if job_id:
+                        try:
+                            background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error": f"http_{resp.status_code}", "response": resp.text, "completed_at": utc_now_iso()}})
+                        except Exception:
+                            logger.exception("Failed to write failed job result to DB")
                 else:
-                    print(f"[bg_scale] HTTP scale lookup succeeded for masterSKUid={masterSKUid}")
+                    logger.info("[bg_scale] HTTP scale lookup succeeded for masterSKUid=%s", masterSKUid)
+                    if job_id:
+                        try:
+                            background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "success", "response_status": resp.status_code, "completed_at": utc_now_iso()}})
+                        except Exception:
+                            logger.exception("Failed to write success job result to DB")
                 return
-            except Exception as e:
-                print(f"[bg_scale] HTTP call to scale lookup failed: {e}")
+            except Exception:
+                logger.exception("[bg_scale] HTTP call to scale lookup failed")
 
         # Fallback: attempt in-process call to the async handler in a fresh event loop.
-        # Keep original behavior for environments where HTTP access to the server
-        # is not available (e.g., single-process testing).
-        print(f"[bg_scale] running in-process scale lookup for masterSKUid={masterSKUid} query='{query}' locale={locale}")
+        logger.info("[bg_scale] running in-process scale lookup for masterSKUid=%s query='%s' locale=%s", masterSKUid, query, locale)
         try:
             # local import to avoid circular imports at module load
             try:
@@ -136,18 +151,44 @@ def _bg_call_scale_lookup(query: str, locale: str, masterSKUid: str, base_url: s
                     # alternative import path
                     from enrich.scale_lookup import get_shopping_result
                 except Exception as ie:
-                    print(f"[bg_scale] failed to import scale lookup: {ie}")
+                    logger.exception("[bg_scale] failed to import scale lookup: %s", ie)
+                    if job_id:
+                        try:
+                            background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error": f"import_error: {str(ie)}", "completed_at": utc_now_iso()}})
+                        except Exception:
+                            logger.exception("Failed to write import error to job DB")
                     return
 
             # run the async endpoint function in a fresh event loop
             try:
                 asyncio.run(get_shopping_result(query=query, locale=locale, masterSKUid=masterSKUid))
-            except Exception as e:
-                print(f"[bg_scale] error running get_shopping_result: {e}")
-        except Exception as e:
-            print(f"[background scale_lookup error] {e}")
+                logger.info("[bg_scale] in-process scale lookup completed for masterSKUid=%s", masterSKUid)
+                if job_id:
+                    try:
+                        background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "success", "completed_at": utc_now_iso()}})
+                    except Exception:
+                        logger.exception("Failed to write in-process success to job DB")
+            except Exception:
+                logger.exception("[bg_scale] error running get_shopping_result")
+                if job_id:
+                    try:
+                        background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error": "execution_error", "completed_at": utc_now_iso()}})
+                    except Exception:
+                        logger.exception("Failed to write execution error to job DB")
+        except Exception:
+            logger.exception("[background scale_lookup error]")
+            if job_id:
+                try:
+                    background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error": "unexpected", "completed_at": utc_now_iso()}})
+                except Exception:
+                    logger.exception("Failed to write unexpected error to job DB")
     except Exception as e:
-        print(f"[background scale_lookup error] {e}")
+        logger.exception("[background scale_lookup unexpected error]")
+        if job_id:
+            try:
+                background_jobs_collection.update_one({"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error": str(e), "completed_at": utc_now_iso()}})
+            except Exception:
+                logger.exception("Failed to write unexpected error to job DB")
 
 
 def schedule_scale_lookup_background(query: str, locale: str, masterSKUid: str, base_url: str = None):
@@ -156,11 +197,28 @@ def schedule_scale_lookup_background(query: str, locale: str, masterSKUid: str, 
         # background lookups consistently target the configured backend URL even
         # if callers use request.base_url or omit the param.
         resolved_base = os.getenv("FASTAPI_BASE_URL") or base_url
-        print(f"[schedule_scale_lookup_background] scheduling background lookup for masterSKUid={masterSKUid} query='{query}' locale={locale} base_url={resolved_base}")
-        t = threading.Thread(target=_bg_call_scale_lookup, args=(query, locale, masterSKUid, resolved_base), daemon=True)
+        # create a background job record so failures are persisted and searchable
+        job_doc = {
+            "type": "scale_lookup",
+            "query": query,
+            "locale": locale,
+            "masterSKUid": masterSKUid,
+            "base_url": resolved_base,
+            "status": "scheduled",
+            "created_at": utc_now_iso()
+        }
+        try:
+            job_res = background_jobs_collection.insert_one(job_doc)
+            job_id = str(job_res.inserted_id)
+        except Exception:
+            logger.exception("Failed to create background job record; proceeding without job_id")
+            job_id = None
+
+        logger.info("[schedule_scale_lookup_background] scheduling background lookup for masterSKUid=%s query='%s' locale=%s base_url=%s job_id=%s", masterSKUid, query, locale, resolved_base, job_id)
+        t = threading.Thread(target=_bg_call_scale_lookup, args=(query, locale, masterSKUid, resolved_base, job_id), daemon=True)
         t.start()
-    except Exception as e:
-        print(f"[schedule scale_lookup error] {e}")
+    except Exception:
+        logger.exception("[schedule scale_lookup error]")
 
 
 class MasterSKURequest(BaseModel):
@@ -189,7 +247,7 @@ def fetch_icecat_by_gtin(gtin: str, locale: str) -> Optional[Dict]:
         if res.status_code == 200:
             return res.json().get("data", {})
     except Exception as e:
-        print(f"[ICECAT GTIN error] {e}")
+        logger.exception("[ICECAT GTIN error] %s", e)
     return None
 
 def fetch_icecat_by_make_model(make: str, model: str, locale: str) -> Optional[Dict]:
@@ -200,7 +258,7 @@ def fetch_icecat_by_make_model(make: str, model: str, locale: str) -> Optional[D
         if res.status_code == 200:
             return res.json().get("data", {})
     except Exception as e:
-        print(f"[ICECAT fallback error] {e}")
+        logger.exception("[ICECAT fallback error] %s", e)
     return None
 
 def fetch_upc(gtin: str) -> Optional[Dict]:
@@ -211,7 +269,7 @@ def fetch_upc(gtin: str) -> Optional[Dict]:
         if res.status_code == 200:
             return res.json()
     except Exception as e:
-        print(f"[Go-UPC error] {e}")
+        logger.exception("[Go-UPC error] %s", e)
     return None
 
 def extract_make_model_from_title(title: str, data: MasterSKURequest):
@@ -233,7 +291,7 @@ def extract_make_model_from_title(title: str, data: MasterSKURequest):
         if not data.Model.strip():
             data.Model = parsed.get("Model", "").strip()
     except Exception as e:
-        print(f"[GPT extraction error] {e}")
+        logger.exception("[GPT extraction error] %s", e)
 
 def extract_multimedia_urls(icecat_data: dict) -> dict:
     """
@@ -342,7 +400,7 @@ def build_locale_data_from_serp(title: str, locale: str, category: str, model: s
         return block
 
     except Exception as e:
-        print(f"[SERP error] {e}")
+        logger.exception("[SERP error] %s", e)
         block = {
             "locale": locale,
             "Category": category,
