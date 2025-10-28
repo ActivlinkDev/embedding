@@ -98,14 +98,21 @@ def _bg_call_scale_lookup(query: str, locale: str, masterSKUid: str, base_url: s
     try:
         base = (base_url and str(base_url).strip()) or os.getenv("FASTAPI_BASE_URL") or "http://localhost:8080"
         params = {"query": query, "locale": locale, "masterSKUid": masterSKUid}
-        # fire-and-forget GET to internal scale endpoint; ignore response
-        requests.get(f"{base.rstrip('/')}/scale/shopping", params=params, timeout=15)
+        # debug log
+        print(f"[bg_scale] calling {base.rstrip('/')}/scale/shopping with params={params}")
+        # fire-and-forget GET to internal scale endpoint; ignore response but log outcome
+        resp = requests.get(f"{base.rstrip('/')}/scale/shopping", params=params, timeout=15)
+        try:
+            print(f"[bg_scale] response status: {resp.status_code}")
+        except Exception:
+            print("[bg_scale] response received but failed to read status")
     except Exception as e:
         print(f"[background scale_lookup error] {e}")
 
 
 def schedule_scale_lookup_background(query: str, locale: str, masterSKUid: str, base_url: str = None):
     try:
+        print(f"[schedule_scale_lookup_background] scheduling background lookup for masterSKUid={masterSKUid} query='{query}' locale={locale}")
         t = threading.Thread(target=_bg_call_scale_lookup, args=(query, locale, masterSKUid, base_url), daemon=True)
         t.start()
     except Exception as e:
