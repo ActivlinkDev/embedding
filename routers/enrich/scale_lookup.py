@@ -110,11 +110,13 @@ async def get_shopping_result(
             "hl": hl_val,
         }
         try:
-            pd_resp = await client.get(SCALE_SERP_BASE_URL, params=product_params)
-            pd_resp.raise_for_status()
-            pd_data = pd_resp.json()
-            # attach only the product_results object from the product_details response
-            trimmed["product_details"] = pd_data.get("product_results")
+            # use a fresh client for the follow-up call (initial client may be closed)
+            async with httpx.AsyncClient(timeout=10.0) as client2:
+                pd_resp = await client2.get(SCALE_SERP_BASE_URL, params=product_params)
+                pd_resp.raise_for_status()
+                pd_data = pd_resp.json()
+                # attach only the product_results object from the product_details response
+                trimmed["product_details"] = pd_data.get("product_results")
         except httpx.HTTPStatusError as e:
             # don't fail the whole endpoint for product details failures; include error info
             trimmed["product_details"] = {"error": f"status {e.response.status_code}", "detail": str(e)}
