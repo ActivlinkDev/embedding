@@ -161,15 +161,23 @@ async def get_shopping_result(
             locale_update = {
                 "SERP_Title": trimmed.get("title"),
                 "Google_ID": trimmed.get("gpc_id"),
-                "Google_URL": trimmed.get("link"),
                 "Merchant": trimmed.get("merchant"),
                 "Currency": trimmed.get("currency"),
                 "Price": trimmed.get("price_value") or trimmed.get("price"),
+                # include product_details.about_the_item and sellers_online when available
+                "about_the_item": None,
+                "sellers_online": None,
                 "created_at": utc_now_iso(),
-                "serp_pending": False,
-                "Serp_match": False,
                 "serp_status": serp_status,
             }
+
+            # populate about_the_item and sellers_online from product_details if present
+            pd = trimmed.get("product_details") if isinstance(trimmed.get("product_details"), dict) else None
+            if pd:
+                if pd.get("about_the_item") is not None:
+                    locale_update["about_the_item"] = pd.get("about_the_item")
+                if pd.get("sellers_online") is not None:
+                    locale_update["sellers_online"] = pd.get("sellers_online")
 
             # Attempt to set fields on an existing locale entry
             result = mastersku_collection.update_one(

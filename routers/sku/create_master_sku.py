@@ -458,14 +458,11 @@ def create_master_sku(data: MasterSKURequest, request: Request, addSERP: Optiona
                 "Input_Title": localized_title,
                 "SERP_Title": None,
                 "Google_ID": None,
-                "Google_URL": None,
                 "Merchant": None,
                 "Currency": currency_code,
                 "Price": None,
                 "MSRP_Source": "Skipped",
-                "created_at": utc_now_iso(),
-                "serp_pending": False,
-                "Serp_match": False
+                "created_at": utc_now_iso()
             }
             if extra:
                 locale_block.update(extra)
@@ -549,14 +546,11 @@ def create_master_sku(data: MasterSKURequest, request: Request, addSERP: Optiona
             "Input_Title": title,
             "SERP_Title": None,
             "Google_ID": None,
-            "Google_URL": None,
             "Merchant": None,
             "Currency": currency_code,
             "Price": None,
             "MSRP_Source": "Skipped",
-            "created_at": utc_now_iso(),
-            "serp_pending": False,
-            "Serp_match": False
+            "created_at": utc_now_iso()
         }
         if extra:
             locale_block.update(extra)
