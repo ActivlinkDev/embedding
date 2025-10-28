@@ -15,6 +15,7 @@ import re
 from dotenv import load_dotenv
 from fastapi.responses import RedirectResponse, StreamingResponse
 import httpx
+import logging
 
 from utils.dependencies import verify_token
 from utils.common import embed_query, find_best_match, category_embeddings, device_categories
@@ -70,6 +71,13 @@ locale_collection = db["Locale_Params"]
 master_collection = db["MasterSKU"]
 failed_matches_collection = db["Failed_Matches"]
 url_map_collection = db["url_map"]
+background_jobs_collection = db.get("Background_Jobs") or db["Background_Jobs"]
+
+# module logger
+logger = logging.getLogger(__name__)
+# If root logging isn't configured, default to INFO so we still see messages during dev.
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO)
 
 # Ensure a uniqueness guard to reduce duplicate MasterSKU creation.
 # Use a computed `match_key` (prefers GTIN when present, otherwise normalized make|model).
