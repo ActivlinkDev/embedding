@@ -1,5 +1,7 @@
 import os
 import httpx
+import asyncio
+import logging
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -78,14 +80,39 @@ async def get_shopping_result(
         "num": 1,  # limit to 1 result
     }
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    # Make the external request with a small retry/backoff policy to tolerate transient network glitches.
+    max_attempts = 3
+    backoff_seconds = 1
+    response = None
+    for attempt in range(1, max_attempts + 1):
         try:
-            response = await client.get(SCALE_SERP_BASE_URL, params=params)
-            response.raise_for_status()
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.get(SCALE_SERP_BASE_URL, params=params)
+                response.raise_for_status()
+            # success
+            break
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=str(e))
+            # Server returned 4xx/5xx. Don't retry for 4xx client errors except 429.
+            status = e.response.status_code if e.response is not None else None
+            if status and 400 <= status < 500 and status != 429:
+                raise HTTPException(status_code=status, detail=str(e))
+            # otherwise, log and retry
+            logger = logging.getLogger(__name__)
+            logger.warning("ScaleSERP HTTPStatusError on attempt %d/%d: %s", attempt, max_attempts, str(e))
+        except (httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+            logger = logging.getLogger(__name__)
+            logger.warning("ScaleSERP timeout on attempt %d/%d: %s", attempt, max_attempts, str(e))
         except httpx.RequestError as e:
-            raise HTTPException(status_code=500, detail=f"ScaleSERP request failed: {str(e)}")
+            logger = logging.getLogger(__name__)
+            logger.warning("ScaleSERP request error on attempt %d/%d: %s", attempt, max_attempts, str(e))
+
+        # if we have more attempts left, wait with simple backoff
+        if attempt < max_attempts:
+            await asyncio.sleep(backoff_seconds * attempt)
+
+    if response is None:
+        # All attempts failed
+        raise HTTPException(status_code=500, detail="ScaleSERP request failed after retries")
 
     data = response.json()
     item = (data.get("shopping_results") or [None])[0] or {}
