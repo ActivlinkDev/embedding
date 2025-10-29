@@ -112,7 +112,20 @@ class MasterSKURequest(BaseModel):
     Category: Optional[str] = None
 
 
-# --- Helper Functions ---
+
+# --- Background ScaleSERP Task ---
+try:
+    from routers.enrich.scale_lookup import get_shopping_result
+except Exception:
+    from enrich.scale_lookup import get_shopping_result
+
+async def _run_and_log(query, locale, masterSKUid):
+    try:
+        logger.info(f"[bg_scale] starting scale lookup for masterSKUid={masterSKUid} query='{query}' locale={locale}")
+        await get_shopping_result(query=query, locale=locale, masterSKUid=masterSKUid)
+        logger.info(f"[bg_scale] finished scale lookup for masterSKUid={masterSKUid}")
+    except Exception:
+        logger.exception(f"[bg_scale] error in scale lookup for masterSKUid={masterSKUid}")
 
 def is_valid_gtin(gtin: str) -> bool:
     """Checks if GTIN is valid."""
@@ -505,24 +518,10 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
             pass
         updated["_id"] = str(updated["_id"])
         # schedule background ScaleSERP lookup using Make+Model via asyncio.create_task with logging wrapper
-        async def _run_and_log(query, locale, masterSKUid):
-            try:
-                logger.info(f"[bg_scale] starting scale lookup for masterSKUid={masterSKUid} query='{query}' locale={locale}")
-                await get_shopping_result(query=query, locale=locale, masterSKUid=masterSKUid)
-                logger.info(f"[bg_scale] finished scale lookup for masterSKUid={masterSKUid}")
-            except Exception:
-                logger.exception(f"[bg_scale] error in scale lookup for masterSKUid={masterSKUid}")
         try:
-            try:
-                from routers.enrich.scale_lookup import get_shopping_result
-            except Exception:
-                from enrich.scale_lookup import get_shopping_result
-            try:
-                asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(updated["_id"])))
-            except Exception:
-                logger.exception("Failed to create asyncio task for scale lookup (existing update)")
+            asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(updated["_id"])))
         except Exception:
-            logger.exception("Failed to import or schedule scale lookup (existing update)")
+            logger.exception("Failed to create asyncio task for scale lookup (existing update)")
 
         return {
             "source": "master-update",
@@ -631,24 +630,10 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
             except Exception:
                 pass
                 # schedule background ScaleSERP lookup for newly created/upserted MasterSKU
-                async def _run_and_log(query, locale, masterSKUid):
-                    try:
-                        logger.info(f"[bg_scale] starting scale lookup for masterSKUid={masterSKUid} query='{query}' locale={locale}")
-                        await get_shopping_result(query=query, locale=locale, masterSKUid=masterSKUid)
-                        logger.info(f"[bg_scale] finished scale lookup for masterSKUid={masterSKUid}")
-                    except Exception:
-                        logger.exception(f"[bg_scale] error in scale lookup for masterSKUid={masterSKUid}")
                 try:
-                    try:
-                        from routers.enrich.scale_lookup import get_shopping_result
-                    except Exception:
-                        from enrich.scale_lookup import get_shopping_result
-                    try:
-                        asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(res["_id"])))
-                    except Exception:
-                        logger.exception("Failed to create asyncio task for scale lookup (new upsert)")
+                    asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(res["_id"])))
                 except Exception:
-                    logger.exception("Failed to import or schedule scale lookup (new upsert)")
+                    logger.exception("Failed to create asyncio task for scale lookup (new upsert)")
             return res
     except errors.DuplicateKeyError:
         # Rare race: another process created the doc between our check and upsert. Fetch the existing doc.
@@ -659,24 +644,10 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
             except Exception:
                 pass
                 # schedule a background lookup for the found existing doc as well
-                async def _run_and_log(query, locale, masterSKUid):
-                    try:
-                        logger.info(f"[bg_scale] starting scale lookup for masterSKUid={masterSKUid} query='{query}' locale={locale}")
-                        await get_shopping_result(query=query, locale=locale, masterSKUid=masterSKUid)
-                        logger.info(f"[bg_scale] finished scale lookup for masterSKUid={masterSKUid}")
-                    except Exception:
-                        logger.exception(f"[bg_scale] error in scale lookup for masterSKUid={masterSKUid}")
                 try:
-                    try:
-                        from routers.enrich.scale_lookup import get_shopping_result
-                    except Exception:
-                        from enrich.scale_lookup import get_shopping_result
-                    try:
-                        asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(existing_doc["_id"])))
-                    except Exception:
-                        logger.exception("Failed to create asyncio task for scale lookup (duplicate key handling)")
+                    asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(existing_doc["_id"])))
                 except Exception:
-                    logger.exception("Failed to import or schedule scale lookup (duplicate key handling)")
+                    logger.exception("Failed to create asyncio task for scale lookup (duplicate key handling)")
                 return existing_doc
     except Exception as e:
         # As a fallback, attempt a plain insert (so we don't fail hard for unexpected DB errors)
