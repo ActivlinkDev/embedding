@@ -497,7 +497,6 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
                 "Merchant": None,
                 "Currency": currency_code,
                 "Price": None,
-                "MSRP_Source": "Skipped",
                 "created_at": utc_now_iso()
             }
             if extra:
@@ -594,7 +593,6 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
             "Merchant": None,
             "Currency": currency_code,
             "Price": None,
-            "MSRP_Source": "Skipped",
             "created_at": utc_now_iso()
         }
         if extra:
