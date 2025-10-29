@@ -245,23 +245,25 @@ async def create_custom_sku(data: CustomSKURequest, request: Request, _: None = 
                     Category=data.Category
                 )
                 res_master = await create_master_sku(master_data, addSERP=data.addSERP, request=request)
-                # schedule background SERP enrichment (best-effort)
-                try:
-                    if isinstance(res_master, dict) and res_master.get("_id"):
-                        try:
-                            # Prefer the MasterSKU's stored Make/Model (res_master) if available; fall back to the Custom SKU input.
-                            m_make = (res_master.get("Make") or data.Make or "").strip()
-                            m_model = (res_master.get("Model") or data.Model or "").strip()
-                            query = " ".join([p for p in (m_make, m_model) if p]).strip() or (res_master.get("Title") or f"{data.Make} {data.Model}")
-                            asyncio.create_task(_run_and_log(query, data.Locale, res_master.get("_id")))
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                # Wait for the persisted MasterSKU to be available (poll) and then schedule
+                # the SERP enrichment using the persisted MasterSKU fields to ensure a
+                # non-empty query (avoid scheduling too early when fields may be missing).
                 mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
                 mastersku_locale_data = find_locale_data(
                     mastersku.get("Locale_Specific_Data", []), data.Locale
                 ) if mastersku else {}
+                # Schedule background SERP enrichment now that we have the persisted MasterSKU
+                try:
+                    if mastersku and mastersku.get("_id"):
+                        try:
+                            m_make = (mastersku.get("Make") or data.Make or "").strip()
+                            m_model = (mastersku.get("Model") or data.Model or "").strip()
+                            query = " ".join([p for p in (m_make, m_model) if p]).strip() or (mastersku.get("Title") or f"{data.Make} {data.Model}")
+                            asyncio.create_task(_run_and_log(query, data.Locale, str(mastersku.get("_id"))))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 if not mastersku_locale_data:
                     return {
                         "message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."
@@ -351,18 +353,19 @@ async def create_custom_sku(data: CustomSKURequest, request: Request, _: None = 
                     Category=data.Category
                 )
                 res_master = await create_master_sku(master_data, addSERP=data.addSERP, request=request)
+                mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
+                # Schedule background SERP enrichment once the persisted MasterSKU is available
                 try:
-                    if isinstance(res_master, dict) and res_master.get("_id"):
+                    if mastersku and mastersku.get("_id"):
                         try:
-                            m_make = (res_master.get("Make") or data.Make or "").strip()
-                            m_model = (res_master.get("Model") or data.Model or "").strip()
-                            query = " ".join([p for p in (m_make, m_model) if p]).strip() or (res_master.get("Title") or f"{data.Make} {data.Model}")
-                            asyncio.create_task(_run_and_log(query, data.Locale, res_master.get("_id")))
+                            m_make = (mastersku.get("Make") or data.Make or "").strip()
+                            m_model = (mastersku.get("Model") or data.Model or "").strip()
+                            query = " ".join([p for p in (m_make, m_model) if p]).strip() or (mastersku.get("Title") or f"{data.Make} {data.Model}")
+                            asyncio.create_task(_run_and_log(query, data.Locale, str(mastersku.get("_id"))))
                         except Exception:
                             pass
                 except Exception:
                     pass
-                mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
                 if not mastersku:
                     return {
                         "message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."
@@ -408,18 +411,19 @@ async def create_custom_sku(data: CustomSKURequest, request: Request, _: None = 
                 Category=data.Category
             )
             res_master = await create_master_sku(master_data, addSERP=data.addSERP, request=request)
+            mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
+            # Schedule background SERP enrichment once the persisted MasterSKU is available
             try:
-                if isinstance(res_master, dict) and res_master.get("_id"):
+                if mastersku and mastersku.get("_id"):
                     try:
-                        m_make = (res_master.get("Make") or data.Make or "").strip()
-                        m_model = (res_master.get("Model") or data.Model or "").strip()
-                        query = " ".join([p for p in (m_make, m_model) if p]).strip() or (res_master.get("Title") or f"{data.Make} {data.Model}")
-                        asyncio.create_task(_run_and_log(query, data.Locale, res_master.get("_id")))
+                        m_make = (mastersku.get("Make") or data.Make or "").strip()
+                        m_model = (mastersku.get("Model") or data.Model or "").strip()
+                        query = " ".join([p for p in (m_make, m_model) if p]).strip() or (mastersku.get("Title") or f"{data.Make} {data.Model}")
+                        asyncio.create_task(_run_and_log(query, data.Locale, str(mastersku.get("_id"))))
                     except Exception:
                         pass
             except Exception:
                 pass
-            mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
             if not mastersku:
                 return {
                     "message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."
