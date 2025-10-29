@@ -127,6 +127,13 @@ async def _run_and_log(query, locale, masterSKUid):
     except Exception:
         logger.exception(f"[bg_scale] error in scale lookup for masterSKUid={masterSKUid}")
 
+async def _probe_log(masterSKUid):
+    try:
+        await asyncio.sleep(0.1)
+        logger.info(f"[bg_probe] probe executed for masterSKUid={masterSKUid}")
+    except Exception:
+        logger.exception("[bg_probe] probe error")
+
 def is_valid_gtin(gtin: str) -> bool:
     """Checks if GTIN is valid."""
     return gtin.isdigit() and len(gtin) in {8, 12, 13, 14}
@@ -519,7 +526,10 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
         updated["_id"] = str(updated["_id"])
         # schedule background ScaleSERP lookup using Make+Model via asyncio.create_task with logging wrapper
         try:
-            asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(updated["_id"])))
+            logger.info(f"[bg_schedule] scheduling _run_and_log for masterSKUid={updated['_id']}")
+            t1 = asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(updated["_id"])))
+            t2 = asyncio.create_task(_probe_log(str(updated["_id"])))
+            logger.info(f"[bg_schedule] scheduled tasks t1={t1} t2={t2} for masterSKUid={updated['_id']}")
         except Exception:
             logger.exception("Failed to create asyncio task for scale lookup (existing update)")
 
@@ -631,7 +641,10 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
                 pass
                 # schedule background ScaleSERP lookup for newly created/upserted MasterSKU
                 try:
-                    asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(res["_id"])))
+                    logger.info(f"[bg_schedule] scheduling _run_and_log for masterSKUid={res['_id']}")
+                    t1 = asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(res["_id"])))
+                    t2 = asyncio.create_task(_probe_log(str(res["_id"])))
+                    logger.info(f"[bg_schedule] scheduled tasks t1={t1} t2={t2} for masterSKUid={res['_id']}")
                 except Exception:
                     logger.exception("Failed to create asyncio task for scale lookup (new upsert)")
             return res
@@ -645,7 +658,10 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
                 pass
                 # schedule a background lookup for the found existing doc as well
                 try:
-                    asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(existing_doc["_id"])))
+                    logger.info(f"[bg_schedule] scheduling _run_and_log for masterSKUid={existing_doc['_id']}")
+                    t1 = asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(existing_doc["_id"])))
+                    t2 = asyncio.create_task(_probe_log(str(existing_doc["_id"])))
+                    logger.info(f"[bg_schedule] scheduled tasks t1={t1} t2={t2} for masterSKUid={existing_doc['_id']}")
                 except Exception:
                     logger.exception("Failed to create asyncio task for scale lookup (duplicate key handling)")
                 return existing_doc
@@ -657,3 +673,18 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
             return doc
         except Exception:
             raise HTTPException(status_code=500, detail=f"Failed to create MasterSKU: {str(e)}")
+
+
+    @router.post("/debug_probe")
+    async def debug_probe(masterSKUid: str, _: None = Depends(verify_token)):
+        """Schedule a tiny probe task to verify background tasks run on the event loop.
+        Call this endpoint and watch the uvicorn logs for a [bg_probe] entry.
+        """
+        try:
+            logger.info(f"[debug_probe] scheduling probe for masterSKUid={masterSKUid}")
+            t = asyncio.create_task(_probe_log(masterSKUid))
+            logger.info(f"[debug_probe] scheduled probe task={t}")
+            return {"scheduled": True}
+        except Exception:
+            logger.exception("[debug_probe] failed to schedule probe")
+            raise HTTPException(status_code=500, detail="Failed to schedule probe")

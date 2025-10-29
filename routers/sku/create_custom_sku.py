@@ -12,7 +12,7 @@ from bson import ObjectId
 from dotenv import load_dotenv
 
 from utils.dependencies import verify_token
-from .create_master_sku import create_master_sku, MasterSKURequest
+from .create_master_sku import create_master_sku, MasterSKURequest, _run_and_log
 import asyncio
 
 # QR code generation removed — previously generated PNG/base64 inline which blocked request path.
@@ -249,11 +249,11 @@ async def create_custom_sku(data: CustomSKURequest, request: Request, _: None = 
                 try:
                     if isinstance(res_master, dict) and res_master.get("_id"):
                         try:
-                            from routers.enrich.scale_lookup import get_shopping_result
-                        except Exception:
-                            from enrich.scale_lookup import get_shopping_result
-                        try:
-                            asyncio.create_task(get_shopping_result(query=f"{data.Make} {data.Model}", locale=data.Locale, masterSKUid=res_master.get("_id")))
+                            # Prefer the MasterSKU's stored Make/Model (res_master) if available; fall back to the Custom SKU input.
+                            m_make = (res_master.get("Make") or data.Make or "").strip()
+                            m_model = (res_master.get("Model") or data.Model or "").strip()
+                            query = " ".join([p for p in (m_make, m_model) if p]).strip() or (res_master.get("Title") or f"{data.Make} {data.Model}")
+                            asyncio.create_task(_run_and_log(query, data.Locale, res_master.get("_id")))
                         except Exception:
                             pass
                 except Exception:
@@ -354,11 +354,10 @@ async def create_custom_sku(data: CustomSKURequest, request: Request, _: None = 
                 try:
                     if isinstance(res_master, dict) and res_master.get("_id"):
                         try:
-                            from routers.enrich.scale_lookup import get_shopping_result
-                        except Exception:
-                            from enrich.scale_lookup import get_shopping_result
-                        try:
-                            asyncio.create_task(get_shopping_result(query=f"{data.Make} {data.Model}", locale=data.Locale, masterSKUid=res_master.get("_id")))
+                            m_make = (res_master.get("Make") or data.Make or "").strip()
+                            m_model = (res_master.get("Model") or data.Model or "").strip()
+                            query = " ".join([p for p in (m_make, m_model) if p]).strip() or (res_master.get("Title") or f"{data.Make} {data.Model}")
+                            asyncio.create_task(_run_and_log(query, data.Locale, res_master.get("_id")))
                         except Exception:
                             pass
                 except Exception:
@@ -412,11 +411,10 @@ async def create_custom_sku(data: CustomSKURequest, request: Request, _: None = 
             try:
                 if isinstance(res_master, dict) and res_master.get("_id"):
                     try:
-                        from routers.enrich.scale_lookup import get_shopping_result
-                    except Exception:
-                        from enrich.scale_lookup import get_shopping_result
-                    try:
-                        asyncio.create_task(get_shopping_result(query=f"{data.Make} {data.Model}", locale=data.Locale, masterSKUid=res_master.get("_id")))
+                        m_make = (res_master.get("Make") or data.Make or "").strip()
+                        m_model = (res_master.get("Model") or data.Model or "").strip()
+                        query = " ".join([p for p in (m_make, m_model) if p]).strip() or (res_master.get("Title") or f"{data.Make} {data.Model}")
+                        asyncio.create_task(_run_and_log(query, data.Locale, res_master.get("_id")))
                     except Exception:
                         pass
             except Exception:
