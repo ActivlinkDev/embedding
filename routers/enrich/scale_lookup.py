@@ -206,8 +206,27 @@ async def get_shopping_result(
             if pd:
                 if pd.get("about_the_item") is not None:
                     locale_update["about_the_item"] = pd.get("about_the_item")
-                if pd.get("sellers_online") is not None:
-                    locale_update["sellers_online"] = pd.get("sellers_online")
+                # Store only the `base_price_parsed` for each seller to avoid
+                # including tax/shipping/total price fields in the MasterSKU record.
+                sellers = pd.get("sellers_online")
+                if sellers:
+                    try:
+                        mapped = []
+                        for s in sellers:
+                            bp_parsed = s.get("base_price_parsed")
+                            # base_price_raw may be present on the seller or derivable from parsed
+                            bp_raw = s.get("base_price_raw") or (bp_parsed.get("raw") if isinstance(bp_parsed, dict) else None)
+                            mapped.append({
+                                "position": s.get("position"),
+                                "merchant": s.get("merchant"),
+                                "link": s.get("link"),
+                                "base_price_raw": bp_raw,
+                                "base_price_parsed": bp_parsed,
+                            })
+                        locale_update["sellers_online"] = mapped
+                    except Exception:
+                        # Fallback: keep original sellers_online if mapping fails
+                        locale_update["sellers_online"] = pd.get("sellers_online")
 
             # Attempt to set fields on an existing locale entry
             result = mastersku_collection.update_one(
