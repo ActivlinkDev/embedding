@@ -95,6 +95,17 @@ def build_locale_data(
             ]
         ),
     }
+    # Include the localized matched category string from the MasterSKU locale block, if available
+    try:
+        if mastersku_locale and isinstance(mastersku_locale, dict):
+            lm = mastersku_locale.get("Locale_Matched_Category")
+            # Only include if present and non-empty
+            d["Locale_Matched_Category"] = lm if lm not in (None, "") else None
+        else:
+            d["Locale_Matched_Category"] = None
+    except Exception:
+        # Don't let localization lookup break creation
+        d["Locale_Matched_Category"] = None
     return d
 
 def build_existing_query(client_name, data):
