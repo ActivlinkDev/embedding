@@ -72,6 +72,7 @@ locale_collection = db["Locale_Params"]
 master_collection = db["MasterSKU"]
 failed_matches_collection = db["Failed_Matches"]
 url_map_collection = db["url_map"]
+category_collection = db["Category"]
 
 # module logger
 logger = logging.getLogger(__name__)
@@ -410,6 +411,32 @@ def compute_category_embedding(category_input: str):
     final_category = matched_category if similarity >= 0.49 else "Unknown"
     return final_category, matched_category, similarity, embedding
 
+
+def resolve_locale_title_for_category(category_name: str, locale: str):
+    """Lookup the Category collection and return the localized title for the given locale.
+    Preference order: requested locale -> en_GB -> any available title -> None
+    """
+    if not category_name:
+        return None
+    try:
+        doc = category_collection.find_one({"category": category_name})
+        if not doc:
+            return None
+        lt_list = doc.get("locale_title")
+        if not isinstance(lt_list, list):
+            return None
+        titles = {lt.get("locale"): lt.get("title") for lt in lt_list if lt.get("locale") and lt.get("title")}
+        if not titles:
+            return None
+        if locale and locale in titles:
+            return titles[locale]
+        if "en_GB" in titles:
+            return titles["en_GB"]
+        # return any available title
+        return next(iter(titles.values()))
+    except Exception:
+        return None
+
 def log_failed_match(category_input: str, data: MasterSKURequest, embedding, similarity: float):
     failed_doc = {
         "category_input": category_input,
@@ -501,6 +528,26 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
             }
             if extra:
                 locale_block.update(extra)
+
+        # Populate Locale_Matched_Category for this locale_block using existing doc's matched category if available
+        try:
+            matched_cat = None
+            similarity_val = None
+            # prefer an explicit matched category stored on the existing master doc
+            if isinstance(existing, dict):
+                matched_cat = existing.get("Matched_Category") or existing.get("Category")
+                similarity_val = existing.get("Match_Similarity")
+            if matched_cat:
+                locale_title = resolve_locale_title_for_category(matched_cat, data.locale)
+                # store only the localized title string
+                locale_block["Locale_Matched_Category"] = locale_title
+            else:
+                locale_block["Locale_Matched_Category"] = None
+        except Exception:
+            try:
+                locale_block["Locale_Matched_Category"] = None
+            except Exception:
+                pass
 
         # Ensure existing doc has a match_key so future upserts can find it atomically.
         try:
@@ -597,6 +644,23 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
         }
         if extra:
             locale_block.update(extra)
+
+    # Populate Locale_Matched_Category for the newly created master (use matched_category + similarity)
+    try:
+        # matched_category and similarity are computed above in the embedding section
+        mcat = matched_category if 'matched_category' in locals() else None
+        msim = similarity if 'similarity' in locals() else None
+        if mcat:
+            locale_title = resolve_locale_title_for_category(mcat, data.locale)
+            # store only the localized title string
+            locale_block["Locale_Matched_Category"] = locale_title
+        else:
+            locale_block["Locale_Matched_Category"] = None
+    except Exception:
+        try:
+            locale_block["Locale_Matched_Category"] = None
+        except Exception:
+            pass
 
     now_iso = utc_now_iso()
     doc = {
