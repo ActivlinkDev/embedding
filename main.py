@@ -49,6 +49,7 @@ ROUTERS = {
     "lookup_locale_params": "routers.lookup_locale_params",
     "lookup_custom_sku": "routers.sku.lookup_custom_sku",
     "lookup_custom_sku_all": "routers.sku.lookup_custom_sku_all",
+    "lookup_custom_sku_locale": "routers.sku.lookup_custom_sku_locale",
     "create_custom_sku": "routers.sku.create_custom_sku",
     "lookup_master_sku": "routers.sku.lookup_master_sku",
     "lookup_master_sku_all": "routers.sku.lookup_master_sku_all",
