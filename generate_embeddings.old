@@ -1,4 +1,4 @@
-from dotenv import load_dotenv
+-from dotenv import load_dotenv
 load_dotenv()
 
 import os
@@ -15,6 +15,7 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = "Activlink"
 COLLECTION_NAME = "Category"
+OUTPUT_FILE = "generate_embeddings.npz"
 
 if not openai.api_key:
     logger.error("OPENAI_API_KEY not set!")
@@ -60,31 +61,6 @@ def batch_embed_texts(texts, batch_size=100, delay=1):
 embeddings = batch_embed_texts(categories)
 embeddings_array = np.array(embeddings, dtype=np.float32)
 
-# Previously this script saved an output .npz file. That is no longer needed
-# because embeddings are persisted directly into MongoDB. We keep the
-# in-memory `embeddings_array` for the update loop below.
-
-# Persist each category embedding back into the MongoDB collection so documents
-# can be queried by vector (or exported later). We store the embedding as a
-# plain list of floats under the `embedding` field on documents that match the
-# category string. Use update_many in case multiple documents share the same
-# category value.
-try:
-    for cat, emb in zip(categories, embeddings_array):
-        # Convert numpy vector to plain Python floats
-        vec = emb.tolist()
-        # Only update documents that don't already have an `embedding` field.
-        # This prevents overwriting existing vectors.
-        res = category_collection.update_many(
-            {"category": cat, "embedding": {"$exists": False}},
-            {"$set": {"embedding": vec}}
-        )
-        if res.matched_count:
-            logger.info(
-                f"Updated {res.modified_count} document(s) for category '{cat}' (matched {res.matched_count} without embedding)."
-            )
-        else:
-            logger.info(f"Skipped category '{cat}': embedding already exists on matching documents.")
-    logger.info("✅ All category embeddings persisted to MongoDB.")
-except Exception as e:
-    logger.error(f"Failed to persist embeddings to MongoDB: {e}")
+# Save embeddings and categories together
+np.savez_compressed(OUTPUT_FILE, embeddings=embeddings_array, categories=np.array(categories))
+logger.info(f"✅ Embeddings and categories saved successfully to {OUTPUT_FILE}.")

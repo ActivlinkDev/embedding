@@ -4,7 +4,7 @@ from typing import Optional
 import os
 from pymongo import MongoClient
 
-from utils.common import embed_query, find_best_match, category_embeddings, device_categories
+from utils.common import embed_query, cosine_similarity
 from utils.dependencies import verify_token
 
 router = APIRouter(
@@ -45,28 +45,81 @@ def match_category(
     request: QueryRequest,
     _: None = Depends(verify_token)
 ):
+    # Embed the incoming query
     query_embedding = embed_query(request.query)
-    category, similarity = find_best_match(query_embedding, category_embeddings, device_categories)
+
+    # Try using MongoDB's vector search first (preferred). If unavailable or
+    # it fails, fall back to the in-memory category_embeddings lookup.
     locale_title = None
+    matched_category = None
+    matched_score = None
+
     try:
         client = _get_mongo_client()
         if client:
             db = client[MONGO_DB]
             coll = db[MONGO_COLLECTION]
-            doc = coll.find_one({"category": category})
-            if doc and isinstance(doc.get("locale_title"), list):
-                # Build mapping locale->title
-                titles = {lt.get("locale"): lt.get("title") for lt in doc.get("locale_title", []) if lt.get("locale") and lt.get("title")}
-                # prefer requested locale, then en_GB, then any
-                req = request.locale
-                if req and req in titles:
-                    locale_title = titles[req]
-                elif "en_GB" in titles:
-                    locale_title = titles["en_GB"]
-                elif titles:
-                    locale_title = next(iter(titles.values()))
-    except Exception:
-        # Do not raise — matching should still work even if lookup fails
-        locale_title = None
 
-    return MatchResponse(category=category, similarity=similarity, locale_title=locale_title)
+            # Ensure we have a plain Python list of floats
+            try:
+                qvec = list(query_embedding)
+            except Exception:
+                qvec = [float(x) for x in query_embedding]
+
+            index = os.getenv("VECTOR_INDEX", "vector_index")
+            num_candidates = int(os.getenv("VECTOR_NUM_CANDIDATES", "100"))
+            # Ask the server for the single best match
+            stage = {
+                "$vectorSearch": {
+                    "index": index,
+                    "path": "embedding",
+                    "queryVector": qvec,
+                    "numCandidates": num_candidates,
+                    "limit": 1,
+                }
+            }
+
+            results = list(coll.aggregate([stage]))
+            if results:
+                doc = results[0]
+                # category field may have different names in documents
+                cat = doc.get("category") or doc.get("Category") or doc.get("category_name")
+
+                # Extract score if provided by server, else compute cosine similarity
+                score = None
+                for k in ("score", "searchScore", "vectorSearchScore", "scoreValue", "_score"):
+                    if k in doc:
+                        try:
+                            score = float(doc[k])
+                        except Exception:
+                            score = None
+                        break
+
+                if score is None and isinstance(doc.get("embedding"), (list, tuple)):
+                    try:
+                        score = float(cosine_similarity(query_embedding, doc["embedding"]))
+                    except Exception:
+                        score = None
+
+                matched_category = cat
+                matched_score = float(score) if score is not None else 0.0
+
+                # If the document contains localized titles, pick the preferred one
+                if isinstance(doc.get("locale_title"), list):
+                    titles = {lt.get("locale"): lt.get("title") for lt in doc.get("locale_title", []) if lt.get("locale") and lt.get("title")}
+                    req = request.locale
+                    if req and req in titles:
+                        locale_title = titles[req]
+                    elif "en_GB" in titles:
+                        locale_title = titles["en_GB"]
+                    elif titles:
+                        locale_title = next(iter(titles.values()))
+    except Exception:
+        # Do not raise here; we'll return an empty/zero-match result below.
+        matched_category = None
+        matched_score = None
+    # If no match found or Mongo unavailable, return an empty category with 0.0 similarity
+    if not matched_category:
+        return MatchResponse(category="", similarity=0.0, locale_title=locale_title)
+
+    return MatchResponse(category=matched_category, similarity=float(matched_score or 0.0), locale_title=locale_title)

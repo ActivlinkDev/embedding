@@ -16,17 +16,12 @@ if not openai.api_key:
     logger.error("OPENAI_API_KEY not set!")
     raise ValueError("OPENAI_API_KEY not set!")
 
-# Load categories and embeddings from NPZ
-EMBEDDINGS_FILE = "generate_embeddings.npz"
-
-try:
-    npz = np.load(EMBEDDINGS_FILE, allow_pickle=True)
-    category_embeddings = npz["embeddings"].tolist()
-    device_categories = npz["categories"].tolist()
-    logger.info(f"Loaded {len(device_categories)} categories and embeddings from {EMBEDDINGS_FILE}.")
-except Exception as e:
-    logger.error(f"Error loading embeddings/categories from {EMBEDDINGS_FILE}: {e}")
-    raise
+# Precomputed embeddings file removed: this module no longer depends on a
+# local "generate_embeddings.npz" file. If you previously relied on
+# precomputed embeddings, provide them at runtime to functions that need
+# them (for example via a database or by passing arrays to helpers).
+category_embeddings = []
+device_categories = []
 
 # Utilities
 def embed_query(query: str):
