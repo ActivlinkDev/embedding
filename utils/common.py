@@ -37,6 +37,38 @@ def cosine_similarity(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 def find_best_match(query_embedding, category_embeddings, categories):
-    similarities = [cosine_similarity(query_embedding, emb) for emb in category_embeddings]
-    best_idx = int(np.argmax(similarities))
-    return categories[best_idx], float(similarities[best_idx])
+    """Return the best matching category and its similarity.
+
+    Defensive: if `category_embeddings` is empty or similarities cannot be
+    computed, return (None, 0.0) instead of raising an exception.
+    """
+    if not category_embeddings:
+        logger.warning("find_best_match called with empty category_embeddings")
+        return None, 0.0
+
+    try:
+        similarities = np.array([
+            cosine_similarity(query_embedding, emb) for emb in category_embeddings
+        ], dtype=float)
+    except Exception:
+        logger.exception("Error computing similarities in find_best_match")
+        return None, 0.0
+
+    # If there are no computed similarities or all are NaN, return default
+    if similarities.size == 0 or np.all(np.isnan(similarities)):
+        logger.warning("No valid similarities computed (empty or all-NaN)")
+        return None, 0.0
+
+    # Treat NaNs as very small so argmax ignores them
+    nan_mask = np.isnan(similarities)
+    if np.any(nan_mask):
+        similarities[nan_mask] = -np.inf
+
+    best_idx = int(np.nanargmax(similarities))
+    best_similarity = float(similarities[best_idx])
+
+    if not categories or best_idx < 0 or best_idx >= len(categories):
+        logger.warning("find_best_match computed index out of range for categories")
+        return None, best_similarity
+
+    return categories[best_idx], best_similarity
