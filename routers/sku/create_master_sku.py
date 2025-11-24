@@ -407,8 +407,19 @@ def get_gtin_from_icecat(icecat_data: Optional[Dict], default_gtin: str):
 
 def compute_category_embedding(category_input: str):
     embedding = embed_query(category_input)
-    matched_category, similarity = find_best_match(embedding, category_embeddings, device_categories)
-    final_category = matched_category if similarity >= 0.49 else "Unknown"
+
+    # First try MongoDB vector search (same approach as routers.match)
+    try:
+        from utils.common import mongo_vector_search
+        matched_category, similarity = mongo_vector_search(embedding)
+    except Exception:
+        matched_category, similarity = None, 0.0
+
+    # If MongoDB vector search didn't return a match, fall back to in-memory lookup
+    if not matched_category:
+        matched_category, similarity = find_best_match(embedding, category_embeddings, device_categories)
+
+    final_category = matched_category if matched_category and similarity >= 0.49 else "Unknown"
     return final_category, matched_category, similarity, embedding
 
 
