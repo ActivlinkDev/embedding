@@ -6,7 +6,7 @@ from utils.dependencies import verify_token
 
 router = APIRouter(
     prefix="/otp",
-    tags=["OTP"],
+    tags=["Messaging"],
 )
 
 # --- Configuration ---

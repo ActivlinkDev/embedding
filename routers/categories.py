@@ -4,7 +4,7 @@ from utils.dependencies import verify_token
 
 router = APIRouter(
     prefix="/categories",
-    tags=["Categories"]
+    tags=["Catalog"]
 )
 
 @router.get("/")

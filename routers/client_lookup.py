@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 # Load environment variables from .env
 load_dotenv()
 
-router = APIRouter()
+router = APIRouter(tags=["Catalog"])
 
 # MongoDB connection
 MONGO_URI = os.getenv("MONGO_URI", "your-default-mongo-uri")
@@ -16,7 +16,7 @@ client = MongoClient(MONGO_URI)
 db = client["Activlink"]
 collection = db["ClientKey"]
 
-@router.get("/get-client", tags=["Client Lookup"])
+@router.get("/get-client")
 def get_client(clientkey: str = Query(..., description="The clientkey to look up the full client record")):
     result = collection.find_one({"ClientKey": clientkey}, {"_id": 0})
 

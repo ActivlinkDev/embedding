@@ -3,7 +3,7 @@ import stripe
 import os
 from pymongo import MongoClient
 
-router = APIRouter(tags=["Stripe Utilities"])
+router = APIRouter(tags=["Payments"])
 
 # Set your Stripe secret key
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")

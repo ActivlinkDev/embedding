@@ -6,7 +6,7 @@ from routers.generate_payment_link import generate_checkout_session, CheckoutSes
 from pymongo import MongoClient
 import os
 
-router = APIRouter(tags=["Payment Links"])
+router = APIRouter(tags=["Payments"])
 
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]

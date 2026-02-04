@@ -6,7 +6,7 @@ from pymongo import MongoClient
 from utils.dependencies import verify_token
 from utils.locale import resolve_strapi_locale, LocaleNotSupportedError
 
-router = APIRouter(tags=["Props Lookup"]) 
+router = APIRouter(tags=["CMS"]) 
 
 STRAPI_BASE_URL = "https://strapi-production-5603.up.railway.app/api/props"
 STRAPI_BEARER_TOKEN = os.getenv("STRAPI_BEARER_TOKEN")

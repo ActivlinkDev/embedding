@@ -2,7 +2,7 @@ from fastapi import APIRouter, Body
 from pymongo import MongoClient
 import os
 
-router = APIRouter(tags=["Customer"])
+router = APIRouter(tags=["Customers"])
 
 # Setup Mongo client and collection
 client = MongoClient(os.getenv("MONGO_URI"))

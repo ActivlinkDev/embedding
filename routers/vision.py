@@ -13,7 +13,7 @@ from routers.match import find_best_match, embed_query, category_embeddings, dev
 
 router = APIRouter(
     prefix="/vision",
-    tags=["Vision"]
+    tags=["Enrichment"]
 )
 
 openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))

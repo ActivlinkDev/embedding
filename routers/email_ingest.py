@@ -12,7 +12,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from utils.dependencies import verify_token
 
 # ✅ FastAPI router object
-router = APIRouter(prefix="/email/ingest", tags=["Email Ingest"])
+router = APIRouter(prefix="/email/ingest", tags=["Messaging"])
 
 # ----------------------
 # Load mailbox configs

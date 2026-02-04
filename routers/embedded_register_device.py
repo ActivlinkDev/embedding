@@ -15,7 +15,7 @@ import base64
 import re
 
 router = APIRouter(
-    tags=["Register"]
+    tags=["Devices"]
 )
 
 # MongoDB connection setup

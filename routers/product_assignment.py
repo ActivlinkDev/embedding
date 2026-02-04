@@ -5,7 +5,7 @@ from utils.dependencies import verify_token
 from pymongo import MongoClient
 import os
 
-router = APIRouter(tags=["Product Assignment"])
+router = APIRouter(tags=["Assignments"])
 
 # MongoDB setup
 client = MongoClient(os.getenv("MONGO_URI"))

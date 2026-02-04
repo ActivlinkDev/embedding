@@ -8,7 +8,7 @@ load_dotenv()
 
 router = APIRouter(
     prefix="/ice",
-    tags=["Enrich"]
+    tags=["Enrichment"]
 )
 
 ICECAT_USERNAME = os.getenv("ICECAT_USER", "")

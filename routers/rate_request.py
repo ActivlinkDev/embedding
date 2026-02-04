@@ -7,7 +7,7 @@ import os
 import re
 from typing import List, Optional
 
-router = APIRouter(tags=["Rate Request"])
+router = APIRouter(tags=["Payments"])
 
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]

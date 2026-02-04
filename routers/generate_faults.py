@@ -13,7 +13,7 @@ from utils.dependencies import verify_token  # <-- import your auth here
 # -------------------------------
 router = APIRouter(
     prefix="/faults",
-    tags=["Faults"]
+    tags=["Operations"]
 )
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
