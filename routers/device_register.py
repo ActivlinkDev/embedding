@@ -7,7 +7,7 @@ from bson import ObjectId
 import os
 from datetime import datetime
 
-router = APIRouter(tags=["Device Registration"])
+router = APIRouter(tags=["Devices"])
 
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]

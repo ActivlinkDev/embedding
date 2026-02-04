@@ -6,7 +6,7 @@ from datetime import datetime
 import os
 from utils.dependencies import verify_token
 
-router = APIRouter(tags=["Quote"])
+router = APIRouter(tags=["Quotes"])
 
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]

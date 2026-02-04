@@ -4,7 +4,7 @@ import time
 
 from utils.dependencies import verify_token
 
-router = APIRouter(tags=["Customer"])
+router = APIRouter(tags=["Customers"])
 
 VERIFIED_COOKIE_NAME = os.getenv("VERIFIED_COOKIE_NAME", "verified_customer")
 VERIFIED_TTL_SECONDS = int(os.getenv("VERIFIED_TTL_SECONDS", str(24 * 3600)))

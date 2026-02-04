@@ -11,7 +11,7 @@ from utils.dependencies import verify_token
 from .assign_product_by_device_id import assign_product_for_device
 from .rate_request import RateRequest as RateReqModel, RateRequestBatch, rate_request
 
-router = APIRouter(tags=["Embedded Quote"])
+router = APIRouter(tags=["Quotes"])
 
 
 class EmbeddedQuoteRequest(BaseModel):

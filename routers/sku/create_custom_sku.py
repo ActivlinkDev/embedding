@@ -151,7 +151,7 @@ load_dotenv()
 
 router = APIRouter(
     prefix="/sku",
-    tags=["SKU"]
+    tags=["Catalog"]
 )
 
 client = MongoClient(os.getenv("MONGO_URI"))

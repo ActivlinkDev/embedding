@@ -3,7 +3,7 @@ from pymongo import MongoClient
 from bson import ObjectId
 import os
 
-router = APIRouter(tags=["Customer"])
+router = APIRouter(tags=["Customers"])
 
 # Setup Mongo client and collections
 client = MongoClient(os.getenv("MONGO_URI"))

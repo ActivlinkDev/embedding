@@ -11,7 +11,7 @@ from bson import ObjectId
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-router = APIRouter(prefix="/scale", tags=["ScaleSERP"])
+router = APIRouter(prefix="/scale", tags=["Enrichment"])
 
 SCALE_SERP_API_KEY = os.getenv("SCALE_SERP_API_KEY")
 SCALE_SERP_BASE_URL = "https://api.scaleserp.com/search"

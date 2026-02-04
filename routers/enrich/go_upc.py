@@ -8,7 +8,7 @@ load_dotenv()
 
 router = APIRouter(
     prefix="/upc",
-    tags=["Enrich"]
+    tags=["Enrichment"]
 )
 
 GO_UPC_API_KEY = os.getenv("GO_UPC_TOKEN")

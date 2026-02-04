@@ -7,7 +7,7 @@ from datetime import datetime
 from utils.dependencies import verify_token
 from .product_assignment import product_assignment, ProductAssignmentRequest
 
-router = APIRouter(tags=["Device Product Assignment"])
+router = APIRouter(tags=["Assignments"])
 
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]

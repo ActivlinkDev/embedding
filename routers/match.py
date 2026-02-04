@@ -8,7 +8,7 @@ from utils.common import embed_query, cosine_similarity
 from utils.dependencies import verify_token
 
 router = APIRouter(
-    tags=["Match"]
+    tags=["Catalog"]
 )
 
 class QueryRequest(BaseModel):

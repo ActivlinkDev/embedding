@@ -7,7 +7,7 @@ import os
 
 from utils.dependencies import verify_token
 
-router = APIRouter(tags=["Device Collection"])
+router = APIRouter(tags=["Assignments"])
 
 client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]

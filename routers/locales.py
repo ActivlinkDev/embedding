@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from utils.locale import get_locale_mapping
 
-router = APIRouter(prefix="", tags=["Locales"])
+router = APIRouter(prefix="", tags=["Localization"])
 
 @router.get("/locales", summary="List supported locales", response_description="Mapping of locale short keys to metadata")
 async def list_locales():

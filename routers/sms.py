@@ -7,7 +7,7 @@ from utils.dependencies import verify_token
 
 router = APIRouter(
     prefix="/notify",
-    tags=["Notifications"]
+    tags=["Messaging"]
 )
 
 VOODOO_API_KEY = os.getenv("VOODOO_SMS_API_KEY")

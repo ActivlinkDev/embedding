@@ -5,7 +5,7 @@ import os
 
 from utils.dependencies import verify_token
 
-router = APIRouter(tags=["Customer"], prefix="")
+router = APIRouter(tags=["Customers"], prefix="")
 
 MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:

@@ -5,10 +5,27 @@ import asyncio, traceback
 from fastapi import FastAPI
 from routers.quote import router as quote_router
 
+OPENAPI_TAGS = [
+    {"name": "Catalog", "description": "Category, SKU, and client catalog lookups."},
+    {"name": "Localization", "description": "Locale lookups and mappings."},
+    {"name": "Enrichment", "description": "Third-party enrichment and AI extraction."},
+    {"name": "Devices", "description": "Device registration and lookup."},
+    {"name": "Assignments", "description": "Device and product assignment workflows."},
+    {"name": "Quotes", "description": "Quote generation and retrieval."},
+    {"name": "Payments", "description": "Rates, payment links, and Stripe utilities."},
+    {"name": "Basket", "description": "Basket pricing and payments."},
+    {"name": "Customers", "description": "Customer identity and verification."},
+    {"name": "Messaging", "description": "SMS, email ingest, and OTP flows."},
+    {"name": "CMS", "description": "Content management integrations."},
+    {"name": "Operations", "description": "Internal tools and maintenance utilities."},
+    {"name": "QA", "description": "Quality assurance utilities."},
+]
+
 app = FastAPI(
     title="Activlink API Suite",
     description="APIs for registration, ingestion, enrichment, and payments.",
     version="1.0.0",
+    openapi_tags=OPENAPI_TAGS,
 )
 
 # -------- Health check --------

@@ -25,7 +25,7 @@ load_dotenv()
 
 router = APIRouter(
     prefix="/sku",
-    tags=["SKU"]
+    tags=["Catalog"]
 )
 
 

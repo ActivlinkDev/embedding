@@ -5,7 +5,7 @@ import sys
 from pymongo import MongoClient
 from bson import ObjectId
 
-router = APIRouter(tags=["Stripe Webhook"])
+router = APIRouter(tags=["Payments"])
 
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 if not STRIPE_WEBHOOK_SECRET:
