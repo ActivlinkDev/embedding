@@ -25,6 +25,8 @@ class BasketPaymentRequest(BaseModel):
     product_name: Optional[str] = Field(None, description="Override product name for Stripe")
     product_description: Optional[str] = Field(None, description="Override product description for Stripe")
     product_images: Optional[List[str]] = Field(None, description="Override product images (URLs) for Stripe")
+    success_url: Optional[str] = Field(None, description="Success redirect URL for Stripe session")
+    cancel_url: Optional[str] = Field(None, description="Cancel redirect URL for Stripe session")
 
 
 def _extract_currency(items: list[dict[str, Any]]) -> str:
@@ -131,6 +133,8 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
     product_description = req.product_description or basket.get("description") or "Basket items checkout"
     # Prefer provided images; else gather from basket items if present
     product_images = req.product_images or _collect_product_images(items)
+    success_url = req.success_url or "https://yourdomain.com/success"
+    cancel_url = req.cancel_url or "https://frontend-production-7798.up.railway.app/lookup"
 
     req_checkout = CheckoutSessionRequest(
         product_name=product_name,
@@ -140,8 +144,8 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
         currency=currency,
         quantity=1,
         mode=mode_enum,
-        success_url="https://yourdomain.com/success",
-        cancel_url="https://frontend-production-7798.up.railway.app/lookup",
+        success_url=success_url,
+        cancel_url=cancel_url,
         locale=locale,
         internal_reference=str(basket["_id"]),
         metadata={
