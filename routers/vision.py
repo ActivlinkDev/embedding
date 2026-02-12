@@ -8,7 +8,9 @@ import json
 from utils.dependencies import verify_token
 
 # --- Import your category matching tools ---
-from routers.match import find_best_match, embed_query, category_embeddings, device_categories
+# `find_best_match` and embedding helpers live in `utils.common`.
+# Import them from there to avoid circular/misplaced imports.
+from utils.common import find_best_match, embed_query, category_embeddings, device_categories
 # Update the import above if your project structure differs
 
 router = APIRouter(

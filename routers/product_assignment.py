@@ -1,6 +1,8 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field, field_validator, constr
 from datetime import datetime
+from itertools import combinations
+from typing import Any, Dict, List, Set
 from utils.dependencies import verify_token
 from pymongo import MongoClient
 import os
@@ -42,6 +44,102 @@ def criteria_failure_reasons(crit, locale, gtee, age_in_months, price, currency)
     if currency not in crit.get("currency", []):
         reasons.append(f"currency '{currency}' not in {crit.get('currency', [])}")
     return reasons
+
+DOC_MATCH_FIELDS = ("client", "source", "category")
+CRITERIA_MATCH_FIELDS = ("locale", "gtee", "age", "price", "currency")
+DIAGNOSIS_FIELDS = DOC_MATCH_FIELDS + CRITERIA_MATCH_FIELDS
+
+def _active_client_entries(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
+    active_client = doc.get("activeClient", [])
+    if isinstance(active_client, dict):
+        return [active_client]
+    if isinstance(active_client, list):
+        return [item for item in active_client if isinstance(item, dict)]
+    return []
+
+def _doc_level_match(doc: Dict[str, Any], payload, subset_fields: Set[str]) -> bool:
+    active_client_entries = _active_client_entries(doc)
+    if "client" in subset_fields and "source" in subset_fields:
+        if not any(
+            entry.get("client") == payload.client and entry.get("source") == payload.source
+            for entry in active_client_entries
+        ):
+            return False
+    elif "client" in subset_fields:
+        if not any(entry.get("client") == payload.client for entry in active_client_entries):
+            return False
+    elif "source" in subset_fields:
+        if not any(entry.get("source") == payload.source for entry in active_client_entries):
+            return False
+
+    if "category" in subset_fields:
+        if payload.category not in doc.get("categoryGroup", []):
+            return False
+
+    return True
+
+def _criteria_subset_match(crit: Dict[str, Any], payload, age_in_months: int, subset_fields: Set[str]) -> bool:
+    if "locale" in subset_fields and payload.locale not in crit.get("locale", []):
+        return False
+    if "gtee" in subset_fields and payload.gtee not in crit.get("guaranteeDuration", []):
+        return False
+    if "age" in subset_fields and not (crit.get("monthsLow", 0) <= age_in_months <= crit.get("monthsHigh", 9999)):
+        return False
+    if "price" in subset_fields and not (crit.get("msrpLow", 0) <= payload.price <= crit.get("msrpHigh", 999999)):
+        return False
+    if "currency" in subset_fields and payload.currency not in crit.get("currency", []):
+        return False
+    return True
+
+def _document_matches_subset(doc: Dict[str, Any], payload, age_in_months: int, subset_fields: Set[str]) -> bool:
+    if not _doc_level_match(doc, payload, subset_fields):
+        return False
+
+    criteria_fields = subset_fields.intersection(CRITERIA_MATCH_FIELDS)
+    if not criteria_fields:
+        return True
+
+    for crit in doc.get("criteria", []):
+        if _criteria_subset_match(crit, payload, age_in_months, criteria_fields):
+            return True
+    return False
+
+def build_match_diagnostics(payload, age_in_months: int) -> Dict[str, Any]:
+    active_docs = list(product_assignments.find({"status": "active"}))
+    subset_checks: List[Dict[str, Any]] = []
+    first_unmatched_subset_size = None
+    first_unmatched_subsets: List[List[str]] = []
+
+    for size in range(1, len(DIAGNOSIS_FIELDS) + 1):
+        checks_for_size: List[Dict[str, Any]] = []
+        for field_combo in combinations(DIAGNOSIS_FIELDS, size):
+            subset_fields = set(field_combo)
+            match_count = 0
+            for doc in active_docs:
+                if _document_matches_subset(doc, payload, age_in_months, subset_fields):
+                    match_count += 1
+
+            checks_for_size.append({
+                "fields": list(field_combo),
+                "match_count": match_count
+            })
+
+        subset_checks.append({
+            "subset_size": size,
+            "checks": checks_for_size
+        })
+
+        zero_match_subsets = [check["fields"] for check in checks_for_size if check["match_count"] == 0]
+        if zero_match_subsets:
+            first_unmatched_subset_size = size
+            first_unmatched_subsets = zero_match_subsets
+            break
+
+    return {
+        "first_unmatched_subset_size": first_unmatched_subset_size,
+        "first_unmatched_subsets": first_unmatched_subsets,
+        "subset_checks": subset_checks
+    }
 
 def find_strict_assignment(payload, age_in_months):
     """
@@ -153,8 +251,10 @@ def product_assignment(payload: ProductAssignmentRequest, _: None = Depends(veri
             "products": products
         }
     else:
+        diagnostics = build_match_diagnostics(payload, age_in_months)
         error_detail = {
             "debug_failed": debug_failed,
+            "match_diagnostics": diagnostics,
             "error": "No criteria matched in any ProductAssignment document."
         }
         error_log_collection.insert_one({
@@ -168,5 +268,6 @@ def product_assignment(payload: ProductAssignmentRequest, _: None = Depends(veri
             "input": payload.dict(),
             "products": [],
             "error": "No criteria matched in any ProductAssignment document.",
-            "details": debug_failed
+            "details": debug_failed,
+            "match_diagnostics": diagnostics
         }

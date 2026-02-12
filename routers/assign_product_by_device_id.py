@@ -103,55 +103,22 @@ def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
             }
             product_list.append(product_entry)
 
-    # === Log error and raise if no products found, include parameter(s) likely causing it ===
+    # === Log error and raise if no products found, including subset-match diagnostics ===
     if not product_list:
-        parameter_checks = []
-        failing_params = []
-        input_dict = req_payload.dict()
-        check_params = ["client", "source", "category", "price", "locale", "gtee", "currency"]
-        for key in check_params:
-            test_input = input_dict.copy()
-            if isinstance(test_input[key], (int, float)):
-                test_input[key] = 0
-            else:
-                test_input[key] = ""
-            try:
-                test_payload = ProductAssignmentRequest(**test_input)
-                test_result = product_assignment(test_payload)
-                has_products = any(
-                    prod.get("POC", {}).get("durationMonths")
-                    for prod in test_result.get("products", [])
-                )
-                result = "products_found" if has_products else "no_products"
-                parameter_checks.append({
-                    "parameter": key,
-                    "test_value": test_input[key],
-                    "result": result,
-                    "products": test_result.get("products", [])
-                })
-                if has_products:
-                    failing_params.append(key)
-            except Exception as e:
-                parameter_checks.append({
-                    "parameter": key,
-                    "test_value": test_input[key],
-                    "result": "validation_error",
-                    "validation_error": str(e)
-                })
-
-        error_message = "No products found for this device."
-        if failing_params:
-            error_message += " Likely problematic parameter(s): " + ", ".join(failing_params)
-        log_entry = {
+        diagnostics = assignment_result.get("match_diagnostics")
+        error_detail = {
+            "message": "No products found for this device.",
             "device_id": device_id,
             "original_inputs": req_payload.dict(),
-            "parameter_checks": parameter_checks,
+            "match_diagnostics": diagnostics,
+            "assignment_details": assignment_result.get("details", []),
+        }
+        log_entry = {
+            **error_detail,
             "timestamp": datetime.utcnow().isoformat(),
-            "message": error_message,
-            "failing_params": failing_params
         }
         error_log_collection.insert_one(log_entry)
-        raise HTTPException(status_code=404, detail=error_message)
+        raise HTTPException(status_code=404, detail=error_detail)
 
     # === Add distinct product IDs array to response ===
     distinct_product_ids = list({prod["product_id"] for prod in product_list})
