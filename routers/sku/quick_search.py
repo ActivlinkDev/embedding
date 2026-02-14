@@ -1,10 +1,8 @@
 from fastapi import APIRouter, HTTPException, Query, Depends
 from typing import Optional
 from pymongo import MongoClient
-from bson import ObjectId
 import os, re
 from dotenv import load_dotenv
-from datetime import datetime
 
 from utils.dependencies import verify_token
 
@@ -36,9 +34,10 @@ def _to_id_str(doc):
 @router.get("/quick_search")
 def quick_search(
     clientKey: str = Query(..., description="Your assigned client key (required)"),
-    q: str = Query(..., min_length=2, description="Free-text query matching GTIN, SKU, Make, or Model"),
+    q: Optional[str] = Query(None, description="Free-text query matching GTIN, SKU, Make, or Model"),
+    mode: Optional[str] = Query(None, description="Use mode=all to return all client SKUs (subject to limit)."),
     locale: Optional[str] = Query(None, description="Optional locale to require presence in Locale_Specific_Data"),
-    limit: int = Query(20, ge=1, le=50, description="Max results to return"),
+    limit: int = Query(20, ge=1, le=500, description="Max results to return"),
     _: None = Depends(verify_token)
 ):
     # Resolve clientKey -> Client_ID
@@ -47,20 +46,26 @@ def quick_search(
         raise HTTPException(status_code=404, detail="Invalid clientKey")
     client_id = clientkey_doc["Client_ID"]
 
-    # Build fuzzy OR conditions across identifiers
-    safe = re.escape(q)
-    or_conditions = [
-        {"Identifiers.Make": {"$regex": safe, "$options": "i"}},
-        {"Identifiers.Model": {"$regex": safe, "$options": "i"}},
-        {"Identifiers.SKU": {"$regex": safe, "$options": "i"}},
-        {"Identifiers.GTIN": {"$regex": safe, "$options": "i"}},  # works when GTIN is array of strings
-    ]
-
     base = {"Client": client_id}
     if locale:
         base["Locale_Specific_Data.locale"] = locale
 
-    query = {"$and": [base, {"$or": or_conditions}]}
+    mode_normalized = (mode or "").strip().lower()
+    query = base
+
+    if mode_normalized != "all" or q:
+        search_term = (q or "").strip()
+        if len(search_term) < 2:
+            raise HTTPException(status_code=400, detail="q must be at least 2 characters unless mode=all")
+
+        safe = re.escape(search_term)
+        or_conditions = [
+            {"Identifiers.Make": {"$regex": safe, "$options": "i"}},
+            {"Identifiers.Model": {"$regex": safe, "$options": "i"}},
+            {"Identifiers.SKU": {"$regex": safe, "$options": "i"}},
+            {"Identifiers.GTIN": {"$regex": safe, "$options": "i"}},  # works when GTIN is array of strings
+        ]
+        query = {"$and": [base, {"$or": or_conditions}]}
 
     # Projection: limit payload size; include one matching locale element if provided
     projection = {
