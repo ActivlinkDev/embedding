@@ -13,6 +13,7 @@ OPENAPI_TAGS = [
     {"name": "Assignments", "description": "Device and product assignment workflows."},
     {"name": "Quotes", "description": "Quote generation and retrieval."},
     {"name": "Payments", "description": "Rates, payment links, and Stripe utilities."},
+    {"name": "Contracts", "description": "Device-cover contract issuance and administration."},
     {"name": "Basket", "description": "Basket pricing and payments."},
     {"name": "Customers", "description": "Customer identity and verification."},
     {"name": "Messaging", "description": "SMS, email ingest, and OTP flows."},
@@ -93,6 +94,7 @@ ROUTERS = {
     "generate_payment_link": "routers.generate_payment_link",
     "sync_stripe_prices": "routers.sync_stripe_prices",
     "stripe_webook": "routers.stripe_webook",
+    "contract_admin": "routers.contract.admin",
     # basket
     "basket": "routers.basket",
     "ratebasket": "routers.basket.ratebasket",

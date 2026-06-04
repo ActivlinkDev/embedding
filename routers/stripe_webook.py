@@ -39,6 +39,17 @@ except Exception:
     except Exception:
         pair_customer = None
 
+try:
+    from routers.contract.contract_service import create_contract
+    from routers.contract import contract_service as contract_svc
+except Exception:
+    try:
+        from contract.contract_service import create_contract
+        from contract import contract_service as contract_svc
+    except Exception:
+        create_contract = None
+        contract_svc = None
+
 @router.post("/stripe/webhook")
 async def stripe_webhook(
     request: Request,
@@ -123,25 +134,25 @@ async def stripe_webhook(
                         )
                     except Exception as e:
                         print(f"[Stripe Webhook] Failed to append Transaction_log on customer: {e}", file=sys.stderr)
-                    # Also add a contract entry into customer's contracts array if basket_id present
+                    # Issue contracts (one per basket item) in the Contracts
+                    # collection (idempotent per item).
                     try:
-                        basket_id_meta = data.get("metadata", {}).get("basket_id")
-                        if basket_id_meta:
-                            contract_obj = {
-                                "basket_id": basket_id_meta,
-                                "type": "bundle",
-                                "status": "active",
-                            }
-                            try:
-                                customer_collection.update_one(
-                                    {"_id": ObjectId(customer_id)},
-                                    {"$push": {"contracts": contract_obj}}
-                                )
-                                print(f"[Stripe Webhook] Added contract to customer: {contract_obj}", file=sys.stderr)
-                            except Exception as c_err:
-                                print(f"[Stripe Webhook] Failed to append contract on customer: {c_err}", file=sys.stderr)
-                    except Exception as e:
-                        print(f"[Stripe Webhook] Error while preparing contract object: {e}", file=sys.stderr)
+                        contracts = create_contract(data, customer_id) if create_contract else []
+                        for contract in contracts or []:
+                            # Keep a lightweight back-reference on the customer doc.
+                            customer_collection.update_one(
+                                {"_id": ObjectId(customer_id)},
+                                {"$addToSet": {"contract_refs": {
+                                    "contract_id": str(contract["_id"]),
+                                    "reference": contract.get("reference"),
+                                    "status": contract.get("status"),
+                                }}},
+                            )
+                            print(f"[Stripe Webhook] Issued contract {contract.get('reference')} "
+                                  f"({contract.get('status')}) for customer {customer_id}",
+                                  file=sys.stderr)
+                    except Exception as c_err:
+                        print(f"[Stripe Webhook] Failed to issue contract: {c_err}", file=sys.stderr)
                     # After customer exists/updated, attempt to pair customer to basket if metadata present
                     try:
                         basket_id = data.get("metadata", {}).get("basket_id")
@@ -155,6 +166,31 @@ async def stripe_webhook(
                         print(f"[Stripe Webhook] Error while attempting to pair customer: {e}", file=sys.stderr)
                 except Exception as cust_exc:
                     print(f"[Stripe Webhook] Customer creation error: {cust_exc}", file=sys.stderr)
+        elif event_type == "invoice.paid" and contract_svc:
+            # Monthly cover: activate on first invoice, renew on each cycle.
+            try:
+                c = contract_svc.handle_invoice_paid(data, event.get("id"))
+                if c:
+                    print(f"[Stripe Webhook] invoice.paid -> contract {c.get('reference')} "
+                          f"({c.get('status')})", file=sys.stderr)
+            except Exception as inv_exc:
+                print(f"[Stripe Webhook] handle_invoice_paid failed: {inv_exc}", file=sys.stderr)
+        elif event_type == "charge.refunded" and contract_svc:
+            try:
+                c = contract_svc.handle_charge_refunded(data, event.get("id"))
+                if c:
+                    print(f"[Stripe Webhook] charge.refunded -> contract {c.get('reference')} "
+                          f"({c.get('status')})", file=sys.stderr)
+            except Exception as ref_exc:
+                print(f"[Stripe Webhook] handle_charge_refunded failed: {ref_exc}", file=sys.stderr)
+        elif event_type == "customer.subscription.deleted" and contract_svc:
+            try:
+                c = contract_svc.handle_subscription_deleted(data)
+                if c:
+                    print(f"[Stripe Webhook] subscription.deleted -> contract "
+                          f"{c.get('reference')} cancelled", file=sys.stderr)
+            except Exception as sub_exc:
+                print(f"[Stripe Webhook] handle_subscription_deleted failed: {sub_exc}", file=sys.stderr)
         else:
             print(f"[Stripe Webhook] Received event type: {event_type} (not stored).", file=sys.stderr)
     except Exception as db_exc:
