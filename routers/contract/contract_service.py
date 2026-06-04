@@ -430,6 +430,17 @@ def handle_invoice_paid(invoice: dict, stripe_event_id: str | None = None) -> li
     currency = (invoice.get("currency") or "gbp").upper()
     invoice_id = invoice.get("id")
 
+    # Idempotency: one invoice is processed once. If any contract on this
+    # subscription already recorded a payment for this invoice, a retry/replay
+    # is a no-op — otherwise a duplicate `subscription_cycle` delivery would
+    # renew the lifecycle an extra term for a single paid invoice.
+    if invoice_id and contracts_collection.find_one(
+        {"stripe_subscription_id": sub_id, "payments.stripe_object_id": invoice_id}
+    ):
+        print(f"[Contract] invoice {invoice_id} already processed for sub {sub_id}",
+              file=sys.stderr)
+        return []
+
     affected: list[dict] = []
 
     if reason == "subscription_create":

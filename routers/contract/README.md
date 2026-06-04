@@ -28,7 +28,9 @@ policies):
 * one child **`Contracts`** doc per basket item, each with its own device, offer, and
   item price.
 
-Idempotent: parent on `stripe_session_id`, children on a per-item `dedupe_key`.
+Idempotent: parent on `stripe_session_id`, children on a per-item `dedupe_key`,
+and subscription `invoice.paid` events on the **invoice id** (a retried/replayed
+invoice is a no-op, so the lifecycle never advances an extra term for one payment).
 One-off checkouts that arrive already paid activate immediately; monthly cover
 activates on the first paid invoice (see "Subscriptions" below).
 
