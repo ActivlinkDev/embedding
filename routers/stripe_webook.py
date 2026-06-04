@@ -168,9 +168,10 @@ async def stripe_webhook(
                     print(f"[Stripe Webhook] Customer creation error: {cust_exc}", file=sys.stderr)
         elif event_type == "invoice.paid" and contract_svc:
             # Monthly cover: activate on first invoice, renew on each cycle.
+            # A subscription can back many device contracts, so this affects all.
             try:
-                c = contract_svc.handle_invoice_paid(data, event.get("id"))
-                if c:
+                affected = contract_svc.handle_invoice_paid(data, event.get("id"))
+                for c in affected or []:
                     print(f"[Stripe Webhook] invoice.paid -> contract {c.get('reference')} "
                           f"({c.get('status')})", file=sys.stderr)
             except Exception as inv_exc:

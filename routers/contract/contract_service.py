@@ -350,7 +350,8 @@ def renew(doc: dict) -> dict:
         "stripe_session_id": None,
         "stripe_payment_intent_id": None,
         "stripe_subscription_id": doc.get("stripe_subscription_id"),
-        "dedupe_key": None,
+        # No dedupe_key: a renewal is not tied to a checkout session item. Omitting
+        # the field (rather than setting null) keeps it out of the unique index.
         "document_url": None,
         "ipid_url": None,
         "events": [_event("ISSUED", {"renewed_from": str(doc["_id"])})],
@@ -413,36 +414,47 @@ def renewal_notifier(notice_days: int = 30) -> dict:
     return {"notified": notified, "notice_days": notice_days}
 
 
-def handle_invoice_paid(invoice: dict, stripe_event_id: str | None = None) -> dict | None:
-    """Activate a monthly contract on first invoice, renew it on each cycle.
+def handle_invoice_paid(invoice: dict, stripe_event_id: str | None = None) -> list[dict]:
+    """Activate (or renew) every contract on a subscription for one paid invoice.
 
-    Driven by Stripe `invoice.paid`. Matches the contract by subscription id.
+    Driven by Stripe `invoice.paid`. A single subscription can back many device
+    contracts (one monthly basket -> many policies), so this applies the event to
+    ALL of them, not just one. Each child records its own item price as the
+    payment amount (the invoice amount is the subscription total across devices).
+    Returns the list of affected contracts.
     """
     sub_id = invoice.get("subscription")
     if not sub_id:
-        return None
+        return []
     reason = invoice.get("billing_reason")
-    amount = invoice.get("amount_paid")
-    amount = (amount / 100) if amount is not None else None
     currency = (invoice.get("currency") or "gbp").upper()
+    invoice_id = invoice.get("id")
 
-    doc = contracts_collection.find_one(
-        {"stripe_subscription_id": sub_id, "status": {"$ne": "RENEWED"}},
-        sort=[("created_at", -1)],
-    )
-    if not doc:
-        return None
+    affected: list[dict] = []
 
-    if reason == "subscription_create" and doc["status"] == "PENDING_ACTIVATION":
-        _record_payment(doc, invoice.get("id"), "INITIAL", amount, currency,
-                        stripe_event_id=stripe_event_id)
-        activate(doc, doc.get("term_months") or 12)
-        return contracts_collection.find_one({"_id": doc["_id"]})
-    if reason == "subscription_cycle" and doc["status"] == "ACTIVE":
-        _record_payment(doc, invoice.get("id"), "RENEWAL", amount, currency,
-                        stripe_event_id=stripe_event_id)
-        return renew(doc)
-    return doc
+    if reason == "subscription_create":
+        # Activate all pending contracts for this subscription.
+        pending = list(contracts_collection.find(
+            {"stripe_subscription_id": sub_id, "status": "PENDING_ACTIVATION"}
+        ))
+        for doc in pending:
+            _record_payment(doc, invoice_id, "INITIAL", doc.get("price"),
+                            doc.get("currency") or currency, stripe_event_id=stripe_event_id)
+            activate(doc, doc.get("term_months") or 12)
+            affected.append(contracts_collection.find_one({"_id": doc["_id"]}))
+
+    elif reason == "subscription_cycle":
+        # Renew all currently-active contracts. Snapshot first: renew() creates new
+        # ACTIVE docs, which must not be picked up again in the same pass.
+        active = list(contracts_collection.find(
+            {"stripe_subscription_id": sub_id, "status": "ACTIVE"}
+        ))
+        for doc in active:
+            _record_payment(doc, invoice_id, "RENEWAL", doc.get("price"),
+                            doc.get("currency") or currency, stripe_event_id=stripe_event_id)
+            affected.append(renew(doc))
+
+    return affected
 
 
 def handle_charge_refunded(charge: dict, stripe_event_id: str | None = None) -> dict | None:

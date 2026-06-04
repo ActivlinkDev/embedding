@@ -134,7 +134,9 @@ default 12 months).
 ## Indexes (created on the live DB; re-run is idempotent)
 ```js
 // children
-db.Contracts.createIndex({ dedupe_key: 1 }, { unique: true, sparse: true })
+// partial (string-only) so renewals — which have no dedupe_key — don't collide on null
+db.Contracts.createIndex({ dedupe_key: 1 },
+  { unique: true, partialFilterExpression: { dedupe_key: { $type: "string" } } })
 db.Contracts.createIndex({ order_id: 1 })
 db.Contracts.createIndex({ customer_id: 1, created_at: -1 })
 db.Contracts.createIndex({ device_id: 1 })
