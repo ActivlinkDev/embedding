@@ -147,7 +147,7 @@ async def stripe_webhook(
                     # Issue contracts (one per basket item) in the Contracts
                     # collection (idempotent per item).
                     try:
-                        contracts = create_contract(data, customer_id) if create_contract else []
+                        contracts = create_contract(data_dict, customer_id) if create_contract else []
                         for contract in contracts or []:
                             customer_collection.update_one(
                                 {"_id": ObjectId(customer_id)},
@@ -180,7 +180,7 @@ async def stripe_webhook(
             # Monthly cover: activate on first invoice, renew on each cycle.
             # A subscription can back many device contracts, so this affects all.
             try:
-                affected = contract_svc.handle_invoice_paid(data, event.id)
+                affected = contract_svc.handle_invoice_paid(data_dict, event.id)
                 for c in affected or []:
                     print(f"[Stripe Webhook] invoice.paid -> contract {c.get('reference')} "
                           f"({c.get('status')})", file=sys.stderr)
@@ -188,7 +188,7 @@ async def stripe_webhook(
                 print(f"[Stripe Webhook] handle_invoice_paid failed: {inv_exc}", file=sys.stderr)
         elif event_type == "charge.refunded" and contract_svc:
             try:
-                c = contract_svc.handle_charge_refunded(data, event.id)
+                c = contract_svc.handle_charge_refunded(data_dict, event.id)
                 if c:
                     print(f"[Stripe Webhook] charge.refunded -> contract {c.get('reference')} "
                           f"({c.get('status')})", file=sys.stderr)
@@ -196,7 +196,7 @@ async def stripe_webhook(
                 print(f"[Stripe Webhook] handle_charge_refunded failed: {ref_exc}", file=sys.stderr)
         elif event_type == "customer.subscription.deleted" and contract_svc:
             try:
-                c = contract_svc.handle_subscription_deleted(data)
+                c = contract_svc.handle_subscription_deleted(data_dict)
                 if c:
                     print(f"[Stripe Webhook] subscription.deleted -> contract "
                           f"{c.get('reference')} cancelled", file=sys.stderr)
