@@ -77,6 +77,7 @@ ROUTERS = {
 
     # enrich
     "ice_lookup": "routers.enrich.ice_lookup",
+    "ice_brand_index": "routers.enrich.ice_brand_index",
     "go_upc": "routers.enrich.go_upc",
     "scale_lookup": "routers.enrich.scale_lookup",
 
