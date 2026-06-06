@@ -67,37 +67,49 @@ async def stripe_webhook(
             sig_header=stripe_signature,
             secret=STRIPE_WEBHOOK_SECRET
         )
-        print(f"[Stripe Webhook] Event parsed successfully: {event.get('type')}", file=sys.stderr)
+        print(f"[Stripe Webhook] Event parsed successfully: {event.type}", file=sys.stderr)
     except ValueError as e:
         print(f"[Stripe Webhook] Invalid payload: {e}", file=sys.stderr)
         raise HTTPException(status_code=400, detail="Invalid payload")
-    except stripe.error.SignatureVerificationError as e:
+    except stripe.SignatureVerificationError as e:
         print(f"[Stripe Webhook] Invalid Stripe signature: {e}", file=sys.stderr)
         raise HTTPException(status_code=400, detail="Invalid Stripe signature")
     except Exception as e:
-        print(f"[Stripe Webhook] Unexpected error during event parsing: {e}", file=sys.stderr)
+        import traceback
+        print(f"[Stripe Webhook] Unexpected error during event parsing: {e}\n{traceback.format_exc()}", file=sys.stderr)
         raise HTTPException(status_code=400, detail=f"Unexpected error: {e}")
 
-    event_type = event.get('type')
-    data = event['data']['object']
+    event_type = event.type
+    data = event.data.object
+
+    # stripe v5+ StripeObjects are not dicts — convert to plain dict for MongoDB
+    import json as _json
+    def _to_dict(obj):
+        try:
+            return _json.loads(str(obj))
+        except Exception:
+            return {}
+
+    data_dict = _to_dict(data)
+    event_dict = _to_dict(event)
 
     try:
         if event_type == "checkout.session.completed":
             record = {
                 "event_type": event_type,
-                "session": data,
-                "received_at": event.get("created"),
-                "stripe_event_id": event["id"],
-                "raw_event": event
+                "session": data_dict,
+                "received_at": event.created,
+                "stripe_event_id": event.id,
+                "raw_event": event_dict,
             }
             result = stripe_completed_collection.insert_one(record)
             print(f"[Stripe Webhook] Stored completed session in DB with _id: {result.inserted_id}", file=sys.stderr)
             # If we have customer details in the session, create or find the customer
-            cust_details = data.get("customer_details") or {}
+            cust_details = getattr(data, "customer_details", None)
             if cust_details and get_or_create_customer:
-                name = cust_details.get("name")
-                email = cust_details.get("email")
-                phone = cust_details.get("phone") or ""
+                name = getattr(cust_details, "name", None)
+                email = getattr(cust_details, "email", None)
+                phone = getattr(cust_details, "phone", None) or ""
 
                 # Create or get existing customer
                 try:
@@ -107,19 +119,17 @@ async def stripe_webhook(
                     print(f"[Stripe Webhook] Customer id: {customer_id} | existing: {existing}", file=sys.stderr)
 
                     # Build address object from session and store on customer document
-                    address = cust_details.get("address") or {}
+                    address = getattr(cust_details, "address", None)
                     if address:
-                        # Normalize address fields
                         addr_obj = {
-                            "line1": address.get("line1"),
-                            "line2": address.get("line2"),
-                            "city": address.get("city"),
-                            "state": address.get("state"),
-                            "postal_code": address.get("postal_code"),
-                            "country": address.get("country")
+                            "line1": getattr(address, "line1", None),
+                            "line2": getattr(address, "line2", None),
+                            "city": getattr(address, "city", None),
+                            "state": getattr(address, "state", None),
+                            "postal_code": getattr(address, "postal_code", None),
+                            "country": getattr(address, "country", None),
                         }
                         try:
-                            # Update by ObjectId (customer_id returned from helper)
                             customer_collection.update_one(
                                 {"_id": ObjectId(customer_id)},
                                 {"$set": {"address": addr_obj}}
@@ -139,7 +149,6 @@ async def stripe_webhook(
                     try:
                         contracts = create_contract(data, customer_id) if create_contract else []
                         for contract in contracts or []:
-                            # Keep a lightweight back-reference on the customer doc.
                             customer_collection.update_one(
                                 {"_id": ObjectId(customer_id)},
                                 {"$addToSet": {"contract_refs": {
@@ -155,7 +164,8 @@ async def stripe_webhook(
                         print(f"[Stripe Webhook] Failed to issue contract: {c_err}", file=sys.stderr)
                     # After customer exists/updated, attempt to pair customer to basket if metadata present
                     try:
-                        basket_id = data.get("metadata", {}).get("basket_id")
+                        metadata = getattr(data, "metadata", None)
+                        basket_id = getattr(metadata, "basket_id", None) if metadata else None
                         if basket_id and pair_customer:
                             try:
                                 pair_result = pair_customer(customer_id=customer_id, basket_id=basket_id)
@@ -168,16 +178,17 @@ async def stripe_webhook(
                     print(f"[Stripe Webhook] Customer creation error: {cust_exc}", file=sys.stderr)
         elif event_type == "invoice.paid" and contract_svc:
             # Monthly cover: activate on first invoice, renew on each cycle.
+            # A subscription can back many device contracts, so this affects all.
             try:
-                c = contract_svc.handle_invoice_paid(data, event.get("id"))
-                if c:
+                affected = contract_svc.handle_invoice_paid(data, event.id)
+                for c in affected or []:
                     print(f"[Stripe Webhook] invoice.paid -> contract {c.get('reference')} "
                           f"({c.get('status')})", file=sys.stderr)
             except Exception as inv_exc:
                 print(f"[Stripe Webhook] handle_invoice_paid failed: {inv_exc}", file=sys.stderr)
         elif event_type == "charge.refunded" and contract_svc:
             try:
-                c = contract_svc.handle_charge_refunded(data, event.get("id"))
+                c = contract_svc.handle_charge_refunded(data, event.id)
                 if c:
                     print(f"[Stripe Webhook] charge.refunded -> contract {c.get('reference')} "
                           f"({c.get('status')})", file=sys.stderr)

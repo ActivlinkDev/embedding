@@ -28,7 +28,9 @@ policies):
 * one child **`Contracts`** doc per basket item, each with its own device, offer, and
   item price.
 
-Idempotent: parent on `stripe_session_id`, children on a per-item `dedupe_key`.
+Idempotent: parent on `stripe_session_id`, children on a per-item `dedupe_key`,
+and subscription `invoice.paid` events on the **invoice id** (a retried/replayed
+invoice is a no-op, so the lifecycle never advances an extra term for one payment).
 One-off checkouts that arrive already paid activate immediately; monthly cover
 activates on the first paid invoice (see "Subscriptions" below).
 
@@ -134,7 +136,9 @@ default 12 months).
 ## Indexes (created on the live DB; re-run is idempotent)
 ```js
 // children
-db.Contracts.createIndex({ dedupe_key: 1 }, { unique: true, sparse: true })
+// partial (string-only) so renewals — which have no dedupe_key — don't collide on null
+db.Contracts.createIndex({ dedupe_key: 1 },
+  { unique: true, partialFilterExpression: { dedupe_key: { $type: "string" } } })
 db.Contracts.createIndex({ order_id: 1 })
 db.Contracts.createIndex({ customer_id: 1, created_at: -1 })
 db.Contracts.createIndex({ device_id: 1 })
