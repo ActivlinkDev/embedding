@@ -115,8 +115,17 @@ def mongo_vector_search(query_embedding, mongo_uri: str = None, db_name: str = "
                 "limit": 1,
             }
         }
+        project_stage = {
+            "$project": {
+                "category": 1,
+                "Category": 1,
+                "category_name": 1,
+                "embedding": 1,
+                "score": {"$meta": "vectorSearchScore"},
+            }
+        }
 
-        results = list(coll.aggregate([stage]))
+        results = list(coll.aggregate([stage, project_stage]))
         if not results:
             return None, 0.0
 
