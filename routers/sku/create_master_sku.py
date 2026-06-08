@@ -184,8 +184,9 @@ def extract_make_model_from_title(title: str, data: MasterSKURequest):
         from openai import OpenAI
         openai = OpenAI()
         prompt = f"Extract the brand (Make) and model number from this product title: '{title}'. Return as JSON with keys 'Make' and 'Model'."
+        scoring_model = os.getenv("OPENAI_SCORING_MODEL", "gpt-4o-mini")
         response = openai.chat.completions.create(
-            model="gpt-5-nano",
+            model=scoring_model,
             messages=[{"role": "user", "content": prompt}]
         )
         import json
@@ -406,7 +407,11 @@ def get_gtin_from_icecat(icecat_data: Optional[Dict], default_gtin: str):
     return [default_gtin]
 
 def compute_category_embedding(category_input: str):
-    embedding = embed_query(category_input)
+    try:
+        embedding = embed_query(category_input)
+    except Exception:
+        logger.exception("[compute_category_embedding] embed_query failed for input=%r", category_input)
+        return "Unknown", None, 0.0, []
 
     # First try MongoDB vector search (same approach as routers.match)
     try:
