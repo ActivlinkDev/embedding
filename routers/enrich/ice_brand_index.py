@@ -1,13 +1,27 @@
-import gzip
+"""
+ice_brand_index.py — Icecat batch lookup endpoint
+
+POST /ice/batch-lookup
+  Accepts a list of identifiers (GTINs and/or brand+productcode pairs) and fans
+  them out concurrently to the Icecat single-product API.  Returns a result for
+  every identifier — hit, miss, or error — so callers can see exactly what was
+  found without looping manually.
+
+Why not index-file based?
+  The Icecat bulk index XML download (freexml.int.gz) requires a Full Icecat
+  subscription.  Open Icecat accounts (e.g. plyford) only support individual
+  product lookups, so this endpoint maximises throughput by running all lookups
+  in parallel via asyncio/httpx.
+"""
+
+import asyncio
 import os
-import time
-import xml.etree.ElementTree as ET
-from io import BytesIO
 from typing import Optional
 
-import requests
+import httpx
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 
 from utils.dependencies import verify_token
 
@@ -16,86 +30,122 @@ load_dotenv()
 router = APIRouter(prefix="/ice", tags=["Enrichment"])
 
 ICECAT_USERNAME = os.getenv("ICECAT_USER", "")
-ICECAT_PASSWORD = os.getenv("ICECAT_PASS", "")
-
-# Icecat index: free tier (Open Icecat). For Full Icecat use xml_full.gz.
-INDEX_URL = "https://icecat.us/export/freexml.int.gz"
-
-# Simple in-process cache so repeated calls don't re-download the ~50MB index.
-_cache: dict = {"data": None, "fetched_at": 0}
-CACHE_TTL = 3600  # seconds — Icecat publishes a new index daily, 1h is fine
+BASE_URL = "https://live.icecat.biz/api/"
+MAX_CONCURRENT = 10          # stay polite to Icecat's servers
+REQUEST_TIMEOUT = 15.0       # seconds per individual lookup
 
 
-def _fetch_index() -> list[dict]:
-    """Download and parse the Icecat product index, returning a flat list of product dicts."""
-    now = time.time()
-    if _cache["data"] is not None and now - _cache["fetched_at"] < CACHE_TTL:
-        return _cache["data"]
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
 
-    auth = (ICECAT_USERNAME, ICECAT_PASSWORD) if ICECAT_PASSWORD else (ICECAT_USERNAME, ICECAT_USERNAME)
-    resp = requests.get(INDEX_URL, auth=auth, timeout=120, stream=True)
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Icecat index fetch failed: HTTP {resp.status_code}",
-        )
+class IcecatIdentifier(BaseModel):
+    gtin: Optional[str] = Field(None, description="GTIN / EAN / UPC")
+    brand: Optional[str] = Field(None, description="Brand name (required if no GTIN)")
+    productcode: Optional[str] = Field(None, description="Manufacturer product code (required if no GTIN)")
+    ref: Optional[str] = Field(None, description="Optional caller reference echoed back in the result")
 
-    raw = gzip.decompress(resp.content)
-    root = ET.fromstring(raw)
 
-    products = []
-    for file_el in root.iter("file"):
-        supplier = (file_el.findtext("Supplier") or "").strip()
-        prod_id = file_el.get("Product_id", "")
-        prod_name = file_el.get("Name", "")
-        prod_code = file_el.get("Prod_id", "")
-        ean = file_el.get("EAN_UPCS", "")
-        category = file_el.findtext("Category") or ""
-        updated = file_el.get("Updated", "")
+class BatchLookupRequest(BaseModel):
+    identifiers: list[IcecatIdentifier] = Field(..., min_items=1, max_items=200)
+    lang: str = Field("en", description="2-letter language code")
 
-        products.append(
-            {
-                "product_id": prod_id,
-                "name": prod_name,
-                "product_code": prod_code,
-                "ean": ean,
-                "supplier": supplier,
-                "category": category,
-                "updated": updated,
+
+# ---------------------------------------------------------------------------
+# Core lookup helper
+# ---------------------------------------------------------------------------
+
+async def _lookup_one(
+    client: httpx.AsyncClient,
+    ident: IcecatIdentifier,
+    lang: str,
+    semaphore: asyncio.Semaphore,
+) -> dict:
+    """Perform a single Icecat lookup and return a normalised result dict."""
+    async with semaphore:
+        base = f"{BASE_URL}?username={ICECAT_USERNAME}&lang={lang}"
+
+        # Prefer GTIN; fall back to brand + productcode
+        if ident.gtin:
+            url = f"{base}&GTIN={ident.gtin}"
+            tried = f"GTIN={ident.gtin}"
+        elif ident.brand and ident.productcode:
+            url = f"{base}&brand={ident.brand}&productcode={ident.productcode}"
+            tried = f"brand={ident.brand}&productcode={ident.productcode}"
+        else:
+            return {
+                "ref": ident.ref,
+                "status": "error",
+                "error": "Must supply gtin OR both brand and productcode",
+                "data": None,
             }
-        )
 
-    _cache["data"] = products
-    _cache["fetched_at"] = now
-    return products
+        try:
+            resp = await client.get(url, timeout=REQUEST_TIMEOUT)
+        except httpx.RequestError as exc:
+            return {
+                "ref": ident.ref,
+                "tried": tried,
+                "status": "error",
+                "error": str(exc),
+                "data": None,
+            }
+
+        if resp.status_code == 200:
+            return {
+                "ref": ident.ref,
+                "tried": tried,
+                "status": "found",
+                "error": None,
+                "data": resp.json(),
+            }
+
+        return {
+            "ref": ident.ref,
+            "tried": tried,
+            "status": "not_found",
+            "error": f"HTTP {resp.status_code}",
+            "data": None,
+        }
 
 
-@router.get("/brand-index", dependencies=[Depends(verify_token)])
-def brand_index(
-    brand: str = Query(..., description="Brand / manufacturer name (case-insensitive, partial match)"),
-    category: Optional[str] = Query(None, description="Optional category filter (case-insensitive, partial match)"),
-    limit: int = Query(500, ge=1, le=5000, description="Max products to return"),
-):
+# ---------------------------------------------------------------------------
+# Endpoint
+# ---------------------------------------------------------------------------
+
+@router.post("/batch-lookup", dependencies=[Depends(verify_token)])
+async def batch_lookup(body: BatchLookupRequest):
     """
-    Return all Icecat products for a brand from the full index XML.
-    Much faster than one-by-one SKU lookups for bulk ingestion.
-    The index is cached in-process for 1 hour.
+    Look up multiple products in Icecat concurrently.
+
+    Supply up to 200 identifiers per request — each can use a GTIN or a
+    brand + productcode pair.  An optional `ref` field is echoed back so you
+    can correlate results with your own records.
+
+    Returns one result object per identifier with:
+    - `status`: "found" | "not_found" | "error"
+    - `data`: full Icecat product sheet (when found)
+    - `error`: reason string (when not found or errored)
     """
-    all_products = _fetch_index()
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-    brand_lower = brand.lower()
-    cat_lower = category.lower() if category else None
+    async with httpx.AsyncClient() as client:
+        tasks = [
+            _lookup_one(client, ident, body.lang, semaphore)
+            for ident in body.identifiers
+        ]
+        results = await asyncio.gather(*tasks)
 
-    matches = [
-        p for p in all_products
-        if brand_lower in p["supplier"].lower()
-        and (cat_lower is None or cat_lower in p["category"].lower())
-    ]
+    found = sum(1 for r in results if r["status"] == "found")
+    not_found = sum(1 for r in results if r["status"] == "not_found")
+    errors = sum(1 for r in results if r["status"] == "error")
 
     return {
-        "brand": brand,
-        "category_filter": category,
-        "total_matched": len(matches),
-        "returned": min(len(matches), limit),
-        "products": matches[:limit],
+        "summary": {
+            "total": len(results),
+            "found": found,
+            "not_found": not_found,
+            "errors": errors,
+        },
+        "results": results,
     }
