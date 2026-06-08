@@ -143,6 +143,13 @@ def mongo_vector_search(query_embedding, mongo_uri: str = None, db_name: str = "
                     score = None
                 break
 
+        # Atlas normalizes cosine/dotProduct scores to [0, 1] via (1 + cosine) / 2.
+        # Convert back to the [-1, 1] cosine scale so callers can apply the existing
+        # cosine threshold (e.g. >= 0.49) without false positives: a true cosine of 0.0
+        # would otherwise appear as 0.5 and pass the gate for any unrelated top hit.
+        if score is not None:
+            score = 2.0 * score - 1.0
+
         # If no score provided but embedding present, compute cosine locally
         if score is None and isinstance(doc.get("embedding"), (list, tuple)):
             try:
