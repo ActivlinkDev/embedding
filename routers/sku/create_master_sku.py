@@ -1,6 +1,6 @@
 # master_sku_router.py
 
-from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import requests
@@ -479,7 +479,13 @@ def add_serp_match_flag(locale_block: Dict, model: str):
 # --- Main Endpoint ---
 
 @router.post("/create_master_sku")
-async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: Optional[bool] = False, _: None = Depends(verify_token)):
+def create_master_sku(
+    data: MasterSKURequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    addSERP: Optional[bool] = False,
+    _: None = Depends(verify_token),
+):
     # Validate
     if data.GTIN.strip() and not is_valid_gtin(data.GTIN):
         raise HTTPException(status_code=400, detail="Invalid GTIN format")
@@ -581,14 +587,11 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
         except Exception:
             pass
         updated["_id"] = str(updated["_id"])
-        # schedule background ScaleSERP lookup using Make+Model via asyncio.create_task with logging wrapper
+        # schedule background ScaleSERP lookup using Make+Model (runs after the response is sent)
         try:
-            logger.info(f"[bg_schedule] scheduling _run_and_log for masterSKUid={updated['_id']}")
-            t1 = asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(updated["_id"])))
-            t2 = asyncio.create_task(_probe_log(str(updated["_id"])))
-            logger.info(f"[bg_schedule] scheduled tasks t1={t1} t2={t2} for masterSKUid={updated['_id']}")
+            background_tasks.add_task(_run_and_log, f"{data.Make} {data.Model}", data.locale, str(updated["_id"]))
         except Exception:
-            logger.exception("Failed to create asyncio task for scale lookup (existing update)")
+            logger.exception("Failed to schedule scale lookup (existing update)")
 
         return {
             "source": "master-update",
@@ -699,65 +702,51 @@ async def create_master_sku(data: MasterSKURequest, request: Request, addSERP: O
     doc["match_key"] = match_key
 
     # Use an atomic upsert to avoid race-condition duplicate inserts.
+    saved = None
     try:
         update = {
             "$setOnInsert": doc,
             # Ensure GTIN array contains any gtins we discovered
-            "$addToSet": {"GTIN": {"$each": gtin_from_icecat}, "Locale_Specific_Data": locale_block}
+            "$addToSet": {"GTIN": {"$each": gtin_from_icecat}, "Locale_Specific_Data": locale_block},
         }
-        res = master_collection.find_one_and_update({"match_key": match_key}, update, upsert=True, return_document=ReturnDocument.AFTER)
-        # If the returned doc came from DB, ensure _id is a string
-        if res:
-            try:
-                res["_id"] = str(res["_id"])
-            except Exception:
-                pass
-                # schedule background ScaleSERP lookup for newly created/upserted MasterSKU
-                try:
-                    logger.info(f"[bg_schedule] scheduling _run_and_log for masterSKUid={res['_id']}")
-                    t1 = asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(res["_id"])))
-                    t2 = asyncio.create_task(_probe_log(str(res["_id"])))
-                    logger.info(f"[bg_schedule] scheduled tasks t1={t1} t2={t2} for masterSKUid={res['_id']}")
-                except Exception:
-                    logger.exception("Failed to create asyncio task for scale lookup (new upsert)")
-            return res
+        saved = master_collection.find_one_and_update(
+            {"match_key": match_key}, update, upsert=True, return_document=ReturnDocument.AFTER
+        )
     except errors.DuplicateKeyError:
         # Rare race: another process created the doc between our check and upsert. Fetch the existing doc.
-        existing_doc = master_collection.find_one({"match_key": match_key})
-        if existing_doc:
-            try:
-                existing_doc["_id"] = str(existing_doc["_id"])
-            except Exception:
-                pass
-                # schedule a background lookup for the found existing doc as well
-                try:
-                    logger.info(f"[bg_schedule] scheduling _run_and_log for masterSKUid={existing_doc['_id']}")
-                    t1 = asyncio.create_task(_run_and_log(f"{data.Make} {data.Model}", data.locale, str(existing_doc["_id"])))
-                    t2 = asyncio.create_task(_probe_log(str(existing_doc["_id"])))
-                    logger.info(f"[bg_schedule] scheduled tasks t1={t1} t2={t2} for masterSKUid={existing_doc['_id']}")
-                except Exception:
-                    logger.exception("Failed to create asyncio task for scale lookup (duplicate key handling)")
-                return existing_doc
+        saved = master_collection.find_one({"match_key": match_key})
     except Exception as e:
         # As a fallback, attempt a plain insert (so we don't fail hard for unexpected DB errors)
         try:
             result = master_collection.insert_one(doc)
-            doc["_id"] = str(result.inserted_id)
-            return doc
+            doc["_id"] = result.inserted_id
+            saved = doc
         except Exception:
             raise HTTPException(status_code=500, detail=f"Failed to create MasterSKU: {str(e)}")
 
+    if not saved:
+        raise HTTPException(status_code=500, detail="Failed to create MasterSKU")
 
-    @router.post("/debug_probe")
-    async def debug_probe(masterSKUid: str, _: None = Depends(verify_token)):
-        """Schedule a tiny probe task to verify background tasks run on the event loop.
-        Call this endpoint and watch the uvicorn logs for a [bg_probe] entry.
-        """
-        try:
-            logger.info(f"[debug_probe] scheduling probe for masterSKUid={masterSKUid}")
-            t = asyncio.create_task(_probe_log(masterSKUid))
-            logger.info(f"[debug_probe] scheduled probe task={t}")
-            return {"scheduled": True}
-        except Exception:
-            logger.exception("[debug_probe] failed to schedule probe")
-            raise HTTPException(status_code=500, detail="Failed to schedule probe")
+    saved["_id"] = str(saved["_id"])
+    # schedule background ScaleSERP lookup for the created/found MasterSKU (runs after response)
+    try:
+        background_tasks.add_task(_run_and_log, f"{data.Make} {data.Model}", data.locale, saved["_id"])
+    except Exception:
+        logger.exception("Failed to schedule scale lookup (create path)")
+
+    return saved
+
+
+@router.post("/debug_probe")
+async def debug_probe(masterSKUid: str, _: None = Depends(verify_token)):
+    """Schedule a tiny probe task to verify background tasks run on the event loop.
+    Call this endpoint and watch the uvicorn logs for a [bg_probe] entry.
+    """
+    try:
+        logger.info(f"[debug_probe] scheduling probe for masterSKUid={masterSKUid}")
+        t = asyncio.create_task(_probe_log(masterSKUid))
+        logger.info(f"[debug_probe] scheduled probe task={t}")
+        return {"scheduled": True}
+    except Exception:
+        logger.exception("[debug_probe] failed to schedule probe")
+        raise HTTPException(status_code=500, detail="Failed to schedule probe")

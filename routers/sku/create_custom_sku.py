@@ -1,28 +1,29 @@
 # create_custom_sku.py
 
-from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timezone
 import os
-import time
+import re
 
 from pymongo import MongoClient
 from bson import ObjectId
 from dotenv import load_dotenv
 
 from utils.dependencies import verify_token
-from .create_master_sku import create_master_sku, MasterSKURequest, _run_and_log
-import asyncio
+from .create_master_sku import create_master_sku, MasterSKURequest
 
-# QR code generation removed — previously generated PNG/base64 inline which blocked request path.
-# If QR images are required later, generate them asynchronously in a background worker and store
-# the result (or serve via a CDN) instead of generating synchronously during request handling.
+# NOTE: This endpoint runs as a synchronous `def` so FastAPI executes it in a
+# threadpool. That keeps its blocking work (pymongo + the inline MasterSKU
+# creation, which itself does blocking HTTP/DB calls) off the event loop.
+# Background SERP enrichment is scheduled inside create_master_sku via
+# BackgroundTasks, so this module no longer schedules anything itself.
 
 # ==== HELPERS ====
 
 def utc_now_iso() -> str:
-    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 def validate_mandatory_fields(data) -> List[str]:
     missing_fields = []
@@ -51,6 +52,21 @@ def build_identifiers(mastersku, sku: str) -> dict:
         "Model": mastersku.get("Model", ""),
         "SKU": sku
     }
+
+def master_query_for(data) -> Optional[dict]:
+    """Build the MasterSKU lookup query from GTIN (preferred) or Make+Model.
+
+    Make/Model are escaped so product codes containing regex metacharacters can't
+    break the query or match unintended documents.
+    """
+    if data.GTIN and data.GTIN.strip():
+        return {"GTIN": {"$in": [data.GTIN]}}
+    if data.Make and data.Model:
+        return {
+            "Make": {"$regex": f"^{re.escape(data.Make)}$", "$options": "i"},
+            "Model": {"$regex": re.escape(data.Model), "$options": "i"},
+        }
+    return None
 
 def build_locale_data(
     data, locale_details, locale_info, client_info, mastersku_locale=None
@@ -99,7 +115,6 @@ def build_locale_data(
     try:
         if mastersku_locale and isinstance(mastersku_locale, dict):
             lm = mastersku_locale.get("Locale_Matched_Category")
-            # Only include if present and non-empty
             d["Locale_Matched_Category"] = lm if lm not in (None, "") else None
         else:
             d["Locale_Matched_Category"] = None
@@ -125,8 +140,8 @@ def build_existing_query(client_name, data):
     make_model_cond = (
         {
             "Client": client_name,
-            "Identifiers.Make": {"$regex": f"^{data.Make}$", "$options": "i"},
-            "Identifiers.Model": {"$regex": f"^{data.Model}$", "$options": "i"},
+            "Identifiers.Make": {"$regex": f"^{re.escape(data.Make)}$", "$options": "i"},
+            "Identifiers.Model": {"$regex": f"^{re.escape(data.Model)}$", "$options": "i"},
             "Sources": {"$in": [data.Source]}
         }
         if data.Make and data.Model else None
@@ -135,15 +150,6 @@ def build_existing_query(client_name, data):
     if gtin_cond: or_conditions.append(gtin_cond)
     if make_model_cond: or_conditions.append(make_model_cond)
     return {"$or": or_conditions}
-
-def wait_for_mastersku(mastersku_collection, query, locale, timeout=7, poll_interval=0.7):
-    start_time = time.time()
-    while (time.time() - start_time) < timeout:
-        mastersku = mastersku_collection.find_one(query)
-        if mastersku and locale_exists(mastersku.get("Locale_Specific_Data", []), locale):
-            return mastersku
-        time.sleep(poll_interval)
-    return None
 
 # ==== END HELPERS ====
 
@@ -187,8 +193,57 @@ class CustomSKURequest(BaseModel):
     Global_Promotion: Optional[str] = None
     addSERP: Optional[bool] = False
 
+
+def ensure_master_with_locale(data, request, background_tasks):
+    """Return the MasterSKU document that contains data.Locale.
+
+    If a matching MasterSKU already has the locale, it's returned as-is.
+    Otherwise create_master_sku is invoked synchronously to create the
+    MasterSKU (or add the locale). Because that call commits its write before
+    returning, a single re-read is enough — no polling/sleep loop required.
+
+    Returns None only when there are no identifiers (GTIN or Make+Model) to
+    match on.
+    """
+    query = master_query_for(data)
+    if not query:
+        return None
+
+    master = mastersku_collection.find_one(query)
+    if master and locale_exists(master.get("Locale_Specific_Data", []), data.Locale):
+        return master
+
+    master_data = MasterSKURequest(
+        Make=data.Make or "",
+        Model=data.Model or "",
+        GTIN=data.GTIN or "",
+        locale=data.Locale,
+        Category=data.Category,
+    )
+    # Synchronous call — create_master_sku persists before returning and
+    # schedules its own background SERP enrichment via BackgroundTasks.
+    create_master_sku(
+        master_data,
+        request=request,
+        background_tasks=background_tasks,
+        addSERP=data.addSERP,
+    )
+    return mastersku_collection.find_one(query)
+
+
+def _serialize(doc):
+    if doc and "_id" in doc:
+        doc["_id"] = str(doc["_id"])
+    return doc
+
+
 @router.post("/create_custom_sku")
-async def create_custom_sku(data: CustomSKURequest, request: Request, _: None = Depends(verify_token)):
+def create_custom_sku(
+    data: CustomSKURequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    _: None = Depends(verify_token),
+):
     # 0. Validate inputs
     missing_fields = validate_mandatory_fields(data)
     if missing_fields:
@@ -208,269 +263,55 @@ async def create_custom_sku(data: CustomSKURequest, request: Request, _: None = 
         raise HTTPException(status_code=404, detail=f"ClientKey {data.ClientKey} not found.")
     client_name = client_info.get("Client_ID", "")
 
-    # 3. Check for existing CustomSKU (by any of SKU, GTIN, or Make+Model)
-    existing_query = build_existing_query(client_name, data)
-    existing = customsku_collection.find_one(existing_query)
+    # 3. Check for an existing CustomSKU (by SKU, GTIN, or Make+Model)
+    existing = customsku_collection.find_one(build_existing_query(client_name, data))
+
     if existing:
-        str_existing_id = str(existing["_id"])
-        locale_specific_data = existing.get("Locale_Specific_Data", [])
-        locale_match = locale_exists(locale_specific_data, data.Locale) if locale_specific_data else False
-
-        if locale_match:
-            existing["_id"] = str(existing["_id"])
-            # Refresh the document to return the stored value (QR generation removed)
-            persisted = customsku_collection.find_one({"_id": ObjectId(existing["_id"])})
-            if persisted:
-                persisted["_id"] = str(persisted["_id"])
-                return {
-                    "message": "SKU exists already for client and locale",
-                    "existing": persisted
-                }
-            else:
-                return {
-                    "message": "SKU exists already for client and locale",
-                    "existing": existing
-                }
-        else:
-            # Only add the locale to CustomSKU if MasterSKU has it, else trigger creation and poll
-            mastersku_query = None
-            if data.GTIN and data.GTIN.strip():
-                mastersku_query = {"GTIN": {"$in": [data.GTIN]}}
-            elif data.Make and data.Model:
-                mastersku_query = {
-                    "Make": {"$regex": f"^{data.Make}$", "$options": "i"},
-                    "Model": {"$regex": data.Model, "$options": "i"}
-                }
-            mastersku = mastersku_collection.find_one(mastersku_query) if mastersku_query else None
-            mastersku_locale_data = find_locale_data(
-                mastersku.get("Locale_Specific_Data", []), data.Locale
-            ) if mastersku else {}
-
-            if not mastersku_locale_data:
-                # Locale does not exist in MasterSKU, create and poll
-                master_data = MasterSKURequest(
-                    Make=data.Make,
-                    Model=data.Model,
-                    GTIN=data.GTIN,
-                    locale=data.Locale,
-                    Category=data.Category
-                )
-                res_master = await create_master_sku(master_data, addSERP=data.addSERP, request=request)
-                # Wait for the persisted MasterSKU to be available (poll) and then schedule
-                # the SERP enrichment using the persisted MasterSKU fields to ensure a
-                # non-empty query (avoid scheduling too early when fields may be missing).
-                mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
-                mastersku_locale_data = find_locale_data(
-                    mastersku.get("Locale_Specific_Data", []), data.Locale
-                ) if mastersku else {}
-                # Schedule background SERP enrichment now that we have the persisted MasterSKU
-                try:
-                    if mastersku and mastersku.get("_id"):
-                        try:
-                            m_make = (mastersku.get("Make") or data.Make or "").strip()
-                            m_model = (mastersku.get("Model") or data.Model or "").strip()
-                            query = " ".join([p for p in (m_make, m_model) if p]).strip() or (mastersku.get("Title") or f"{data.Make} {data.Model}")
-                            asyncio.create_task(_run_and_log(query, data.Locale, str(mastersku.get("_id"))))
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                if not mastersku_locale_data:
-                    return {
-                        "message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."
-                    }
-            # Locale exists in MasterSKU - proceed to add to CustomSKU
-            locale_details = data.Locale_Details or LocaleDetails()
-            locale_data = build_locale_data(
-                data, locale_details, locale_info, client_info, mastersku_locale=mastersku_locale_data
-            )
-            customsku_collection.update_one(
-                {"_id": existing["_id"]},
-                {"$push": {"Locale_Specific_Data": locale_data}}
-            )
-            updated_doc = customsku_collection.find_one({"_id": ObjectId(str_existing_id)})
-            if updated_doc:
-                updated_doc["_id"] = str(updated_doc["_id"])
-                # Refresh and return updated document (QR generation removed)
-                persisted = customsku_collection.find_one({"_id": ObjectId(str_existing_id)})
-                if persisted:
-                    persisted["_id"] = str(persisted["_id"])
-                    return {
-                        "message": "Locale added to existing CustomSKU",
-                        "customsku": persisted
-                    }
-                return {
-                    "message": "Locale added to existing CustomSKU",
-                    "customsku": updated_doc
-                }
-            else:
-                raise HTTPException(status_code=500, detail="Failed to retrieve updated CustomSKU document.")
-
-    # 4. If no CustomSKU exists, search MasterSKU by GTIN or Make/Model
-    mastersku_query = None
-    if data.GTIN and data.GTIN.strip():
-        mastersku_query = {"GTIN": {"$in": [data.GTIN]}}
-    elif data.Make and data.Model:
-        mastersku_query = {
-            "Make": {"$regex": f"^{data.Make}$", "$options": "i"},
-            "Model": {"$regex": data.Model, "$options": "i"}
-        }
-
-    if mastersku_query:
-        mastersku = mastersku_collection.find_one(mastersku_query)
-        if mastersku:
-            mastersku_id = str(mastersku["_id"])
-            mastersku["_id"] = mastersku_id
-            locale_found = locale_exists(mastersku.get("Locale_Specific_Data", []), data.Locale)
-            if locale_found:
-                identifiers = build_identifiers(mastersku, data.SKU)
-                locale_details = data.Locale_Details or LocaleDetails()
-                mastersku_locale_data = find_locale_data(
-                    mastersku.get("Locale_Specific_Data", []), data.Locale
-                )
-                locale_data = build_locale_data(
-                    data, locale_details, locale_info, client_info, mastersku_locale=mastersku_locale_data
-                )
-                # Set root Category: prefer input, else MasterSKU root, else ""
-                category_root = (
-                    data.Category if data.Category not in (None, "")
-                    else mastersku.get("Category", "")
-                )
-                doc = {
-                    "Client": client_name,
-                    "Client_Key": data.ClientKey,
-                    "Sources": [data.Source],
-                    "Identifiers": identifiers,
-                    "MasterSKU": mastersku_id,
-                    "Category": category_root,
-                    "Global_Promotion": data.Global_Promotion if getattr(data, 'Global_Promotion', None) is not None else None,
-                    "Locale_Specific_Data": [locale_data],
-                }
-                result = customsku_collection.insert_one(doc)
-                doc["_id"] = str(result.inserted_id)
-                # Refresh and return new persisted document (QR generation removed)
-                persisted = customsku_collection.find_one({"_id": ObjectId(doc['_id'])})
-                if persisted:
-                    persisted["_id"] = str(persisted["_id"])
-                    return persisted
-                return doc
-            else:
-                # Call master sku creation to add this locale, and poll
-                master_data = MasterSKURequest(
-                    Make=data.Make,
-                    Model=data.Model,
-                    GTIN=data.GTIN,
-                    locale=data.Locale,
-                    Category=data.Category
-                )
-                res_master = await create_master_sku(master_data, addSERP=data.addSERP, request=request)
-                mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
-                # Schedule background SERP enrichment once the persisted MasterSKU is available
-                try:
-                    if mastersku and mastersku.get("_id"):
-                        try:
-                            m_make = (mastersku.get("Make") or data.Make or "").strip()
-                            m_model = (mastersku.get("Model") or data.Model or "").strip()
-                            query = " ".join([p for p in (m_make, m_model) if p]).strip() or (mastersku.get("Title") or f"{data.Make} {data.Model}")
-                            asyncio.create_task(_run_and_log(query, data.Locale, str(mastersku.get("_id"))))
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                if not mastersku:
-                    return {
-                        "message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."
-                    }
-                # After polling, proceed to CustomSKU creation
-                mastersku_id = str(mastersku["_id"])
-                identifiers = build_identifiers(mastersku, data.SKU)
-                locale_details = data.Locale_Details or LocaleDetails()
-                mastersku_locale_data = find_locale_data(
-                    mastersku.get("Locale_Specific_Data", []), data.Locale
-                )
-                locale_data = build_locale_data(
-                    data, locale_details, locale_info, client_info, mastersku_locale=mastersku_locale_data
-                )
-                category_root = (
-                    data.Category if data.Category not in (None, "")
-                    else mastersku.get("Category", "")
-                )
-                doc = {
-                    "Client": client_name,
-                    "Client_Key": data.ClientKey,
-                    "Sources": [data.Source],
-                    "Identifiers": identifiers,
-                    "MasterSKU": mastersku_id,
-                    "Category": category_root,
-                    "Global_Promotion": data.Global_Promotion if getattr(data, 'Global_Promotion', None) is not None else None,
-                    "Locale_Specific_Data": [locale_data],
-                }
-                result = customsku_collection.insert_one(doc)
-                doc["_id"] = str(result.inserted_id)
-                persisted = customsku_collection.find_one({"_id": ObjectId(doc["_id"])})
-                if persisted:
-                    persisted["_id"] = str(persisted["_id"])
-                    return persisted
-                return doc
-        else:
-            # No master SKU found, create master SKU and poll
-            master_data = MasterSKURequest(
-                Make=data.Make,
-                Model=data.Model,
-                GTIN=data.GTIN,
-                locale=data.Locale,
-                Category=data.Category
-            )
-            res_master = await create_master_sku(master_data, addSERP=data.addSERP, request=request)
-            mastersku = wait_for_mastersku(mastersku_collection, mastersku_query, data.Locale)
-            # Schedule background SERP enrichment once the persisted MasterSKU is available
-            try:
-                if mastersku and mastersku.get("_id"):
-                    try:
-                        m_make = (mastersku.get("Make") or data.Make or "").strip()
-                        m_model = (mastersku.get("Model") or data.Model or "").strip()
-                        query = " ".join([p for p in (m_make, m_model) if p]).strip() or (mastersku.get("Title") or f"{data.Make} {data.Model}")
-                        asyncio.create_task(_run_and_log(query, data.Locale, str(mastersku.get("_id"))))
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            if not mastersku:
-                return {
-                    "message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."
-                }
-            # After polling, proceed to CustomSKU creation
-            mastersku_id = str(mastersku["_id"])
-            identifiers = build_identifiers(mastersku, data.SKU)
-            locale_details = data.Locale_Details or LocaleDetails()
-            mastersku_locale_data = find_locale_data(
-                mastersku.get("Locale_Specific_Data", []), data.Locale
-            )
-            locale_data = build_locale_data(
-                data, locale_details, locale_info, client_info, mastersku_locale=mastersku_locale_data
-            )
-            category_root = (
-                data.Category if data.Category not in (None, "")
-                else mastersku.get("Category", "")
-            )
-            doc = {
-                "Client": client_name,
-                "Client_Key": data.ClientKey,
-                "Sources": [data.Source],
-                "Identifiers": identifiers,
-                "MasterSKU": mastersku_id,
-                "Category": category_root,
-                "Global_Promotion": data.Global_Promotion if getattr(data, 'Global_Promotion', None) is not None else None,
-                "Locale_Specific_Data": [locale_data],
+        # 3a. Already has this locale — nothing to do.
+        if locale_exists(existing.get("Locale_Specific_Data", []), data.Locale):
+            return {
+                "message": "SKU exists already for client and locale",
+                "existing": _serialize(existing),
             }
-            result = customsku_collection.insert_one(doc)
-            doc["_id"] = str(result.inserted_id)
-            persisted = customsku_collection.find_one({"_id": ObjectId(doc['_id'] )})
-            if persisted:
-                persisted["_id"] = str(persisted["_id"])
-                return persisted
-            return doc
 
-    return {
-        "message": "No GTIN or Make/Model supplied for MasterSKU matching, unable to proceed."
+        # 3b. Ensure the MasterSKU carries this locale, then append it to the CustomSKU.
+        master = ensure_master_with_locale(data, request, background_tasks)
+        master_locale = find_locale_data(master.get("Locale_Specific_Data", []), data.Locale) if master else {}
+        if not master_locale:
+            return {"message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."}
+
+        locale_details = data.Locale_Details or LocaleDetails()
+        locale_data = build_locale_data(data, locale_details, locale_info, client_info, mastersku_locale=master_locale)
+        customsku_collection.update_one(
+            {"_id": existing["_id"]},
+            {"$push": {"Locale_Specific_Data": locale_data}},
+        )
+        persisted = customsku_collection.find_one({"_id": existing["_id"]})
+        return {"message": "Locale added to existing CustomSKU", "customsku": _serialize(persisted)}
+
+    # 4. No existing CustomSKU — ensure the MasterSKU exists, then create the CustomSKU.
+    master = ensure_master_with_locale(data, request, background_tasks)
+    if master is None:
+        return {"message": "No GTIN or Make/Model supplied for MasterSKU matching, unable to proceed."}
+
+    master_locale = find_locale_data(master.get("Locale_Specific_Data", []), data.Locale)
+    if not master_locale:
+        return {"message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."}
+
+    locale_details = data.Locale_Details or LocaleDetails()
+    locale_data = build_locale_data(data, locale_details, locale_info, client_info, mastersku_locale=master_locale)
+    category_root = data.Category if data.Category not in (None, "") else master.get("Category", "")
+
+    doc = {
+        "Client": client_name,
+        "Client_Key": data.ClientKey,
+        "Sources": [data.Source],
+        "Identifiers": build_identifiers(master, data.SKU),
+        "MasterSKU": str(master["_id"]),
+        "Category": category_root,
+        "Global_Promotion": data.Global_Promotion if data.Global_Promotion is not None else None,
+        "Locale_Specific_Data": [locale_data],
     }
+    result = customsku_collection.insert_one(doc)
+    persisted = customsku_collection.find_one({"_id": result.inserted_id})
+    return _serialize(persisted)
