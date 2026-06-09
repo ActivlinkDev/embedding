@@ -20,6 +20,7 @@ OPENAPI_TAGS = [
     {"name": "CMS", "description": "Content management integrations."},
     {"name": "Operations", "description": "Internal tools and maintenance utilities."},
     {"name": "QA", "description": "Quality assurance utilities."},
+    {"name": "Portal", "description": "Portal admin login and user management."},
 ]
 
 app = FastAPI(
@@ -120,6 +121,10 @@ ROUTERS = {
     "cms_display_offer": "routers.cms.cms_display_offer",
     "strapi_proxy": "routers.cms.strapi",
     "validate_customer": "routers.cms.validate_customer",
+    "cms_portal_admin": "routers.cms.cms_portal_admin",
+
+    # portal admin
+    "portal": "routers.portal",
 
     # email ingest 
     "email_ingest": "routers.email_ingest",
