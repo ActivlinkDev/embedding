@@ -1,18 +1,24 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 import os, hashlib, hmac, secrets, datetime
 from utils.dependencies import verify_token
 
 router = APIRouter(prefix="/portal", tags=["Portal"])
 
-_client = MongoClient(os.getenv("MONGO_URI"))
-_db = _client["Activlink"]
-_users = _db["PortalUser"]
-_keys = _db["ClientKey"]
+_mongo_uri = os.getenv("MONGO_URI")
+_client = MongoClient(_mongo_uri) if _mongo_uri else None
+_db = _client["Activlink"] if _client else None
+_users = _db["PortalUser"] if _db is not None else None
+_keys = _db["ClientKey"] if _db is not None else None
 
-# Ensure unique index on username
-_users.create_index("username", unique=True)
+# Best-effort index creation — failure here does not block the import.
+try:
+    if _users is not None:
+        _users.create_index("username", unique=True)
+except Exception as e:
+    print(f"[portal] Could not create PortalUser index (will retry on first write): {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -20,7 +26,6 @@ _users.create_index("username", unique=True)
 # ---------------------------------------------------------------------------
 
 def _hash_password(password: str) -> str:
-    """Return 'salt$hash' hex string."""
     salt = secrets.token_hex(16)
     h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 260_000)
     return f"{salt}${h.hex()}"
@@ -35,8 +40,14 @@ def _verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(h.hex(), expected)
 
 
-def _client_info(client_key: str) -> dict:
-    doc = _keys.find_one({"ClientKey": client_key}, {"Client_ID": 1, "Source": 1, "_id": 0})
+def _get_collections():
+    if _users is None or _keys is None:
+        raise HTTPException(status_code=503, detail="Database not configured")
+    return _users, _keys
+
+
+def _client_info(keys_col, client_key: str) -> dict:
+    doc = keys_col.find_one({"ClientKey": client_key}, {"Client_ID": 1, "Source": 1, "_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Client key not found")
     return {"clientId": doc.get("Client_ID", ""), "source": doc.get("Source", "")}
@@ -79,10 +90,11 @@ class CreateUserResponse(BaseModel):
 
 @router.post("/login", response_model=LoginResponse)
 def portal_login(body: LoginRequest, _: None = Depends(verify_token)):
-    user = _users.find_one({"username": body.username})
+    users_col, keys_col = _get_collections()
+    user = users_col.find_one({"username": body.username})
     if not user or not _verify_password(body.password, user.get("password_hash", "")):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    info = _client_info(user["client_key"])
+    info = _client_info(keys_col, user["client_key"])
     return LoginResponse(
         username=user["username"],
         clientKey=user["client_key"],
@@ -92,7 +104,8 @@ def portal_login(body: LoginRequest, _: None = Depends(verify_token)):
 
 @router.post("/users", response_model=CreateUserResponse)
 def create_portal_user(body: CreateUserRequest, _: None = Depends(verify_token)):
-    info = _client_info(body.clientKey)
+    users_col, keys_col = _get_collections()
+    info = _client_info(keys_col, body.clientKey)
     now = datetime.datetime.utcnow()
     doc = {
         "username": body.username,
@@ -104,9 +117,11 @@ def create_portal_user(body: CreateUserRequest, _: None = Depends(verify_token))
         "created_at": now,
     }
     try:
-        _users.insert_one(doc)
-    except Exception:
+        users_col.insert_one(doc)
+    except DuplicateKeyError:
         raise HTTPException(status_code=409, detail="Username already exists")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create user: {e}")
     return CreateUserResponse(
         username=body.username,
         clientKey=body.clientKey,
