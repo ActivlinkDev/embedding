@@ -1,13 +1,15 @@
 from fastapi import APIRouter, Query, HTTPException, Request
 import os
 import httpx
+from utils.locale import map_fastapi_to_strapi
 
 router = APIRouter(tags=["CMS"])
 
 STRAPI_BASE = os.getenv("STRAPI_BASE_URL")
 STRAPI_BEARER_TOKEN = os.getenv("STRAPI_BEARER_TOKEN")
 
-PORTAL_ADMIN_ROUTE = "api/portal-admins"
+# Route slug only — STRAPI_BASE_URL already contains the /api prefix.
+PORTAL_ADMIN_ROUTE = "portal-admins"
 
 
 @router.get("/cms_portal_admin")
@@ -19,8 +21,9 @@ async def cms_portal_admin(
     if not STRAPI_BASE:
         raise HTTPException(status_code=500, detail="STRAPI_BASE_URL not configured")
 
+    strapi_locale = map_fastapi_to_strapi(locale)
     upstream = f"{STRAPI_BASE.rstrip('/')}/{PORTAL_ADMIN_ROUTE}"
-    params = {"populate": "*", "locale": locale}
+    params = {"populate": "*", "locale": strapi_locale}
 
     headers = {}
     if STRAPI_BEARER_TOKEN:
@@ -38,9 +41,10 @@ async def cms_portal_admin(
 
     if resp.status_code >= 400:
         try:
-            return resp.json()
+            detail = resp.json()
         except Exception:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text[:1000])
+            detail = resp.text[:1000]
+        raise HTTPException(status_code=resp.status_code, detail=detail)
 
     try:
         return resp.json()
