@@ -13,12 +13,33 @@ _db = _client["Activlink"] if _client else None
 _users = _db["PortalUser"] if _db is not None else None
 _keys = _db["ClientKey"] if _db is not None else None
 
-# Best-effort index creation — failure here does not block the import.
+# Best-effort index creation at import time. If it fails (e.g. DB temporarily
+# unreachable), _index_ready stays False and _ensure_index() retries before
+# the first write so we never insert without the unique constraint in place.
+_index_ready = False
 try:
     if _users is not None:
         _users.create_index("username", unique=True)
+        _index_ready = True
 except Exception as e:
-    print(f"[portal] Could not create PortalUser index (will retry on first write): {e}")
+    print(f"[portal] Could not create PortalUser index at startup (will retry before first write): {e}")
+
+
+def _ensure_index() -> None:
+    """Guarantee the unique index exists before any write. Raises 503 if it cannot."""
+    global _index_ready
+    if _index_ready:
+        return
+    if _users is None:
+        return  # _get_collections() will raise 503 before we reach here
+    try:
+        _users.create_index("username", unique=True)
+        _index_ready = True
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Database index unavailable, cannot accept writes safely: {e}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +125,7 @@ def portal_login(body: LoginRequest, _: None = Depends(verify_token)):
 
 @router.post("/users", response_model=CreateUserResponse)
 def create_portal_user(body: CreateUserRequest, _: None = Depends(verify_token)):
+    _ensure_index()
     users_col, keys_col = _get_collections()
     info = _client_info(keys_col, body.clientKey)
     now = datetime.datetime.utcnow()
