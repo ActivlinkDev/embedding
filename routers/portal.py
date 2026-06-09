@@ -105,6 +105,11 @@ class CreateUserResponse(BaseModel):
     created_at: str
 
 
+class UpdateStylesRequest(BaseModel):
+    clientKey: str
+    styles: dict
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -121,6 +126,18 @@ def portal_login(body: LoginRequest, _: None = Depends(verify_token)):
         clientKey=user["client_key"],
         **info,
     )
+
+
+@router.put("/styles")
+def update_client_styles(body: UpdateStylesRequest, _: None = Depends(verify_token)):
+    _, keys_col = _get_collections()
+    result = keys_col.update_one(
+        {"ClientKey": body.clientKey},
+        {"$set": {"Styles": body.styles}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return {"ok": True, "message": "Styles updated successfully"}
 
 
 @router.post("/users", response_model=CreateUserResponse)
