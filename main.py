@@ -121,7 +121,6 @@ ROUTERS = {
     "cms_display_offer": "routers.cms.cms_display_offer",
     "strapi_proxy": "routers.cms.strapi",
     "validate_customer": "routers.cms.validate_customer",
-    "cms_portal_admin": "routers.cms.cms_portal_admin",
 
     # portal admin
     "portal": "routers.portal",
