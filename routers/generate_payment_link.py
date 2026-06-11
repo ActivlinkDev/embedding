@@ -174,7 +174,11 @@ def generate_checkout_session(request: CheckoutSessionRequest):
             "checkout_url_short": short_url,
             "session_id": session.id,
             "expires_at": session.expires_at,
-            "status": session.status
+            "status": session.status,
+            # Diagnostics: confirm what reached Stripe so prefill issues are visible
+            "customer": getattr(session, "customer", None),
+            "prefill_phone": customer_phone or None,
+            "prefill_email": str(request.customer_email) if request.customer_email else None,
         }
     except stripe.error.StripeError as se:
         raise HTTPException(status_code=400, detail=f"Stripe error: {se.user_message or str(se)}")
