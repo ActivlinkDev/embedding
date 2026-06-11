@@ -4,7 +4,10 @@ from typing import List, Optional, Dict
 from enum import Enum
 import stripe
 import os
+import logging
 import requests
+
+logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter(tags=["Payments"])
 
@@ -111,11 +114,20 @@ def _resolve_stripe_customer_id(email: Optional[str], phone: str) -> str:
             updates["email"] = email
         if updates:
             customer = stripe.Customer.modify(customer["id"], **updates)
+        logger.info(
+            "checkout prefill: reusing customer %s (phone=%s, email=%s)",
+            customer["id"], customer.get("phone"), customer.get("email"),
+        )
         return customer["id"]
     create_params = {"phone": phone}
     if email:
         create_params["email"] = email
-    return stripe.Customer.create(**create_params)["id"]
+    created = stripe.Customer.create(**create_params)
+    logger.info(
+        "checkout prefill: created customer %s (phone=%s, email=%s)",
+        created["id"], created.get("phone"), created.get("email"),
+    )
+    return created["id"]
 
 def shorten_with_tinyurl(long_url: str) -> str:
     headers = {
@@ -158,10 +170,18 @@ def generate_checkout_session(request: CheckoutSessionRequest):
                 session_params["customer"] = _resolve_stripe_customer_id(
                     request.customer_email, customer_phone
                 )
-            except stripe.error.StripeError:
+            except stripe.error.StripeError as ce:
                 # Don't block checkout if customer lookup/creation fails;
                 # fall back to plain email pre-fill below.
-                pass
+                logger.warning(
+                    "checkout prefill: customer resolution failed for phone=%s email=%s: %s",
+                    customer_phone, request.customer_email, ce,
+                )
+        else:
+            logger.info(
+                "checkout prefill: no phone received (email=%s, ref=%s)",
+                request.customer_email, request.internal_reference,
+            )
         # Stripe rejects sessions with both `customer` and `customer_email`
         if "customer" not in session_params and request.customer_email:
             session_params["customer_email"] = request.customer_email
@@ -174,7 +194,11 @@ def generate_checkout_session(request: CheckoutSessionRequest):
             "checkout_url_short": short_url,
             "session_id": session.id,
             "expires_at": session.expires_at,
-            "status": session.status
+            "status": session.status,
+            # Diagnostics: confirm what reached Stripe so prefill issues are visible
+            "customer": getattr(session, "customer", None),
+            "prefill_phone": customer_phone or None,
+            "prefill_email": str(request.customer_email) if request.customer_email else None,
         }
     except stripe.error.StripeError as se:
         raise HTTPException(status_code=400, detail=f"Stripe error: {se.user_message or str(se)}")
