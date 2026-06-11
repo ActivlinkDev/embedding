@@ -42,6 +42,15 @@ class CheckoutSessionRequest(BaseModel):
 
     # Customer / session details
     customer_email: Optional[EmailStr] = Field(default=None, example="customer@email.com")
+    customer_phone: Optional[str] = Field(
+        default=None,
+        example="+447700900123",
+        description=(
+            "E.164 phone number. Stripe Checkout can only pre-fill the phone field "
+            "from an existing Customer, so this creates/reuses a Stripe Customer "
+            "with the phone set and attaches it to the session."
+        ),
+    )
     allow_promotion_codes: bool = Field(default=False)
     success_url: str = Field(..., example="https://yourdomain.com/success")
     cancel_url: str = Field(..., example="https://yourdomain.com/cancel")
@@ -80,6 +89,34 @@ def build_line_items(request: CheckoutSessionRequest):
         "quantity": request.quantity
     }]
 
+def _resolve_stripe_customer_id(email: Optional[str], phone: str) -> str:
+    """Find or create a Stripe Customer carrying the phone so Checkout pre-fills it."""
+    customer = None
+    if email:
+        existing = stripe.Customer.list(email=email, limit=1)
+        if existing.data:
+            customer = existing.data[0]
+    if customer is None:
+        try:
+            found = stripe.Customer.search(query=f"phone:'{phone}'", limit=1)
+            if found.data:
+                customer = found.data[0]
+        except stripe.error.StripeError:
+            customer = None
+    if customer is not None:
+        updates = {}
+        if customer.get("phone") != phone:
+            updates["phone"] = phone
+        if email and customer.get("email") != email:
+            updates["email"] = email
+        if updates:
+            customer = stripe.Customer.modify(customer["id"], **updates)
+        return customer["id"]
+    create_params = {"phone": phone}
+    if email:
+        create_params["email"] = email
+    return stripe.Customer.create(**create_params)["id"]
+
 def shorten_with_tinyurl(long_url: str) -> str:
     headers = {
         "Authorization": f"Bearer {TINYURL_API_KEY}",
@@ -115,7 +152,18 @@ def generate_checkout_session(request: CheckoutSessionRequest):
             "metadata": {**(request.metadata or {}), "internal_reference": request.internal_reference},
             "locale": request.locale if request.locale else None
         }
-        if request.customer_email:
+        customer_phone = (request.customer_phone or "").strip()
+        if customer_phone:
+            try:
+                session_params["customer"] = _resolve_stripe_customer_id(
+                    request.customer_email, customer_phone
+                )
+            except stripe.error.StripeError:
+                # Don't block checkout if customer lookup/creation fails;
+                # fall back to plain email pre-fill below.
+                pass
+        # Stripe rejects sessions with both `customer` and `customer_email`
+        if "customer" not in session_params and request.customer_email:
             session_params["customer_email"] = request.customer_email
 
         session = stripe.checkout.Session.create(**session_params)
