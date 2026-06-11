@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import AliasChoices, BaseModel, Field, EmailStr
 from typing import Optional, Dict, Any, List
 from bson import ObjectId
 from pymongo import MongoClient
@@ -21,7 +21,16 @@ basket_collection = db["Basket_Quotes"]
 
 class BasketPaymentRequest(BaseModel):
     basket_id: str = Field(..., description="Basket_Quotes _id as string")
-    email: Optional[EmailStr] = Field(None, description="Customer email for Stripe session")
+    email: Optional[EmailStr] = Field(
+        None,
+        validation_alias=AliasChoices("email", "customerEmail"),
+        description="Customer email for Stripe session",
+    )
+    customer_phone: Optional[str] = Field(
+        None,
+        validation_alias=AliasChoices("customerPhone", "customer_phone", "phone"),
+        description="Validated customer phone (E.164) used to pre-fill the Stripe checkout phone field",
+    )
     product_name: Optional[str] = Field(None, description="Override product name for Stripe")
     product_description: Optional[str] = Field(None, description="Override product description for Stripe")
     product_images: Optional[List[str]] = Field(None, description="Override product images (URLs) for Stripe")
@@ -154,6 +163,7 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
             "source": _extract_source(items),
         },
         customer_email=req.email if req.email else None,
+        customer_phone=req.customer_phone if req.customer_phone else None,
     )
 
     # 5) Create session via shared helper
