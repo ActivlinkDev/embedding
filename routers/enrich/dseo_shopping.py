@@ -56,9 +56,9 @@ async def submit_dseo_shopping_task(masterSKUid: str, locale: str) -> dict:
 
     make = (sku_doc.get("Make") or "").strip()
     model = (sku_doc.get("Model") or "").strip()
+    if not model:
+        raise ValueError(f"MasterSKU {masterSKUid} has no Model — cannot submit a reliable search task")
     keyword = f"{make} {model}".strip()
-    if not keyword:
-        raise ValueError(f"MasterSKU {masterSKUid} has no Make/Model to build a keyword from")
 
     locale_doc = locale_collection.find_one({"locale": locale})
     if not locale_doc:
