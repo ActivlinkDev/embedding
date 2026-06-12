@@ -2,6 +2,7 @@ import gzip
 import json
 import os
 import sys
+import traceback
 import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, Request
@@ -148,6 +149,93 @@ def _process_task(task: dict) -> dict:
     return {"status": "ok", "master_sku_id": master_sku_id, "locale": locale, "title": item.get("title")}
 
 
+def _process_product_info_task(task: dict) -> dict:
+    """
+    Handle a product_info postback: extract the product_info_element from
+    result[0].items[0] and upsert it as an `extra_product_info` object into
+    the matching MasterSKU Locale_Specific_Data entry.
+    """
+    task_data = task.get("data") or {}
+    master_sku_id = task_data.get("tag")
+    location_code = task_data.get("location_code")
+    language_code = task_data.get("language_code", "en")
+
+    if not master_sku_id:
+        return {"status": "skipped", "reason": "no tag in task data"}
+
+    locale_doc = locale_collection.find_one({"location_code": location_code}) if location_code else None
+    locale = (locale_doc or {}).get("locale") or f"{language_code}_unknown"
+
+    try:
+        ms_id = ObjectId(master_sku_id)
+    except Exception:
+        return {"status": "error", "reason": f"invalid tag ObjectId: {master_sku_id}"}
+
+    results = task.get("result") or []
+    items = (results[0].get("items") or []) if results else []
+    if not items:
+        return {"status": "no_results", "master_sku_id": master_sku_id, "locale": locale}
+
+    item = items[0]
+
+    # Simplify sellers — keep only the fields needed for pricing display
+    raw_sellers = item.get("sellers") or []
+    sellers = [
+        {
+            "title": s.get("title"),
+            "url": s.get("url"),
+            "price": (s.get("price") or {}).get("current"),
+            "currency": (s.get("price") or {}).get("currency"),
+            "availability": s.get("product_availability"),
+            "delivery": (s.get("delivery_info") or {}).get("delivery_message"),
+        }
+        for s in raw_sellers
+    ]
+
+    # Convert specifications list to {name: value} dict for easy lookup
+    specs_dict = {
+        s["specification_name"]: s.get("specification_value")
+        for s in (item.get("specifications") or [])
+        if s.get("specification_name")
+    }
+
+    extra_product_info = {
+        "title": item.get("title"),
+        "description": item.get("description"),
+        "url": item.get("url"),
+        "images": item.get("images") or [],
+        "specifications": specs_dict,
+        "sellers": sellers,
+        "features": item.get("features"),
+        "rating": item.get("rating"),
+        "retrieved_at": _utc_now_iso(),
+    }
+
+    result = mastersku_collection.update_one(
+        {"_id": ms_id, "Locale_Specific_Data.locale": locale},
+        {"$set": {"Locale_Specific_Data.$.extra_product_info": extra_product_info}},
+    )
+    if result.matched_count == 0:
+        mastersku_collection.update_one(
+            {"_id": ms_id},
+            {"$push": {"Locale_Specific_Data": {"locale": locale, "extra_product_info": extra_product_info}}},
+        )
+
+    print(
+        f"[DSEO Webhook] Stored extra_product_info for MasterSKU {master_sku_id} locale={locale} "
+        f"title={item.get('title')!r} sellers={len(sellers)} specs={len(specs_dict)}",
+        file=sys.stderr,
+    )
+    return {
+        "status": "ok",
+        "master_sku_id": master_sku_id,
+        "locale": locale,
+        "title": item.get("title"),
+        "sellers": len(sellers),
+        "specs": len(specs_dict),
+    }
+
+
 async def _parse_body(request: Request) -> dict:
     """
     Read the raw request body and JSON-decode it, decompressing gzip first
@@ -164,12 +252,24 @@ async def _parse_body(request: Request) -> dict:
         return {}
 
 
+def _slim_payload(body: dict) -> dict:
+    """Return a trimmed copy of the body with items stripped from each result,
+    using shallow copies to avoid the cost of deep-copying large payloads."""
+    tasks_out = []
+    for task in body.get("tasks") or []:
+        results_out = []
+        for res in task.get("result") or []:
+            results_out.append({k: v for k, v in res.items() if k != "items"})
+        tasks_out.append({**task, "result": results_out})
+    return {**body, "tasks": tasks_out}
+
+
 @router.post("/webhook")
 async def dseo_webhook(request: Request):
     """
-    Receives DataforSEO postback callbacks for merchant/google/products tasks.
-    Handles gzip-compressed bodies, stores the raw payload, then maps the
-    best-matching item into MasterSKU Locale_Specific_Data.
+    Receives DataforSEO postback callbacks for merchant/google/products and
+    merchant/google/product_info tasks. Handles gzip-compressed bodies, stores
+    a trimmed payload, then dispatches to the correct handler.
     Always returns 200 so DataforSEO does not retry.
     """
     task_id = request.query_params.get("id")
@@ -178,27 +278,29 @@ async def dseo_webhook(request: Request):
 
     print(f"[DSEO Webhook] Received postback task_id={task_id}", file=sys.stderr)
 
-    # Persist raw payload first — processing errors must not lose the raw data
     processing_results = []
+
     record = {
         "task_id": task_id,
         "received_at": _utc_now_iso(),
-        "payload": body,
+        "payload": _slim_payload(body) if isinstance(body, dict) else body,
     }
     try:
         inserted = dseo_results_collection.insert_one(record)
-        print(f"[DSEO Webhook] Stored raw result _id={inserted.inserted_id}", file=sys.stderr)
+        print(f"[DSEO Webhook] Stored result _id={inserted.inserted_id}", file=sys.stderr)
     except Exception as e:
-        print(f"[DSEO Webhook] DB insert failed: {e}", file=sys.stderr)
+        print(f"[DSEO Webhook] DB insert failed: {e}\n{traceback.format_exc()}", file=sys.stderr)
 
-    # Process each task in the response
+    # Dispatch each task to the correct handler based on the DataforSEO function type
     tasks = (body.get("tasks") or []) if isinstance(body, dict) else []
     for task in tasks:
+        fn = (task.get("data") or {}).get("function", "")
+        handler = _process_product_info_task if fn == "product_info" else _process_task
         try:
-            outcome = _process_task(task)
+            outcome = handler(task)
             processing_results.append(outcome)
         except Exception as e:
-            print(f"[DSEO Webhook] Error processing task: {e}", file=sys.stderr)
+            print(f"[DSEO Webhook] Error processing task (function={fn!r}): {e}", file=sys.stderr)
             processing_results.append({"status": "error", "detail": str(e)})
 
     return JSONResponse(content={"status": "ok", "processed": processing_results}, status_code=200)

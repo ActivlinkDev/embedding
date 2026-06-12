@@ -81,6 +81,7 @@ ROUTERS = {
     "ice_brand_index": "routers.enrich.ice_brand_index",
     "go_upc": "routers.enrich.go_upc",
     "dseo_shopping": "routers.enrich.dseo_shopping",
+    "dseo_product_info": "routers.enrich.dseo_product_info",
     "dseo_webhook": "routers.enrich.dseo_webhook",
 
     # registration / assignment
