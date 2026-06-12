@@ -540,7 +540,15 @@ def create_master_sku(
     if not icecat_data:
         upc_data = fetch_upc(data.GTIN)
         if upc_data:
-            title = upc_data.get("product", {}).get("name") or title
+            upc_product = upc_data.get("product", {})
+            title = upc_product.get("name") or title
+            # Use UPC brand as Make when not already supplied
+            if not data.Make.strip():
+                data.Make = (upc_product.get("brand") or "").strip()
+            # Derive Model by stripping the brand from the title; AI extraction refines this if available
+            if not data.Model.strip():
+                candidate = title.replace(data.Make, "").strip(" -–") if data.Make else title
+                data.Model = candidate or title
             extract_make_model_from_title(title, data)
 
     # --- ROOT-LEVEL CATEGORY LOGIC FOR EMBEDDING ---
