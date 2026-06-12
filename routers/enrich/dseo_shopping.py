@@ -31,7 +31,7 @@ mastersku_collection = db["MasterSKU"]
 
 def _auth_header() -> str:
     if not DATAFORSEO_LOGIN or not DATAFORSEO_PASSWORD:
-        raise HTTPException(status_code=500, detail="Missing DATAFORSEO_LOGIN or DATAFORSEO_PASSWORD")
+        raise ValueError("Missing DATAFORSEO_LOGIN or DATAFORSEO_PASSWORD")
     token = base64.b64encode(f"{DATAFORSEO_LOGIN}:{DATAFORSEO_PASSWORD}".encode()).decode()
     return f"Basic {token}"
 
@@ -60,15 +60,19 @@ async def submit_dseo_shopping_task(masterSKUid: str, locale: str) -> dict:
     if not keyword:
         raise ValueError(f"MasterSKU {masterSKUid} has no Make/Model to build a keyword from")
 
-    locale_doc = locale_collection.find_one({"locale": locale}) or {}
+    locale_doc = locale_collection.find_one({"locale": locale})
+    if not locale_doc:
+        raise ValueError(f"Locale '{locale}' not found in Locale_Params — cannot resolve location_code or google_domain")
+
     google_domain = locale_doc.get("google_domain") or "google.co.uk"
     location_code = locale_doc.get("location_code") or 2826
+    language_code = locale_doc.get("hl") or "en"
 
     postback_url = f"{DSEO_WEBHOOK_BASE_URL}/dseo/webhook?id=$id"
 
     payload = [
         {
-            "language_code": "en",
+            "language_code": language_code,
             "location_code": location_code,
             "keyword": keyword,
             "price_min": 5,
@@ -111,8 +115,12 @@ async def create_dseo_shopping_task(
     try:
         result = await submit_dseo_shopping_task(masterSKUid, locale)
     except ValueError as e:
-        status = 400 if "Invalid masterSKUid" in str(e) or "no Make/Model" in str(e) else 500
-        raise HTTPException(status_code=status, detail=str(e))
+        msg = str(e)
+        if "not found" in msg:
+            raise HTTPException(status_code=404, detail=msg)
+        if "Invalid masterSKUid" in msg or "no Make/Model" in msg:
+            raise HTTPException(status_code=400, detail=msg)
+        raise HTTPException(status_code=500, detail=msg)
     except httpx.HTTPStatusError as e:
         logger.error("[dseo_shopping] DataforSEO HTTP error: %s", e)
         raise HTTPException(status_code=502, detail=f"DataforSEO error: {e.response.status_code}")

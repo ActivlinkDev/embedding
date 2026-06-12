@@ -55,11 +55,14 @@ def _flatten_items(items: list) -> list:
 
 
 def _find_matching_item(items: list, model: str) -> dict | None:
-    """Return the first item whose title contains the normalised model string."""
+    """Return the first item whose title contains the normalised model string.
+    Returns None if model is empty — avoids enriching incomplete SKUs with an
+    arbitrary first result (consistent with the previous ScaleSERP behaviour).
+    """
     flat = _flatten_items(items)
     norm_model = _normalize(model)
     if not norm_model:
-        return flat[0] if flat else None
+        return None
     for item in flat:
         if norm_model in _normalize(item.get("title") or ""):
             return item
