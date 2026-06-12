@@ -1,3 +1,5 @@
+import gzip
+import json
 import os
 import sys
 import logging
@@ -20,6 +22,13 @@ dseo_results_collection = db["DSEO_Results"]
 mastersku_collection = db["MasterSKU"]
 locale_collection = db["Locale_Params"]
 
+# Item types that wrap child items rather than carry pricing directly.
+_CAROUSEL_TYPES = {
+    "google_shopping_serp_carousel_element",
+    "google_shopping_paid_carousel_element",
+    "google_shopping_price_comparison_carousel_element",
+}
+
 
 def _utc_now_iso() -> str:
     return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -29,12 +38,29 @@ def _normalize(s: str) -> str:
     return "".join(c for c in s.lower() if c.isalnum())
 
 
+def _flatten_items(items: list) -> list:
+    """
+    Expand carousel wrapper items into their children so that nested results
+    (which carry the real seller/price/shopping_url fields) are searchable.
+    Non-carousel items are kept as-is.
+    """
+    flat = []
+    for item in items:
+        if item.get("type") in _CAROUSEL_TYPES:
+            nested = item.get("items") or []
+            flat.extend(nested)
+        else:
+            flat.append(item)
+    return flat
+
+
 def _find_matching_item(items: list, model: str) -> dict | None:
     """Return the first item whose title contains the normalised model string."""
+    flat = _flatten_items(items)
     norm_model = _normalize(model)
     if not norm_model:
-        return items[0] if items else None
-    for item in items:
+        return flat[0] if flat else None
+    for item in flat:
         if norm_model in _normalize(item.get("title") or ""):
             return item
     return None
@@ -119,21 +145,33 @@ def _process_task(task: dict) -> dict:
     return {"status": "ok", "master_sku_id": master_sku_id, "locale": locale, "title": item.get("title")}
 
 
+async def _parse_body(request: Request) -> dict:
+    """
+    Read the raw request body and JSON-decode it, decompressing gzip first
+    when DataforSEO sends a Content-Encoding: gzip postback.
+    """
+    raw = await request.body()
+    encoding = request.headers.get("content-encoding", "").lower()
+    try:
+        if encoding == "gzip":
+            raw = gzip.decompress(raw)
+        return json.loads(raw)
+    except Exception as e:
+        print(f"[DSEO Webhook] Failed to parse body (encoding={encoding!r}): {e}", file=sys.stderr)
+        return {}
+
+
 @router.post("/webhook")
 async def dseo_webhook(request: Request):
     """
     Receives DataforSEO postback callbacks for merchant/google/products tasks.
-    Stores the raw payload then maps the best-matching item into MasterSKU
-    Locale_Specific_Data using the task tag (masterSKUid) and location_code.
+    Handles gzip-compressed bodies, stores the raw payload, then maps the
+    best-matching item into MasterSKU Locale_Specific_Data.
     Always returns 200 so DataforSEO does not retry.
     """
     task_id = request.query_params.get("id")
 
-    try:
-        body = await request.json()
-    except Exception as e:
-        print(f"[DSEO Webhook] Failed to parse JSON body: {e}", file=sys.stderr)
-        body = {}
+    body = await _parse_body(request)
 
     print(f"[DSEO Webhook] Received postback task_id={task_id}", file=sys.stderr)
 
