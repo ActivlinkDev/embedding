@@ -419,6 +419,7 @@ def create_master_sku(
     data: MasterSKURequest,
     request: Request,
     background_tasks: BackgroundTasks,
+    add_pricing: Optional[bool] = False,
     _: None = Depends(verify_token),
 ):
     # Validate
@@ -507,10 +508,11 @@ def create_master_sku(
         updated = update_existing_sku(existing, data, locale_block)
         updated["_id"] = str(updated["_id"])
         # schedule background DataforSEO task (runs after the response is sent)
-        try:
-            background_tasks.add_task(_run_dseo_task, data.locale, str(updated["_id"]))
-        except Exception:
-            logger.exception("Failed to schedule DataforSEO task (existing update)")
+        if add_pricing:
+            try:
+                background_tasks.add_task(_run_dseo_task, data.locale, str(updated["_id"]))
+            except Exception:
+                logger.exception("Failed to schedule DataforSEO task (existing update)")
 
         return {
             "source": "master-update",
@@ -641,10 +643,11 @@ def create_master_sku(
 
     saved["_id"] = str(saved["_id"])
     # schedule background DataforSEO task for the created/found MasterSKU (runs after response)
-    try:
-        background_tasks.add_task(_run_dseo_task, data.locale, saved["_id"])
-    except Exception:
-        logger.exception("Failed to schedule DataforSEO task (create path)")
+    if add_pricing:
+        try:
+            background_tasks.add_task(_run_dseo_task, data.locale, saved["_id"])
+        except Exception:
+            logger.exception("Failed to schedule DataforSEO task (create path)")
 
     return saved
 
