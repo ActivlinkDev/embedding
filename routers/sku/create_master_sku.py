@@ -294,10 +294,15 @@ def update_existing_sku(existing: Dict, data: MasterSKURequest, locale_block: Di
 
 def get_category_for_embedding(data: MasterSKURequest, icecat_data: Optional[Dict], upc_data: Optional[Dict]) -> str:
     """Determine final category for embedding/matching/root, from all sources."""
+    upc_category = upc_data.get("product", {}).get("category") if upc_data else None
+    upc_name = upc_data.get("product", {}).get("name") if upc_data else None
+    upc_description = upc_data.get("product", {}).get("description") if upc_data else None
+    # Use name as fallback when category is missing — gives embedding enough signal
+    upc_text = upc_category or upc_name or upc_description
     return (
         data.Category
         or (icecat_data.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value") if icecat_data else None)
-        or (upc_data.get("product", {}).get("category") if upc_data else None)
+        or upc_text
         or "Unknown"
     )
 
