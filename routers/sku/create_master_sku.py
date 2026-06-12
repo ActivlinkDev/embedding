@@ -179,23 +179,35 @@ def extract_make_model_from_title(title: str, data: MasterSKURequest):
     """Use OpenAI to extract Make and Model if missing."""
     if data.Make.strip() and data.Model.strip():
         return
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        logger.debug("[extract_make_model] OPENAI_API_KEY not set — skipping AI extraction")
+        return
     try:
+        import json, re
         from openai import OpenAI
-        openai = OpenAI()
-        prompt = f"Extract the brand (Make) and model number from this product title: '{title}'. Return as JSON with keys 'Make' and 'Model'."
+        openai_client = OpenAI(api_key=api_key)
         scoring_model = os.getenv("OPENAI_SCORING_MODEL", "gpt-4o-mini")
-        response = openai.chat.completions.create(
-            model=scoring_model,
-            messages=[{"role": "user", "content": prompt}]
+        prompt = (
+            f"Extract the brand (Make) and model number/name from this product title: '{title}'. "
+            "Return only a JSON object with keys 'Make' and 'Model', no markdown, no explanation."
         )
-        import json
-        parsed = json.loads(response.choices[0].message.content)
+        response = openai_client.chat.completions.create(
+            model=scoring_model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.choices[0].message.content or ""
+        # Strip markdown code fences if present
+        raw = re.sub(r"^```[a-z]*\s*", "", raw.strip(), flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw.strip())
+        parsed = json.loads(raw)
         if not data.Make.strip():
             data.Make = parsed.get("Make", "").strip()
         if not data.Model.strip():
             data.Model = parsed.get("Model", "").strip()
+        logger.info("[extract_make_model] AI extracted Make=%r Model=%r from title=%r", data.Make, data.Model, title)
     except Exception as e:
-        logger.exception("[GPT extraction error] %s", e)
+        logger.warning("[extract_make_model] AI extraction failed: %s", e)
 
 def extract_multimedia_urls(icecat_data: dict) -> dict:
     """
