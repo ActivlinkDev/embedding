@@ -146,7 +146,13 @@ def _process_task(task: dict) -> dict:
         f"title={item.get('title')!r} price={item.get('price')} {item.get('currency')}",
         file=sys.stderr,
     )
-    return {"status": "ok", "master_sku_id": master_sku_id, "locale": locale, "title": item.get("title")}
+    return {
+        "status": "ok",
+        "master_sku_id": master_sku_id,
+        "locale": locale,
+        "title": item.get("title"),
+        "product_id": item.get("product_id"),
+    }
 
 
 def _process_product_info_task(task: dict) -> dict:
@@ -302,5 +308,24 @@ async def dseo_webhook(request: Request):
         except Exception as e:
             print(f"[DSEO Webhook] Error processing task (function={fn!r}): {e}", file=sys.stderr)
             processing_results.append({"status": "error", "detail": str(e)})
+            continue
+
+        # After a successful shopping task, auto-submit product_info if Product_ID was found
+        if fn != "product_info" and outcome.get("status") == "ok" and outcome.get("product_id"):
+            try:
+                from routers.enrich.dseo_product_info import submit_dseo_product_info_task
+            except Exception:
+                from enrich.dseo_product_info import submit_dseo_product_info_task
+            import asyncio
+            asyncio.create_task(
+                submit_dseo_product_info_task(
+                    masterSKUid=outcome["master_sku_id"],
+                    locale=outcome["locale"],
+                )
+            )
+            print(
+                f"[DSEO Webhook] Scheduled product_info task for MasterSKU {outcome['master_sku_id']} locale={outcome['locale']}",
+                file=sys.stderr,
+            )
 
     return JSONResponse(content={"status": "ok", "processed": processing_results}, status_code=200)

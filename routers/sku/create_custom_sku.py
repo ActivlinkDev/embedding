@@ -12,7 +12,7 @@ from bson import ObjectId
 from dotenv import load_dotenv
 
 from utils.dependencies import verify_token
-from .create_master_sku import create_master_sku, MasterSKURequest
+from .create_master_sku import create_master_sku, MasterSKURequest, _run_dseo_task
 
 # NOTE: This endpoint runs as a synchronous `def` so FastAPI executes it in a
 # threadpool. That keeps its blocking work (pymongo + the inline MasterSKU
@@ -191,7 +191,7 @@ class CustomSKURequest(BaseModel):
     Category: Optional[str] = ""
     Locale_Details: Optional[LocaleDetails] = None
     Global_Promotion: Optional[str] = None
-    add_pricing: Optional[bool] = False
+    add_pricing: Optional[bool] = True
 
 
 def ensure_master_with_locale(data, request, background_tasks):
@@ -211,6 +211,9 @@ def ensure_master_with_locale(data, request, background_tasks):
 
     master = mastersku_collection.find_one(query)
     if master and locale_exists(master.get("Locale_Specific_Data", []), data.Locale):
+        # MasterSKU already has this locale — still fire DSEO pricing if requested
+        if data.add_pricing:
+            background_tasks.add_task(_run_dseo_task, data.Locale, str(master["_id"]))
         return master
 
     master_data = MasterSKURequest(
