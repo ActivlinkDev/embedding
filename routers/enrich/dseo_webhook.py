@@ -2,6 +2,7 @@ import gzip
 import json
 import os
 import sys
+import traceback
 import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, Request
@@ -178,18 +179,30 @@ async def dseo_webhook(request: Request):
 
     print(f"[DSEO Webhook] Received postback task_id={task_id}", file=sys.stderr)
 
-    # Persist raw payload first — processing errors must not lose the raw data
+    # Persist a trimmed payload — strip items arrays to avoid hitting the 16MB
+    # document limit (xpath strings alone can be very large for 20+ results).
+    # The matched item fields are already written to MasterSKU by _process_task.
     processing_results = []
+
+    def _slim_payload(b: dict) -> dict:
+        """Return a copy of the body with items stripped from each result."""
+        import copy
+        b2 = copy.deepcopy(b)
+        for task in b2.get("tasks") or []:
+            for result in task.get("result") or []:
+                result.pop("items", None)
+        return b2
+
     record = {
         "task_id": task_id,
         "received_at": _utc_now_iso(),
-        "payload": body,
+        "payload": _slim_payload(body) if isinstance(body, dict) else body,
     }
     try:
         inserted = dseo_results_collection.insert_one(record)
-        print(f"[DSEO Webhook] Stored raw result _id={inserted.inserted_id}", file=sys.stderr)
+        print(f"[DSEO Webhook] Stored result _id={inserted.inserted_id}", file=sys.stderr)
     except Exception as e:
-        print(f"[DSEO Webhook] DB insert failed: {e}", file=sys.stderr)
+        print(f"[DSEO Webhook] DB insert failed: {e}\n{traceback.format_exc()}", file=sys.stderr)
 
     # Process each task in the response
     tasks = (body.get("tasks") or []) if isinstance(body, dict) else []
