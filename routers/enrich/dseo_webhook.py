@@ -152,8 +152,8 @@ def _process_task(task: dict) -> dict:
 def _process_product_info_task(task: dict) -> dict:
     """
     Handle a product_info postback: extract the product_info_element from
-    result[0].items[0] and upsert it as a `product_info` object into the
-    matching MasterSKU Locale_Specific_Data entry.
+    result[0].items[0] and upsert it as an `extra_product_info` object into
+    the matching MasterSKU Locale_Specific_Data entry.
     """
     task_data = task.get("data") or {}
     master_sku_id = task_data.get("tag")
@@ -194,12 +194,12 @@ def _process_product_info_task(task: dict) -> dict:
 
     # Convert specifications list to {name: value} dict for easy lookup
     specs_dict = {
-        s["specification_name"]: s["specification_value"]
+        s["specification_name"]: s.get("specification_value")
         for s in (item.get("specifications") or [])
         if s.get("specification_name")
     }
 
-    product_info = {
+    extra_product_info = {
         "title": item.get("title"),
         "description": item.get("description"),
         "url": item.get("url"),
@@ -213,16 +213,16 @@ def _process_product_info_task(task: dict) -> dict:
 
     result = mastersku_collection.update_one(
         {"_id": ms_id, "Locale_Specific_Data.locale": locale},
-        {"$set": {"Locale_Specific_Data.$.extra_product_info": product_info}},
+        {"$set": {"Locale_Specific_Data.$.extra_product_info": extra_product_info}},
     )
     if result.matched_count == 0:
         mastersku_collection.update_one(
             {"_id": ms_id},
-            {"$push": {"Locale_Specific_Data": {"locale": locale, "extra_product_info": product_info}}},
+            {"$push": {"Locale_Specific_Data": {"locale": locale, "extra_product_info": extra_product_info}}},
         )
 
     print(
-        f"[DSEO Webhook] Stored product_info for MasterSKU {master_sku_id} locale={locale} "
+        f"[DSEO Webhook] Stored extra_product_info for MasterSKU {master_sku_id} locale={locale} "
         f"title={item.get('title')!r} sellers={len(sellers)} specs={len(specs_dict)}",
         file=sys.stderr,
     )
@@ -236,7 +236,7 @@ def _process_product_info_task(task: dict) -> dict:
     }
 
 
-
+async def _parse_body(request: Request) -> dict:
     """
     Read the raw request body and JSON-decode it, decompressing gzip first
     when DataforSEO sends a Content-Encoding: gzip postback.
@@ -252,12 +252,24 @@ def _process_product_info_task(task: dict) -> dict:
         return {}
 
 
+def _slim_payload(body: dict) -> dict:
+    """Return a trimmed copy of the body with items stripped from each result,
+    using shallow copies to avoid the cost of deep-copying large payloads."""
+    tasks_out = []
+    for task in body.get("tasks") or []:
+        results_out = []
+        for res in task.get("result") or []:
+            results_out.append({k: v for k, v in res.items() if k != "items"})
+        tasks_out.append({**task, "result": results_out})
+    return {**body, "tasks": tasks_out}
+
+
 @router.post("/webhook")
 async def dseo_webhook(request: Request):
     """
-    Receives DataforSEO postback callbacks for merchant/google/products tasks.
-    Handles gzip-compressed bodies, stores the raw payload, then maps the
-    best-matching item into MasterSKU Locale_Specific_Data.
+    Receives DataforSEO postback callbacks for merchant/google/products and
+    merchant/google/product_info tasks. Handles gzip-compressed bodies, stores
+    a trimmed payload, then dispatches to the correct handler.
     Always returns 200 so DataforSEO does not retry.
     """
     task_id = request.query_params.get("id")
@@ -266,19 +278,7 @@ async def dseo_webhook(request: Request):
 
     print(f"[DSEO Webhook] Received postback task_id={task_id}", file=sys.stderr)
 
-    # Persist a trimmed payload — strip items arrays to avoid hitting the 16MB
-    # document limit (xpath strings alone can be very large for 20+ results).
-    # The matched item fields are already written to MasterSKU by _process_task.
     processing_results = []
-
-    def _slim_payload(b: dict) -> dict:
-        """Return a copy of the body with items stripped from each result."""
-        import copy
-        b2 = copy.deepcopy(b)
-        for task in b2.get("tasks") or []:
-            for result in task.get("result") or []:
-                result.pop("items", None)
-        return b2
 
     record = {
         "task_id": task_id,
