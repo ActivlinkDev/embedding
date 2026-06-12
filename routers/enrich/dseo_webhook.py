@@ -213,12 +213,12 @@ def _process_product_info_task(task: dict) -> dict:
 
     result = mastersku_collection.update_one(
         {"_id": ms_id, "Locale_Specific_Data.locale": locale},
-        {"$set": {"Locale_Specific_Data.$.product_info": product_info}},
+        {"$set": {"Locale_Specific_Data.$.extra_product_info": product_info}},
     )
     if result.matched_count == 0:
         mastersku_collection.update_one(
             {"_id": ms_id},
-            {"$push": {"Locale_Specific_Data": {"locale": locale, "product_info": product_info}}},
+            {"$push": {"Locale_Specific_Data": {"locale": locale, "extra_product_info": product_info}}},
         )
 
     print(
