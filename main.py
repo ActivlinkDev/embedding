@@ -80,7 +80,8 @@ ROUTERS = {
     "ice_lookup": "routers.enrich.ice_lookup",
     "ice_brand_index": "routers.enrich.ice_brand_index",
     "go_upc": "routers.enrich.go_upc",
-    "scale_lookup": "routers.enrich.scale_lookup",
+    "dseo_shopping": "routers.enrich.dseo_shopping",
+    "dseo_webhook": "routers.enrich.dseo_webhook",
 
     # registration / assignment
     "embedded_register_device": "routers.embedded_register_device",
