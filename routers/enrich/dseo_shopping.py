@@ -36,35 +36,30 @@ def _auth_header() -> str:
     return f"Basic {token}"
 
 
-@router.post("/shopping", dependencies=[Depends(verify_token)])
-async def create_dseo_shopping_task(
-    masterSKUid: str = Query(..., description="MasterSKU ObjectId — used as tag and to build the search keyword"),
-    locale: str = Query("en_GB", description="Locale code used to resolve google_domain and location_code"),
-):
+async def submit_dseo_shopping_task(masterSKUid: str, locale: str) -> dict:
     """
-    Submit a DataforSEO merchant/google/products task for the given MasterSKU.
-    The postback_url is set to this service's /dseo/webhook endpoint so the
-    result is delivered asynchronously once DataforSEO completes the task.
+    Core logic — submit a DataforSEO merchant/google/products task for the given
+    MasterSKU.  Returns the raw DataforSEO JSON response dict.
+    Raises ValueError for configuration/validation problems and httpx errors for
+    network/API failures so callers can handle them appropriately.
     """
     if not DSEO_WEBHOOK_BASE_URL:
-        raise HTTPException(status_code=500, detail="DSEO_WEBHOOK_BASE_URL is not configured")
+        raise ValueError("DSEO_WEBHOOK_BASE_URL is not configured")
 
-    # Resolve MasterSKU document to build keyword
     try:
         sku_doc = mastersku_collection.find_one({"_id": ObjectId(masterSKUid)})
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid masterSKUid format")
+        raise ValueError(f"Invalid masterSKUid format: {masterSKUid!r}")
 
     if not sku_doc:
-        raise HTTPException(status_code=404, detail=f"MasterSKU '{masterSKUid}' not found")
+        raise ValueError(f"MasterSKU '{masterSKUid}' not found")
 
     make = (sku_doc.get("Make") or "").strip()
     model = (sku_doc.get("Model") or "").strip()
     keyword = f"{make} {model}".strip()
     if not keyword:
-        raise HTTPException(status_code=422, detail="MasterSKU has no Make/Model to build a keyword from")
+        raise ValueError(f"MasterSKU {masterSKUid} has no Make/Model to build a keyword from")
 
-    # Resolve locale params
     locale_doc = locale_collection.find_one({"locale": locale}) or {}
     google_domain = locale_doc.get("google_domain") or "google.co.uk"
     location_code = locale_doc.get("location_code") or 2826
@@ -87,17 +82,37 @@ async def create_dseo_shopping_task(
 
     logger.info("[dseo_shopping] Posting task keyword=%r locale=%s tag=%s", keyword, locale, masterSKUid)
 
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(
+            DATAFORSEO_TASK_URL,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": _auth_header(),
+            },
+        )
+        response.raise_for_status()
+
+    result = response.json()
+    logger.info("[dseo_shopping] Task submitted successfully tag=%s", masterSKUid)
+    return result
+
+
+@router.post("/shopping", dependencies=[Depends(verify_token)])
+async def create_dseo_shopping_task(
+    masterSKUid: str = Query(..., description="MasterSKU ObjectId — used as tag and to build the search keyword"),
+    locale: str = Query("en_GB", description="Locale code used to resolve google_domain and location_code"),
+):
+    """
+    Submit a DataforSEO merchant/google/products task for the given MasterSKU.
+    The postback_url is set to this service's /dseo/webhook endpoint so the
+    result is delivered asynchronously once DataforSEO completes the task.
+    """
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                DATAFORSEO_TASK_URL,
-                json=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": _auth_header(),
-                },
-            )
-            response.raise_for_status()
+        result = await submit_dseo_shopping_task(masterSKUid, locale)
+    except ValueError as e:
+        status = 400 if "Invalid masterSKUid" in str(e) or "no Make/Model" in str(e) else 500
+        raise HTTPException(status_code=status, detail=str(e))
     except httpx.HTTPStatusError as e:
         logger.error("[dseo_shopping] DataforSEO HTTP error: %s", e)
         raise HTTPException(status_code=502, detail=f"DataforSEO error: {e.response.status_code}")
@@ -105,6 +120,4 @@ async def create_dseo_shopping_task(
         logger.error("[dseo_shopping] DataforSEO request error: %s", e)
         raise HTTPException(status_code=502, detail=f"DataforSEO request failed: {e}")
 
-    result = response.json()
-    logger.info("[dseo_shopping] Task submitted successfully tag=%s", masterSKUid)
     return JSONResponse(content=result)

@@ -114,19 +114,19 @@ class MasterSKURequest(BaseModel):
 
 
 
-# --- Background ScaleSERP Task ---
+# --- Background DataforSEO Task ---
 try:
-    from routers.enrich.scale_lookup import get_shopping_result
+    from routers.enrich.dseo_shopping import submit_dseo_shopping_task
 except Exception:
-    from enrich.scale_lookup import get_shopping_result
+    from enrich.dseo_shopping import submit_dseo_shopping_task
 
-async def _run_and_log(query, locale, masterSKUid):
+async def _run_dseo_task(locale: str, masterSKUid: str):
     try:
-        logger.info(f"[bg_scale] starting scale lookup for masterSKUid={masterSKUid} query='{query}' locale={locale}")
-        await get_shopping_result(query=query, locale=locale, masterSKUid=masterSKUid)
-        logger.info(f"[bg_scale] finished scale lookup for masterSKUid={masterSKUid}")
+        logger.info(f"[bg_dseo] starting DataforSEO task masterSKUid={masterSKUid} locale={locale}")
+        await submit_dseo_shopping_task(masterSKUid=masterSKUid, locale=locale)
+        logger.info(f"[bg_dseo] DataforSEO task submitted masterSKUid={masterSKUid}")
     except Exception:
-        logger.exception(f"[bg_scale] error in scale lookup for masterSKUid={masterSKUid}")
+        logger.exception(f"[bg_dseo] error submitting DataforSEO task masterSKUid={masterSKUid}")
 
 async def _probe_log(masterSKUid):
     try:
@@ -592,11 +592,11 @@ def create_master_sku(
         except Exception:
             pass
         updated["_id"] = str(updated["_id"])
-        # schedule background ScaleSERP lookup using Make+Model (runs after the response is sent)
+        # schedule background DataforSEO task (runs after the response is sent)
         try:
-            background_tasks.add_task(_run_and_log, f"{data.Make} {data.Model}", data.locale, str(updated["_id"]))
+            background_tasks.add_task(_run_dseo_task, data.locale, str(updated["_id"]))
         except Exception:
-            logger.exception("Failed to schedule scale lookup (existing update)")
+            logger.exception("Failed to schedule DataforSEO task (existing update)")
 
         return {
             "source": "master-update",
@@ -733,11 +733,11 @@ def create_master_sku(
         raise HTTPException(status_code=500, detail="Failed to create MasterSKU")
 
     saved["_id"] = str(saved["_id"])
-    # schedule background ScaleSERP lookup for the created/found MasterSKU (runs after response)
+    # schedule background DataforSEO task for the created/found MasterSKU (runs after response)
     try:
-        background_tasks.add_task(_run_and_log, f"{data.Make} {data.Model}", data.locale, saved["_id"])
+        background_tasks.add_task(_run_dseo_task, data.locale, saved["_id"])
     except Exception:
-        logger.exception("Failed to schedule scale lookup (create path)")
+        logger.exception("Failed to schedule DataforSEO task (create path)")
 
     return saved
 
