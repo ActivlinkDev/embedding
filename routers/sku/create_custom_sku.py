@@ -191,7 +191,6 @@ class CustomSKURequest(BaseModel):
     Category: Optional[str] = ""
     Locale_Details: Optional[LocaleDetails] = None
     Global_Promotion: Optional[str] = None
-    addSERP: Optional[bool] = False
 
 
 def ensure_master_with_locale(data, request, background_tasks):
@@ -221,12 +220,11 @@ def ensure_master_with_locale(data, request, background_tasks):
         Category=data.Category,
     )
     # Synchronous call — create_master_sku persists before returning and
-    # schedules its own background SERP enrichment via BackgroundTasks.
+    # schedules its own background DataforSEO enrichment via BackgroundTasks.
     create_master_sku(
         master_data,
         request=request,
         background_tasks=background_tasks,
-        addSERP=data.addSERP,
     )
     return mastersku_collection.find_one(query)
 

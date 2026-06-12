@@ -98,7 +98,6 @@ except Exception:
 
 ICECAT_USERNAME = os.getenv("ICECAT_USER")
 GO_UPC_API_KEY = os.getenv("GO_UPC_TOKEN")
-SCALE_SERP_API_KEY = os.getenv("SCALE_SERP_KEY")
 
 
 def utc_now_iso():
@@ -263,65 +262,6 @@ def _mask_extra_urls(extra: dict, base_url: str = None) -> dict:
         return extra
     return out
 
-def build_locale_data_from_serp(title: str, locale: str, category: str, model: str, extra: dict = None) -> Dict:
-    locale_info = fetch_locale_info(locale)
-    if not locale_info:
-        raise HTTPException(status_code=404, detail=f"No locale details found for {locale}")
-
-    currency_code = locale_info.get("currency")  # Get from Locale_Params
-
-    params = {
-        "api_key": SCALE_SERP_API_KEY,
-        "search_type": "shopping",
-        "q": title,
-        "google_domain": locale_info.get("google_domain", "google.com"),
-        "hl": locale_info.get("hl", "en"),
-        "gl": locale_info.get("gl", "us"),
-        "shopping_condition": "new",
-        "num": 1,
-        "output": "json"
-    }
-
-    try:
-        response = requests.get("https://api.scaleserp.com/search", params=params, timeout=10)
-        data = response.json()
-        result = data.get("shopping_results", [{}])[0] if data.get("shopping_results") else {}
-
-        block = {
-            "locale": locale,
-            "Category": category,
-            "Input_Title": title,
-            "SERP_Title": result.get("title"),
-            "Google_ID": result.get("id"),
-            "Google_URL": result.get("link"),
-            "Merchant": result.get("merchant"),
-            "Currency": currency_code,  # Set from Locale_Params
-            "Price": result.get("price"),
-            "MSRP_Source": "SERP" if result else "No SERP Match Found",
-            "created_at": utc_now_iso()
-        }
-        if extra:
-            block.update(extra)
-        return block
-
-    except Exception as e:
-        logger.exception("[SERP error] %s", e)
-        block = {
-            "locale": locale,
-            "Category": category,
-            "Input_Title": title,
-            "SERP_Title": None,
-            "Google_ID": None,
-            "Google_URL": None,
-            "Merchant": None,
-            "Currency": currency_code,  # Set from Locale_Params
-            "Price": None,
-            "MSRP_Source": "No SERP Match Found",
-            "created_at": utc_now_iso()
-        }
-        if extra:
-            block.update(extra)
-        return block
 
 def get_existing_sku(data: MasterSKURequest) -> Optional[Dict]:
     """Find existing SKU by GTIN or Make+Model."""
@@ -467,15 +407,6 @@ def log_failed_match(category_input: str, data: MasterSKURequest, embedding, sim
     }
     failed_matches_collection.insert_one(failed_doc)
 
-def add_serp_match_flag(locale_block: Dict, model: str):
-    serp_title = locale_block.get("SERP_Title")
-    if serp_title:
-        model_lower = (model or "").lower()
-        serp_title_lower = serp_title.lower()
-        locale_block["Serp_match"] = model_lower in serp_title_lower
-    else:
-        locale_block["Serp_match"] = False
-
 
 # Note: background job persistence and admin endpoints removed in favor of
 # lightweight native asyncio.create_task scheduling. This keeps the router
@@ -488,7 +419,6 @@ def create_master_sku(
     data: MasterSKURequest,
     request: Request,
     background_tasks: BackgroundTasks,
-    addSERP: Optional[bool] = False,
     _: None = Depends(verify_token),
 ):
     # Validate
@@ -526,30 +456,21 @@ def create_master_sku(
         base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
         # Mask any Icecat URLs so we don't persist raw upstream links
         extra = _mask_extra_urls(extra, base_url=base_for_mask)
-        if addSERP:
-            locale_block = build_locale_data_from_serp(localized_title, data.locale, locale_category_for_block, data.Model, extra=extra)
-            add_serp_match_flag(locale_block, data.Model)
-            # mark master serp status as completed for this locale
-            try:
-                master_collection.update_one({"_id": existing["_id"]}, {"$set": {"serp_status": "completed", "serp_last_updated": utc_now_iso()}})
-            except Exception:
-                pass
-        else:
-            locale_info = fetch_locale_info(data.locale) or {}
-            currency_code = locale_info.get("currency")
-            locale_block = {
-                "locale": data.locale,
-                "Category": locale_category_for_block,
-                "Input_Title": localized_title,
-                "SERP_Title": None,
-                "Google_ID": None,
-                "Merchant": None,
-                "Currency": currency_code,
-                "Price": None,
-                "created_at": utc_now_iso()
-            }
-            if extra:
-                locale_block.update(extra)
+        locale_info = fetch_locale_info(data.locale) or {}
+        currency_code = locale_info.get("currency")
+        locale_block = {
+            "locale": data.locale,
+            "Category": locale_category_for_block,
+            "Input_Title": localized_title,
+            "SERP_Title": None,
+            "Google_ID": None,
+            "Merchant": None,
+            "Currency": currency_code,
+            "Price": None,
+            "created_at": utc_now_iso()
+        }
+        if extra:
+            locale_block.update(extra)
 
         # Populate Locale_Matched_Category for this locale_block using existing doc's matched category if available
         try:
@@ -584,13 +505,6 @@ def create_master_sku(
             pass
 
         updated = update_existing_sku(existing, data, locale_block)
-        # ensure returned document reflects serp_status
-        try:
-            status_val = "completed" if addSERP else "skipped"
-            master_collection.update_one({"_id": existing["_id"]}, {"$set": {"serp_status": status_val}})
-            existing["serp_status"] = status_val
-        except Exception:
-            pass
         updated["_id"] = str(updated["_id"])
         # schedule background DataforSEO task (runs after the response is sent)
         try:
@@ -642,27 +556,21 @@ def create_master_sku(
     base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
     # Mask any Icecat URLs so we don't persist raw upstream links
     extra = _mask_extra_urls(extra, base_url=base_for_mask)
-    if addSERP:
-        locale_block = build_locale_data_from_serp(title, data.locale, locale_category_for_block, data.Model, extra=extra)
-        add_serp_match_flag(locale_block, data.Model)
-        serp_status_val = "completed"
-    else:
-        serp_status_val = "skipped"
-        locale_info = fetch_locale_info(data.locale) or {}
-        currency_code = locale_info.get("currency")
-        locale_block = {
-            "locale": data.locale,
-            "Category": locale_category_for_block,
-            "Input_Title": title,
-            "SERP_Title": None,
-            "Google_ID": None,
-            "Merchant": None,
-            "Currency": currency_code,
-            "Price": None,
-            "created_at": utc_now_iso()
-        }
-        if extra:
-            locale_block.update(extra)
+    locale_info = fetch_locale_info(data.locale) or {}
+    currency_code = locale_info.get("currency")
+    locale_block = {
+        "locale": data.locale,
+        "Category": locale_category_for_block,
+        "Input_Title": title,
+        "SERP_Title": None,
+        "Google_ID": None,
+        "Merchant": None,
+        "Currency": currency_code,
+        "Price": None,
+        "created_at": utc_now_iso()
+    }
+    if extra:
+        locale_block.update(extra)
 
     # Populate Locale_Matched_Category for the newly created master (use matched_category + similarity)
     try:
@@ -696,7 +604,6 @@ def create_master_sku(
         "brand_logo": brand_logo,
         "Source": "CAT" if icecat_data else ("UPC" if upc_data else "INPUT"),
         "Locale_Specific_Data": [locale_block],
-        "serp_status": serp_status_val
     }
 
     # Compute a stable match_key for this product (prefer GTIN when available)
