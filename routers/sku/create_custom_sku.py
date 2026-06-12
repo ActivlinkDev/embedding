@@ -191,7 +191,7 @@ class CustomSKURequest(BaseModel):
     Category: Optional[str] = ""
     Locale_Details: Optional[LocaleDetails] = None
     Global_Promotion: Optional[str] = None
-    add_pricing: Optional[bool] = False
+    add_pricing: Optional[bool] = True
 
 
 def ensure_master_with_locale(data, request, background_tasks):
