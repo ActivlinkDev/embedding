@@ -2,6 +2,8 @@ from fastapi import APIRouter, Query, HTTPException, Request
 import os
 import httpx
 
+from utils.strapi_compat import normalize_strapi_response
+
 router = APIRouter(tags=["CMS"])
 
 STRAPI_BASE = os.getenv("STRAPI_BASE_URL")
@@ -77,7 +79,8 @@ async def proxy_strapi(
 
     if 'application/json' in content_type:
         try:
-            return resp.json()
+            # Re-wrap Strapi v5's flattened payload into the v4 shape consumers expect.
+            return normalize_strapi_response(resp.json())
         except Exception:
             raise HTTPException(status_code=502, detail='Invalid JSON from Strapi')
 
