@@ -4,6 +4,7 @@ import os
 from pymongo import MongoClient
 from utils.dependencies import verify_token
 from utils.locale import resolve_strapi_locale, LocaleNotSupportedError
+from utils.strapi_compat import normalize_strapi_response
 
 router = APIRouter(tags=["CMS"]) 
 
@@ -49,6 +50,7 @@ async def cms_display_offer(
             response = await client_http.get(STRAPI_BASE_URL, params=params, headers=headers, timeout=15.0)
         if response.status_code != 200:
             raise HTTPException(status_code=response.status_code, detail=f"Strapi error: {response.text}")
-        return response.json()
+        # Re-wrap Strapi v5's flattened payload into the v4 shape consumers expect.
+        return normalize_strapi_response(response.json())
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
