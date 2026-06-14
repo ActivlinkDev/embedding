@@ -36,23 +36,37 @@ def _is_media_file(value: Any) -> bool:
     )
 
 
+def _is_relation_entry(value: Any) -> bool:
+    """Test for a populated v5 relation entry.
+
+    Relation entries carry a ``documentId`` and are not yet v4-wrapped. Plain
+    JSON objects (json-type fields) lack ``documentId`` and so are left alone.
+    """
+    return (
+        isinstance(value, dict)
+        and "documentId" in value
+        and "attributes" not in value
+    )
+
+
 def _to_v4_value(value: Any) -> Any:
     """Recursively convert a single v5 field value to its v4 shape."""
     if isinstance(value, list):
         # A list made entirely of media files is a multiple-media field.
         if value and all(_is_media_file(v) for v in value):
             return {"data": [{"id": v.get("id"), "attributes": v} for v in value]}
+        # A list of relation entries (identified by ``documentId``) is a
+        # repeatable relation; re-envelope it like the single-relation case.
+        if value and all(_is_relation_entry(v) for v in value):
+            return {"data": [_entry_to_v4(v) for v in value]}
         return [_to_v4_value(v) for v in value]
 
     if _is_media_file(value):
         return {"data": {"id": value.get("id"), "attributes": value}}
 
-    if isinstance(value, dict):
-        # A populated relation entry is identifiable by ``documentId``.
-        # Plain JSON objects (json-type fields) are left untouched.
-        if "documentId" in value and "attributes" not in value:
-            return _entry_to_v4(value)
-        return value
+    if _is_relation_entry(value):
+        # Single relation -> v4 ``{"data": {...}}`` envelope.
+        return {"data": _entry_to_v4(value)}
 
     return value
 
