@@ -33,18 +33,23 @@ def _to_id_str(doc):
 
 @router.get("/quick_search")
 def quick_search(
-    clientKey: str = Query(..., description="Your assigned client key (required)"),
+    clientKey: Optional[str] = Query(None, description="Client key — resolves to a Client_ID internally"),
+    clientId: Optional[str] = Query(None, description="Client ID (e.g. 'AO') — alternative to clientKey"),
     q: Optional[str] = Query(None, description="Free-text query matching GTIN, SKU, Make, or Model"),
     mode: Optional[str] = Query(None, description="Use mode=all to return all client SKUs (subject to limit)."),
     locale: Optional[str] = Query(None, description="Optional locale to require presence in Locale_Specific_Data"),
     limit: int = Query(20, ge=1, le=500, description="Max results to return"),
     _: None = Depends(verify_token)
 ):
-    # Resolve clientKey -> Client_ID
-    clientkey_doc = clientkey_collection.find_one({"ClientKey": clientKey})
-    if not clientkey_doc or "Client_ID" not in clientkey_doc:
-        raise HTTPException(status_code=404, detail="Invalid clientKey")
-    client_id = clientkey_doc["Client_ID"]
+    if clientId:
+        client_id = clientId
+    elif clientKey:
+        clientkey_doc = clientkey_collection.find_one({"ClientKey": clientKey})
+        if not clientkey_doc or "Client_ID" not in clientkey_doc:
+            raise HTTPException(status_code=404, detail="Invalid clientKey")
+        client_id = clientkey_doc["Client_ID"]
+    else:
+        raise HTTPException(status_code=400, detail="clientKey or clientId is required")
 
     base = {"Client": client_id}
     if locale:
@@ -63,11 +68,10 @@ def quick_search(
             {"Identifiers.Make": {"$regex": safe, "$options": "i"}},
             {"Identifiers.Model": {"$regex": safe, "$options": "i"}},
             {"Identifiers.SKU": {"$regex": safe, "$options": "i"}},
-            {"Identifiers.GTIN": {"$regex": safe, "$options": "i"}},  # works when GTIN is array of strings
+            {"Identifiers.GTIN": {"$regex": safe, "$options": "i"}},
         ]
         query = {"$and": [base, {"$or": or_conditions}]}
 
-    # Projection: limit payload size; include one matching locale element if provided
     projection = {
         "Client": 1,
         "Identifiers": 1,
