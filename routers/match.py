@@ -35,7 +35,14 @@ def _get_mongo_client():
         if not MONGO_URI:
             return None
         try:
-            _mongo_client = MongoClient(MONGO_URI)
+            # Bounded timeouts so a stuck/unhealthy Atlas Search backend can never
+            # block a request (and therefore a uvicorn worker thread) indefinitely.
+            _mongo_client = MongoClient(
+                MONGO_URI,
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=5000,
+                socketTimeoutMS=8000,
+            )
         except Exception:
             _mongo_client = None
     return _mongo_client
@@ -79,7 +86,9 @@ def match_category(
                 }
             }
 
-            results = list(coll.aggregate([stage]))
+            # maxTimeMS bounds the server-side $vectorSearch so a hung Atlas Search
+            # node raises (caught below) instead of hanging the request forever.
+            results = list(coll.aggregate([stage], maxTimeMS=5000))
             if results:
                 doc = results[0]
                 # category field may have different names in documents
