@@ -33,23 +33,18 @@ def _to_id_str(doc):
 
 @router.get("/quick_search")
 def quick_search(
-    clientKey: Optional[str] = Query(None, description="Client key — resolves to a Client_ID internally"),
-    clientId: Optional[str] = Query(None, description="Client ID (e.g. 'AO') — alternative to clientKey"),
+    clientKey: str = Query(..., description="A valid client key — used to derive the tenant scope"),
     q: Optional[str] = Query(None, description="Free-text query matching GTIN, SKU, Make, or Model"),
     mode: Optional[str] = Query(None, description="Use mode=all to return all client SKUs (subject to limit)."),
     locale: Optional[str] = Query(None, description="Optional locale to require presence in Locale_Specific_Data"),
     limit: int = Query(20, ge=1, le=500, description="Max results to return"),
     _: None = Depends(verify_token)
 ):
-    if clientId:
-        client_id = clientId
-    elif clientKey:
-        clientkey_doc = clientkey_collection.find_one({"ClientKey": clientKey})
-        if not clientkey_doc or "Client_ID" not in clientkey_doc:
-            raise HTTPException(status_code=404, detail="Invalid clientKey")
-        client_id = clientkey_doc["Client_ID"]
-    else:
-        raise HTTPException(status_code=400, detail="clientKey or clientId is required")
+    # Resolve clientKey -> Client_ID; this validates the caller holds a real key for the tenant.
+    clientkey_doc = clientkey_collection.find_one({"ClientKey": clientKey})
+    if not clientkey_doc or "Client_ID" not in clientkey_doc:
+        raise HTTPException(status_code=404, detail="Invalid clientKey")
+    client_id = clientkey_doc["Client_ID"]
 
     base = {"Client": client_id}
     if locale:
