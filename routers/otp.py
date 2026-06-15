@@ -15,7 +15,9 @@ OTP_TTL_SECONDS = 5 * 60          # 5 minutes
 RESEND_COOLDOWN_SECONDS = 30      # reuse within 30s
 MAX_ATTEMPTS = 5
 COOKIE_NAME = "otp_fallback"
-COOKIE_SECRET = os.getenv("OTP_COOKIE_SECRET", os.getenv("LOOKUP_API_KEY", "changeme-secret"))
+COOKIE_SECRET = os.getenv("OTP_COOKIE_SECRET") or os.getenv("LOOKUP_API_KEY")
+if not COOKIE_SECRET or COOKIE_SECRET == "changeme-secret":
+    raise RuntimeError("OTP_COOKIE_SECRET or LOOKUP_API_KEY must be set to a strong secret")
 
 # Verified customer cookie config
 VERIFIED_COOKIE_NAME = os.getenv("VERIFIED_COOKIE_NAME", "verified_customer")
@@ -85,7 +87,7 @@ def parse_cookie(raw: str):
         phone = '.'.join(parts[:-2])
         code = parts[-2]
         sig = parts[-1]
-        if _sign(f"{phone}.{code}") != sig:
+        if not hmac.compare_digest(_sign(f"{phone}.{code}"), sig):
             return None
         return {"phone": phone, "code": code}
     except Exception:

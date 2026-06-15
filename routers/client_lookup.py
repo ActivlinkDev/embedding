@@ -1,8 +1,9 @@
 # routers/client_lookup.py
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from pymongo import MongoClient
 import os
+from utils.dependencies import verify_token
 from dotenv import load_dotenv
 
 # Load environment variables from .env
@@ -17,7 +18,10 @@ db = client["Activlink"]
 collection = db["ClientKey"]
 
 @router.get("/get-client")
-def get_client(clientkey: str = Query(..., description="The clientkey to look up the full client record")):
+def get_client(
+    clientkey: str = Query(..., description="The clientkey to look up the full client record"),
+    _: None = Depends(verify_token),
+):
     result = collection.find_one({"ClientKey": clientkey}, {"_id": 0})
 
     if result:
