@@ -98,6 +98,17 @@ class CreateUserResponse(BaseModel):
     created_at: str
 
 
+class PortalUserEntry(BaseModel):
+    username: str
+    clientId: str
+    role: str
+    created_at: str | None = None
+
+
+class ListUsersResponse(BaseModel):
+    users: list[PortalUserEntry]
+
+
 class UpdateStylesRequest(BaseModel):
     clientKey: str
     styles: dict
@@ -168,3 +179,41 @@ def create_portal_user(body: CreateUserRequest, _: None = Depends(verify_token))
         role="user",
         created_at=now.isoformat() + "Z",
     )
+
+
+def _serialize_created_at(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        return value.isoformat() + "Z"
+    return str(value)
+
+
+@router.get("/users", response_model=ListUsersResponse)
+def list_portal_users(clientId: str, _: None = Depends(verify_token)):
+    """List all portal users scoped to a single client."""
+    users_col, _ = _get_collections()
+    docs = users_col.find(
+        {"client_id": clientId},
+        {"username": 1, "client_id": 1, "role": 1, "created_at": 1, "_id": 0},
+    ).sort("username", 1)
+    users = [
+        PortalUserEntry(
+            username=d.get("username", ""),
+            clientId=d.get("client_id", ""),
+            role=d.get("role", "user"),
+            created_at=_serialize_created_at(d.get("created_at")),
+        )
+        for d in docs
+    ]
+    return ListUsersResponse(users=users)
+
+
+@router.delete("/users/{username}")
+def delete_portal_user(username: str, clientId: str, _: None = Depends(verify_token)):
+    """Delete a portal user. Scoped to the client to prevent cross-client deletes."""
+    users_col, _ = _get_collections()
+    result = users_col.delete_one({"username": username, "client_id": clientId})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"ok": True, "message": "User deleted successfully"}
