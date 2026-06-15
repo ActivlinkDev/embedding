@@ -71,6 +71,7 @@ def quick_search(
         "Client": 1,
         "Identifiers": 1,
         "Category": 1,
+        "Global_Promotion": 1,
         "MasterSKU": 1,
         "Locale_Specific_Data": {"$elemMatch": {"locale": locale}} if locale else 1,
     }
