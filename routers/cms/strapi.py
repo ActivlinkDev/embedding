@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Query, HTTPException, Request
+from fastapi import APIRouter, Query, HTTPException, Request, Depends
 import os
 import httpx
+from utils.dependencies import verify_token
 
 router = APIRouter(tags=["CMS"])
 
@@ -20,6 +21,7 @@ async def proxy_strapi(
     filter_field: str | None = Query(None, description="Optional collection field to filter on (Strapi field name)"),
     filter_value: list[str] | str | None = Query(None, description="Value(s) to match for filter_field. Provide multiple values to use $in operator."),
     request: Request = None,
+    _: None = Depends(verify_token),
 ):
     """Proxy a GET request to Strapi.
 
@@ -33,8 +35,10 @@ async def proxy_strapi(
     if not STRAPI_BASE:
         raise HTTPException(status_code=500, detail="STRAPI_BASE_URL not configured")
 
-    # Build upstream URL
+    # Build upstream URL. Only allow relative Strapi API paths to prevent proxy abuse.
     route_clean = route.lstrip('/')
+    if not route_clean or '..' in route_clean.split('/') or route_clean.startswith(('http://', 'https://', '//')):
+        raise HTTPException(status_code=400, detail='Invalid Strapi route')
     upstream = f"{STRAPI_BASE.rstrip('/')}/{route_clean}"
     # Build query params for Strapi: include locale, optional filters, and always populate all relations
     params = {"populate": "*"}

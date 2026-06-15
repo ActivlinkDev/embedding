@@ -2,7 +2,7 @@
 import os
 import importlib
 import asyncio, traceback
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from routers.quote import router as quote_router
 
 OPENAPI_TAGS = [
@@ -23,12 +23,29 @@ OPENAPI_TAGS = [
     {"name": "Portal", "description": "Portal admin login and user management."},
 ]
 
+docs_enabled = os.getenv("ENABLE_API_DOCS", "false").lower() == "true"
+
 app = FastAPI(
     title="Activlink API Suite",
     description="APIs for registration, ingestion, enrichment, and payments.",
     version="1.0.0",
     openapi_tags=OPENAPI_TAGS,
+    docs_url="/docs" if docs_enabled else None,
+    redoc_url="/redoc" if docs_enabled else None,
+    openapi_url="/openapi.json" if docs_enabled else None,
 )
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    if request.url.scheme == "https":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
+
 
 # -------- Health check --------
 @app.get("/healthz")

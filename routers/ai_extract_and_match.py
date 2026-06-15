@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 from typing import Dict
 import os
+import json
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -51,7 +52,10 @@ def extract_and_match(
         )
 
         raw_content = chat_response.choices[0].message.content.strip()
-        extracted = eval(raw_content)
+        try:
+            extracted = json.loads(raw_content)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=502, detail="Model returned invalid JSON") from exc
 
         if not all(k in extracted for k in ["Make", "Model", "Category"]):
             raise HTTPException(status_code=500, detail="GPT output missing required fields")

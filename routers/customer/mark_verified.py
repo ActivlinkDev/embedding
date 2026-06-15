@@ -8,7 +8,9 @@ router = APIRouter(tags=["Customers"])
 
 VERIFIED_COOKIE_NAME = os.getenv("VERIFIED_COOKIE_NAME", "verified_customer")
 VERIFIED_TTL_SECONDS = int(os.getenv("VERIFIED_TTL_SECONDS", str(24 * 3600)))
-COOKIE_SECRET = os.getenv("OTP_COOKIE_SECRET", os.getenv("LOOKUP_API_KEY", "changeme-secret"))
+COOKIE_SECRET = os.getenv("OTP_COOKIE_SECRET") or os.getenv("LOOKUP_API_KEY")
+if not COOKIE_SECRET or COOKIE_SECRET == "changeme-secret":
+    raise RuntimeError("OTP_COOKIE_SECRET or LOOKUP_API_KEY must be set to a strong secret")
 
 import hmac, hashlib, base64
 
