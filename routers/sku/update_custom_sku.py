@@ -71,6 +71,7 @@ def update_custom_sku(data: UpdateCustomSKURequest, _: None = Depends(verify_tok
         raise HTTPException(status_code=400, detail="Locale is required when Locale_Details is provided")
 
     set_ops = {}
+    unset_ops = {}
     update_kwargs = {}
 
     if data.SKU is not None:
@@ -105,28 +106,45 @@ def update_custom_sku(data: UpdateCustomSKURequest, _: None = Depends(verify_tok
 
     if data.Locale_Details:
         locale_set_ops = {}
+        locale_unset_ops = {}
 
-        if data.Locale_Details.Title is not None:
-            locale_set_ops["Locale_Specific_Data.$[loc].Title"] = data.Locale_Details.Title
-        if data.Locale_Details.Price is not None:
-            locale_set_ops["Locale_Specific_Data.$[loc].MSRP"] = data.Locale_Details.Price
-        if data.Locale_Details.GTL is not None:
-            locale_set_ops["Locale_Specific_Data.$[loc].Guarantees.Labour"] = data.Locale_Details.GTL
-        if data.Locale_Details.GTP is not None:
-            locale_set_ops["Locale_Specific_Data.$[loc].Guarantees.Parts"] = data.Locale_Details.GTP
-        if data.Locale_Details.Promo_Code is not None:
-            locale_set_ops["Locale_Specific_Data.$[loc].Guarantees.Promotion"] = data.Locale_Details.Promo_Code
+        # A field that is explicitly present in the request but null is treated
+        # as a clear ($unset). A field that is simply omitted is left untouched.
+        # `model_fields_set` lets us tell those two cases apart (pydantic v2).
+        provided = data.Locale_Details.model_fields_set
+        field_paths = {
+            "Title": "Locale_Specific_Data.$[loc].Title",
+            "Price": "Locale_Specific_Data.$[loc].MSRP",
+            "GTL": "Locale_Specific_Data.$[loc].Guarantees.Labour",
+            "GTP": "Locale_Specific_Data.$[loc].Guarantees.Parts",
+            "Promo_Code": "Locale_Specific_Data.$[loc].Guarantees.Promotion",
+        }
+        for field, path in field_paths.items():
+            if field not in provided:
+                continue
+            value = getattr(data.Locale_Details, field)
+            if value is None:
+                locale_unset_ops[path] = ""
+            else:
+                locale_set_ops[path] = value
 
-        if locale_set_ops:
+        if locale_set_ops or locale_unset_ops:
             set_ops.update(locale_set_ops)
+            unset_ops.update(locale_unset_ops)
             update_kwargs["array_filters"] = [{"loc.locale": data.Locale}]
 
-    if not set_ops:
+    if not set_ops and not unset_ops:
         raise HTTPException(status_code=400, detail="No updatable fields provided")
+
+    update_doc = {}
+    if set_ops:
+        update_doc["$set"] = set_ops
+    if unset_ops:
+        update_doc["$unset"] = unset_ops
 
     customsku_collection.update_one(
         {"_id": doc_id, "Client": client_id},
-        {"$set": set_ops},
+        update_doc,
         **update_kwargs
     )
 
