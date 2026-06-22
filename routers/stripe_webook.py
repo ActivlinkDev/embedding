@@ -4,6 +4,7 @@ import os
 import sys
 from pymongo import MongoClient
 from bson import ObjectId
+from datetime import datetime
 
 router = APIRouter(tags=["Payments"])
 
@@ -19,6 +20,7 @@ client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
 stripe_completed_collection = db["Stripe_completed"]
 customer_collection = db["Customer"]
+basket_collection = db["Basket_Quotes"]
 
 # Import helper from customer router
 try:
@@ -104,6 +106,34 @@ async def stripe_webhook(
             }
             result = stripe_completed_collection.insert_one(record)
             print(f"[Stripe Webhook] Stored completed session in DB with _id: {result.inserted_id}", file=sys.stderr)
+
+            # Mark the basket as paid so it is no longer treated as an active
+            # draft basket. The session items remain on the document so the
+            # confirmation/receipt page can still render the purchased cover,
+            # but the frontend will start a fresh basket for any new shopping.
+            try:
+                metadata = getattr(data, "metadata", None)
+                basket_id = getattr(metadata, "basket_id", None) if metadata else None
+                if basket_id:
+                    try:
+                        basket_objid = ObjectId(str(basket_id))
+                    except Exception:
+                        basket_objid = None
+                    if basket_objid is not None:
+                        paid_res = basket_collection.update_one(
+                            {"_id": basket_objid},
+                            {"$set": {
+                                "status": "paid",
+                                "paid_at": datetime.utcnow(),
+                                "stripe_session_id": getattr(data, "id", None),
+                            }},
+                        )
+                        print(f"[Stripe Webhook] Marked basket {basket_id} as paid "
+                              f"(matched={paid_res.matched_count}, modified={paid_res.modified_count})",
+                              file=sys.stderr)
+            except Exception as basket_exc:
+                print(f"[Stripe Webhook] Failed to mark basket as paid: {basket_exc}", file=sys.stderr)
+
             # If we have customer details in the session, create or find the customer
             cust_details = getattr(data, "customer_details", None)
             if cust_details and get_or_create_customer:
