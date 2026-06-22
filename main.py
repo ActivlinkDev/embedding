@@ -122,6 +122,7 @@ ROUTERS = {
     "basket": "routers.basket",
     "ratebasket": "routers.basket.ratebasket",
     "basket_payment": "routers.basket.payment",
+    "basket_promo": "routers.basket.promo",
 
     # misc features
     "generate_faults": "routers.generate_faults",

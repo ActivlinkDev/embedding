@@ -161,6 +161,7 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
             "basket_id": str(basket["_id"]),
             "client": _extract_client(items),
             "source": _extract_source(items),
+            "promo_code": ((basket.get("applied_promo") or {}).get("code") or ""),
         },
         customer_email=req.email if req.email else None,
         customer_phone=req.customer_phone if req.customer_phone else None,
