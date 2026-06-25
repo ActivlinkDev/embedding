@@ -335,7 +335,41 @@ def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
             best = r
             break
 
-    discount = best.discount if best else 0
+    bundle_discount = best.discount if best else 0
+
+    # ---- Promo code (best-of vs bundle rule) ----
+    # If a customer-entered promo code is applied to this basket, re-validate it
+    # against the current items (so adding/removing items keeps it correct) and
+    # take whichever discount is larger — bundle rule or promo, never both.
+    applied_promo = basket.get("applied_promo")
+    promo_discount = 0
+    refreshed_promo = None
+    if applied_promo and applied_promo.get("code"):
+        # Lazy import to avoid a circular import at module load.
+        from .promo import validate_and_compute_promo
+        refreshed_promo = validate_and_compute_promo(
+            applied_promo.get("code"),
+            items_for_rules,
+            root_client=root_client,
+            root_locale=root_locale,
+        )
+        if refreshed_promo.get("valid"):
+            promo_discount = int(refreshed_promo.get("discount_pence", 0))
+
+    if promo_discount > bundle_discount:
+        discount = promo_discount
+        best_rule_doc = {
+            "rule_id": "PROMO_CODE",
+            "name": (refreshed_promo or {}).get("code"),
+            "priority": 0,
+            "ruleType": "PROMO_CODE",
+            "discount": int(promo_discount),
+            "explanation": (refreshed_promo or {}).get("message"),
+        }
+    else:
+        discount = bundle_discount
+        best_rule_doc = best.dict() if best else None
+
     final_total = max(0, subtotal_pence - discount)
 
     # Determine mode summary (single mode or 'mixed')
@@ -344,18 +378,18 @@ def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
 
     # Persist summary back to Basket_Quotes document
     try:
-        basket_collection.update_one(
-            {"_id": bid},
-            {
-                "$set": {
-                    "subtotal": int(subtotal_pence),
-                    "final_total": int(final_total),
-                    "discount": int(discount),
-                    "best_rule": best.dict() if best else None,
-                    "mode": mode_value,
-                }
-            }
-        )
+        set_fields = {
+            "subtotal": int(subtotal_pence),
+            "final_total": int(final_total),
+            "discount": int(discount),
+            "best_rule": best_rule_doc,
+            "mode": mode_value,
+        }
+        # Keep the stored applied_promo in sync with its re-validated state so
+        # the basket reflects whether the code still applies.
+        if refreshed_promo is not None:
+            set_fields["applied_promo"] = refreshed_promo
+        basket_collection.update_one({"_id": bid}, {"$set": set_fields})
     except Exception:
         # Non-blocking: still return computed response
         pass

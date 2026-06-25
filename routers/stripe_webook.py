@@ -104,6 +104,27 @@ async def stripe_webhook(
             }
             result = stripe_completed_collection.insert_one(record)
             print(f"[Stripe Webhook] Stored completed session in DB with _id: {result.inserted_id}", file=sys.stderr)
+            # Count a promo-code redemption on successful checkout (not at apply
+            # time, so abandoned baskets don't burn codes). Guarded by a flag on
+            # the basket so Stripe webhook retries don't double-count.
+            try:
+                metadata = getattr(data, "metadata", None)
+                basket_id = getattr(metadata, "basket_id", None) if metadata else None
+                if basket_id:
+                    basket_collection = db["Basket_Quotes"]
+                    promo_collection = db["PromoCodes"]
+                    basket_doc = basket_collection.find_one({"_id": ObjectId(basket_id)})
+                    applied = (basket_doc or {}).get("applied_promo") or {}
+                    code = applied.get("code")
+                    already = (basket_doc or {}).get("promo_redeemed") is True
+                    if code and applied.get("valid") and not already:
+                        promo_collection.update_one({"code": code}, {"$inc": {"redemptions": 1}})
+                        basket_collection.update_one(
+                            {"_id": ObjectId(basket_id)}, {"$set": {"promo_redeemed": True}}
+                        )
+                        print(f"[Stripe Webhook] Recorded redemption for promo '{code}'", file=sys.stderr)
+            except Exception as promo_exc:
+                print(f"[Stripe Webhook] Failed to record promo redemption: {promo_exc}", file=sys.stderr)
             # If we have customer details in the session, create or find the customer
             cust_details = getattr(data, "customer_details", None)
             if cust_details and get_or_create_customer:
