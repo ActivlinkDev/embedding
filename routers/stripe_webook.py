@@ -4,7 +4,6 @@ import os
 import sys
 from pymongo import MongoClient
 from bson import ObjectId
-from datetime import datetime
 
 router = APIRouter(tags=["Payments"])
 
@@ -20,40 +19,6 @@ client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
 stripe_completed_collection = db["Stripe_completed"]
 customer_collection = db["Customer"]
-basket_collection = db["Basket_Quotes"]
-
-
-def _mark_basket_paid(data) -> None:
-    """Mark the Basket_Quotes document referenced by the session metadata as paid.
-
-    The session items are left intact so the confirmation/receipt page can still
-    render the purchased cover, but the frontend stops treating it as an active
-    draft basket. Safe to call more than once (idempotent $set), which matters
-    because a settled session can be reported via both
-    checkout.session.completed and checkout.session.async_payment_succeeded.
-    """
-    try:
-        metadata = getattr(data, "metadata", None)
-        basket_id = getattr(metadata, "basket_id", None) if metadata else None
-        if not basket_id:
-            return
-        try:
-            basket_objid = ObjectId(str(basket_id))
-        except Exception:
-            return
-        paid_res = basket_collection.update_one(
-            {"_id": basket_objid},
-            {"$set": {
-                "status": "paid",
-                "paid_at": datetime.utcnow(),
-                "stripe_session_id": getattr(data, "id", None),
-            }},
-        )
-        print(f"[Stripe Webhook] Marked basket {basket_id} as paid "
-              f"(matched={paid_res.matched_count}, modified={paid_res.modified_count})",
-              file=sys.stderr)
-    except Exception as basket_exc:
-        print(f"[Stripe Webhook] Failed to mark basket as paid: {basket_exc}", file=sys.stderr)
 
 # Import helper from customer router
 try:
@@ -139,21 +104,6 @@ async def stripe_webhook(
             }
             result = stripe_completed_collection.insert_one(record)
             print(f"[Stripe Webhook] Stored completed session in DB with _id: {result.inserted_id}", file=sys.stderr)
-
-            # Only mark the basket paid once the session has actually settled.
-            # Delayed/async payment methods can emit checkout.session.completed
-            # while payment_status is still "unpaid"; those settle later via
-            # checkout.session.async_payment_succeeded (handled below). Marking
-            # an unpaid session as paid would hide the draft basket for a payment
-            # that may still fail. See https://docs.stripe.com/checkout/fulfillment
-            payment_status = getattr(data, "payment_status", None)
-            if payment_status == "paid":
-                _mark_basket_paid(data)
-            else:
-                print(f"[Stripe Webhook] checkout.session.completed with "
-                      f"payment_status={payment_status!r}; deferring basket paid status.",
-                      file=sys.stderr)
-
             # If we have customer details in the session, create or find the customer
             cust_details = getattr(data, "customer_details", None)
             if cust_details and get_or_create_customer:
@@ -236,16 +186,6 @@ async def stripe_webhook(
                           f"({c.get('status')})", file=sys.stderr)
             except Exception as inv_exc:
                 print(f"[Stripe Webhook] handle_invoice_paid failed: {inv_exc}", file=sys.stderr)
-        elif event_type == "checkout.session.async_payment_succeeded":
-            # Delayed payment method finally settled — now it is safe to mark
-            # the basket as paid (the completed event may have fired earlier
-            # while still unpaid).
-            _mark_basket_paid(data)
-        elif event_type == "checkout.session.async_payment_failed":
-            # Delayed payment failed after a completed (but unpaid) session.
-            # Leave the basket as a draft so the customer can retry checkout.
-            print(f"[Stripe Webhook] async_payment_failed for session "
-                  f"{getattr(data, 'id', None)}; basket left as draft.", file=sys.stderr)
         elif event_type == "charge.refunded" and contract_svc:
             try:
                 c = contract_svc.handle_charge_refunded(data_dict, event.id)
