@@ -304,13 +304,35 @@ def update_existing_sku(existing: Dict, data: MasterSKURequest, locale_block: Di
     existing.setdefault("Locale_Specific_Data", []).append(locale_block)
     return existing
 
+def get_upc_category_text(upc_data: Optional[Dict]) -> Optional[str]:
+    """Build the best available category text from a Go-UPC product payload.
+
+    Prefer `categoryPath` (the structured taxonomy breadcrumb, e.g. ["Home &
+    Garden", "Major Appliances", "Dishwashers"]) over the flat `category` field:
+    `category` can be sourced from however a given barcode happened to be listed
+    (e.g. a manuals-aggregator site tagging a product as "Product Manuals"
+    instead of its actual product type), so it's not always trustworthy on its
+    own, whereas `categoryPath` reflects real taxonomy when present.
+    """
+    if not upc_data:
+        return None
+    product = upc_data.get("product", {})
+    category_path = product.get("categoryPath")
+    if isinstance(category_path, list) and category_path:
+        return " > ".join(str(p) for p in category_path if p)
+    return product.get("category") or None
+
 def get_category_for_embedding(data: MasterSKURequest, icecat_data: Optional[Dict], upc_data: Optional[Dict]) -> str:
-    """Determine final category for embedding/matching/root, from all sources."""
-    upc_category = upc_data.get("product", {}).get("category") if upc_data else None
-    upc_name = upc_data.get("product", {}).get("name") if upc_data else None
-    upc_description = upc_data.get("product", {}).get("description") if upc_data else None
-    # Use name as fallback when category is missing — gives embedding enough signal
-    upc_text = upc_category or upc_name or upc_description
+    """Determine final category text for embedding/matching/root, from all sources."""
+    upc_category_text = get_upc_category_text(upc_data)
+    upc_product = upc_data.get("product", {}) if upc_data else {}
+    upc_name = upc_product.get("name")
+    upc_description = upc_product.get("description")
+    # Combine category text with the product name rather than trusting category
+    # alone — Go-UPC's category can be misleading (e.g. "Product Manuals" for a
+    # product whose name clearly says "Microwave Oven"), so folding the name in
+    # keeps that signal available to the embedding match instead of discarding it.
+    upc_text = " ".join(p for p in (upc_category_text, upc_name) if p) or upc_description or None
     return (
         data.Category
         or (icecat_data.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value") if icecat_data else None)
@@ -323,10 +345,9 @@ def choose_locale_category(icecat_data, upc_data, data):
     if icecat_data:
         cat = icecat_data.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value")
         if cat: return cat
-    # 2. Try UPC
-    if upc_data:
-        cat = upc_data.get("product", {}).get("category")
-        if cat: return cat
+    # 2. Try UPC (flat category, then taxonomy breadcrumb)
+    upc_category_text = get_upc_category_text(upc_data)
+    if upc_category_text: return upc_category_text
     # 3. Try API input
     if data.Category and data.Category.strip():
         return data.Category.strip()
