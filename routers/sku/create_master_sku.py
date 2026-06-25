@@ -304,13 +304,33 @@ def update_existing_sku(existing: Dict, data: MasterSKURequest, locale_block: Di
     existing.setdefault("Locale_Specific_Data", []).append(locale_block)
     return existing
 
+def get_upc_category_text(upc_data: Optional[Dict]) -> Optional[str]:
+    """Build the best available category text from a Go-UPC product payload.
+
+    Go-UPC's flat `category` field is frequently absent (it depends on a Google
+    Shopping taxonomy match that doesn't cover every barcode), while `categoryPath`
+    (the taxonomy breadcrumb, e.g. ["Home & Garden", "Major Appliances", "Dishwashers"])
+    is populated more often and ends in the same leaf category — so it's a better
+    fallback than jumping straight to the raw product name/description.
+    """
+    if not upc_data:
+        return None
+    product = upc_data.get("product", {})
+    category = product.get("category")
+    if category:
+        return category
+    category_path = product.get("categoryPath")
+    if isinstance(category_path, list) and category_path:
+        return " > ".join(str(p) for p in category_path if p)
+    return None
+
 def get_category_for_embedding(data: MasterSKURequest, icecat_data: Optional[Dict], upc_data: Optional[Dict]) -> str:
     """Determine final category for embedding/matching/root, from all sources."""
-    upc_category = upc_data.get("product", {}).get("category") if upc_data else None
+    upc_category_text = get_upc_category_text(upc_data)
     upc_name = upc_data.get("product", {}).get("name") if upc_data else None
     upc_description = upc_data.get("product", {}).get("description") if upc_data else None
-    # Use name as fallback when category is missing — gives embedding enough signal
-    upc_text = upc_category or upc_name or upc_description
+    # Use name/description as fallback when no category text is available — gives embedding enough signal
+    upc_text = upc_category_text or upc_name or upc_description
     return (
         data.Category
         or (icecat_data.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value") if icecat_data else None)
@@ -323,10 +343,9 @@ def choose_locale_category(icecat_data, upc_data, data):
     if icecat_data:
         cat = icecat_data.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value")
         if cat: return cat
-    # 2. Try UPC
-    if upc_data:
-        cat = upc_data.get("product", {}).get("category")
-        if cat: return cat
+    # 2. Try UPC (flat category, then taxonomy breadcrumb)
+    upc_category_text = get_upc_category_text(upc_data)
+    if upc_category_text: return upc_category_text
     # 3. Try API input
     if data.Category and data.Category.strip():
         return data.Category.strip()
