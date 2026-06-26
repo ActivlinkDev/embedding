@@ -289,6 +289,9 @@ def create_custom_sku(
             {"_id": existing["_id"]},
             {"$push": {"Locale_Specific_Data": locale_data}},
         )
+        # Warm the embeddable-widget quote cache for the newly added locale.
+        from routers.widget_quote import warm_widget_cache
+        background_tasks.add_task(warm_widget_cache, data.ClientKey, str(existing["_id"]), data.Locale)
         persisted = customsku_collection.find_one({"_id": existing["_id"]})
         return {"message": "Locale added to existing CustomSKU", "customsku": _serialize(persisted)}
 
@@ -316,5 +319,8 @@ def create_custom_sku(
         "Locale_Specific_Data": [locale_data],
     }
     result = customsku_collection.insert_one(doc)
+    # Warm the embeddable-widget quote cache so the first shopper is fast too.
+    from routers.widget_quote import warm_widget_cache
+    background_tasks.add_task(warm_widget_cache, data.ClientKey, str(result.inserted_id), data.Locale)
     persisted = customsku_collection.find_one({"_id": result.inserted_id})
     return _serialize(persisted)

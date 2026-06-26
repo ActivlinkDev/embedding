@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import Optional
 from pymongo import MongoClient
@@ -52,7 +52,7 @@ def _to_id_str(doc: Optional[dict]) -> Optional[dict]:
 
 
 @router.post("/update_custom_sku")
-def update_custom_sku(data: UpdateCustomSKURequest, _: None = Depends(verify_token)):
+def update_custom_sku(data: UpdateCustomSKURequest, background_tasks: BackgroundTasks, _: None = Depends(verify_token)):
     clientkey_doc = clientkey_collection.find_one({"ClientKey": data.ClientKey})
     if not clientkey_doc or "Client_ID" not in clientkey_doc:
         raise HTTPException(status_code=404, detail="Invalid clientKey")
@@ -151,6 +151,20 @@ def update_custom_sku(data: UpdateCustomSKURequest, _: None = Depends(verify_tok
     updated = customsku_collection.find_one({"_id": doc_id, "Client": client_id})
     if not updated:
         raise HTTPException(status_code=500, detail="Failed to load updated CustomSKU")
+
+    # Refresh the embeddable-widget quote cache for any affected locale(s), since
+    # MSRP / guarantees / category changes alter pricing.
+    from routers.widget_quote import warm_widget_cache
+    if data.Locale:
+        affected_locales = [data.Locale]
+    else:
+        affected_locales = [
+            entry.get("locale")
+            for entry in (updated.get("Locale_Specific_Data") or [])
+            if isinstance(entry, dict) and entry.get("locale")
+        ]
+    for loc in affected_locales:
+        background_tasks.add_task(warm_widget_cache, data.ClientKey, str(doc_id), loc)
 
     return {
         "message": "CustomSKU updated",
