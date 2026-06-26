@@ -60,6 +60,13 @@ def find_price_factor(price_factor_list, price):
             return pf["factor"]
     return None
 
+def find_price_bracket(price_factor_list, price):
+    """Return (priceLow, priceHigh) for the bracket containing `price`, or None."""
+    for pf in price_factor_list:
+        if pf["priceLow"] <= price <= pf["priceHigh"]:
+            return (pf["priceLow"], pf["priceHigh"])
+    return None
+
 def round_price_49_99(value):
     cents = round(value % 1, 2)
     whole = int(value)
@@ -136,17 +143,24 @@ def group_responses(responses):
         groups[group_key]["options"].append(option)
     return list(groups.values())
 
-# --- Endpoint ---
+# --- Core pricing (no persistence) ---
 
-@router.post("/rate_request")
-def rate_request(
-    payload: RateRequestBatch,
-    _: None = Depends(verify_token)
-):
+def price_and_group(requests: List[RateRequest], log_errors: bool = True):
+    """Price a list of RateRequests and group the responses.
+
+    This contains the rating computation shared by the `/rate_request` endpoint
+    and the widget quote flow. It performs **no** persistence — callers decide
+    whether to store the result in `Quotes`.
+
+    Returns a tuple ``(grouped, price_bracket)`` where ``price_bracket`` is the
+    narrowest ``(priceLow, priceHigh)`` range that contains the request price
+    across all successfully-priced options (used for cache keying), or ``None``.
+    """
     enriched_results = []
-    device_id = payload.deviceId
+    bracket_low = None
+    bracket_high = None
 
-    for req in payload.requests:
+    for req in requests:
         enriched = req.dict()
         try:
             # Add lang field based on locale
@@ -156,12 +170,13 @@ def rate_request(
             missing = req.missing_fields()
             if missing:
                 error = f"Missing or blank required field(s): {', '.join(missing)}"
-                error_log_collection.insert_one({
-                    "input": req.dict(),
-                    "error_type": "validation",
-                    "error_detail": error,
-                    "created_at": datetime.utcnow()
-                })
+                if log_errors:
+                    error_log_collection.insert_one({
+                        "input": req.dict(),
+                        "error_type": "validation",
+                        "error_detail": error,
+                        "created_at": datetime.utcnow()
+                    })
                 enriched["status"] = "error"
                 enriched["error"] = error
                 enriched_results.append(enriched)
@@ -187,12 +202,13 @@ def rate_request(
                     "message": "No rating config found matching all input fields.",
                     "details": failure_reasons
                 }
-                error_log_collection.insert_one({
-                    "input": req.dict(),
-                    "error_type": "not_found",
-                    "error_detail": error,
-                    "created_at": datetime.utcnow()
-                })
+                if log_errors:
+                    error_log_collection.insert_one({
+                        "input": req.dict(),
+                        "error_type": "not_found",
+                        "error_detail": error,
+                        "created_at": datetime.utcnow()
+                    })
                 enriched["status"] = "error"
                 enriched["error"] = error
                 enriched_results.append(enriched)
@@ -217,6 +233,12 @@ def rate_request(
             rate = round(base_fee * locale_factor * poc_factor * category_factor * age_factor * price_factor * multi_factor, 2)
             rounded_price = round_price_49_99(rate)
 
+            # Track the narrowest price bracket containing this price (for caching)
+            bracket = find_price_bracket(matching_doc.get("priceFactor", []), req.price)
+            if bracket:
+                bracket_low = bracket[0] if bracket_low is None else max(bracket_low, bracket[0])
+                bracket_high = bracket[1] if bracket_high is None else min(bracket_high, bracket[1])
+
             enriched["status"] = "ok"
             enriched["factors"] = {
                 "base_fee": base_fee,
@@ -237,17 +259,37 @@ def rate_request(
 
         enriched_results.append(enriched)
 
-    # --- Group responses before storing/returning ---
+    # --- Group responses ---
     grouped = group_responses(enriched_results)
+    price_bracket = (bracket_low, bracket_high) if bracket_low is not None and bracket_high is not None else None
+    return grouped, price_bracket
 
-    # Store grouped responses in Quotes collection
-    quote_insert = quotes_collection.insert_one({
+
+def store_quote(grouped, device_id=None, client_key=None, extra=None):
+    """Persist a grouped quote into the Quotes collection and return its id."""
+    quote_doc = {
         "deviceId": device_id,
-        "clientKey": payload.clientKey,
+        "clientKey": client_key,
         "responses": grouped,
         "created_at": datetime.utcnow()
-    })
-    created_quote_id = str(quote_insert.inserted_id)
+    }
+    if extra:
+        quote_doc.update(extra)
+    quote_insert = quotes_collection.insert_one(quote_doc)
+    return str(quote_insert.inserted_id)
+
+
+# --- Endpoint ---
+
+@router.post("/rate_request")
+def rate_request(
+    payload: RateRequestBatch,
+    _: None = Depends(verify_token)
+):
+    grouped, _bracket = price_and_group(payload.requests)
+
+    # Store grouped responses in Quotes collection
+    created_quote_id = store_quote(grouped, device_id=payload.deviceId, client_key=payload.clientKey)
 
     return {
         "quote_id": created_quote_id,
