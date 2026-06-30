@@ -21,6 +21,7 @@ OPENAPI_TAGS = [
     {"name": "Operations", "description": "Internal tools and maintenance utilities."},
     {"name": "QA", "description": "Quality assurance utilities."},
     {"name": "Portal", "description": "Portal admin login and user management."},
+    {"name": "QR", "description": "QR code collection generation, scanning, and pairing."},
 ]
 
 docs_enabled = os.getenv("ENABLE_API_DOCS", "false").lower() == "true"
@@ -142,6 +143,14 @@ ROUTERS = {
     "cms_display_offer": "routers.cms.cms_display_offer",
     "strapi_proxy": "routers.cms.strapi",
     "validate_customer": "routers.cms.validate_customer",
+
+    # qr
+    "generate_qr_collection": "routers.qr.generate_qr_collection",
+    "generate_device_qr":     "routers.qr.generate_device_qr",
+    "scan_qr":                "routers.qr.scan_qr",
+    "pair_qr_to_device":      "routers.qr.pair_qr_to_device",
+    "get_qr":                 "routers.qr.get_qr",
+    "list_qr_collection":     "routers.qr.list_qr_collection",
 
     # portal admin
     "portal": "routers.portal",
