@@ -1,7 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
-from pymongo import MongoClient
 from bson import ObjectId
 import os
 import uuid
@@ -33,7 +32,8 @@ def generate_device_qr(
 ):
     """Generate a single QR code for an IoT device. The QR encodes a redirect
     URL that pre-populates the registration form with the device's identifiers."""
-    if not clientkey_collection.find_one({"ClientKey": body.client_key}):
+    client_doc = clientkey_collection.find_one({"ClientKey": body.client_key})
+    if not client_doc:
         raise HTTPException(status_code=400, detail="Invalid client_key")
 
     if body.custom_sku:
@@ -41,10 +41,12 @@ def generate_device_qr(
             sku_oid = ObjectId(body.custom_sku)
         except Exception:
             raise HTTPException(status_code=400, detail="custom_sku must be a valid MongoDB ObjectId")
-        if not customsku_collection.find_one({"_id": sku_oid}):
-            raise HTTPException(status_code=400, detail="custom_sku not found")
+        # Fix 3: validate SKU belongs to the requesting client
+        client_id = client_doc.get("Client_ID")
+        if not customsku_collection.find_one({"_id": sku_oid, "Client": client_id}):
+            raise HTTPException(status_code=400, detail="custom_sku not found for this client")
 
-    hex_key = _unique_hex_key()
+    hex_key = _unique_hex_key(used_in_batch=set())
     scan_url = f"{FASTAPI_BASE_URL}/qr/scan/{hex_key}"
     qr_image = generate_qr_code(scan_url)
     now = datetime.now(timezone.utc)
@@ -56,6 +58,7 @@ def generate_device_qr(
         "gtin": body.gtin or None,
     }
 
+    # Fix 1: omit device_id and paired_at fields entirely (don't store null)
     doc = {
         "hex_key": hex_key,
         "batch_id": str(uuid.uuid4()),
@@ -67,8 +70,6 @@ def generate_device_qr(
         "status": "unscanned",
         "scan_count": 0,
         "scans": [],
-        "device_id": None,
-        "paired_at": None,
         "created_at": now,
         "created_by": body.created_by,
     }

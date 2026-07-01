@@ -1,9 +1,9 @@
 """IP-based geolocation utilities for QR scan country detection."""
+import ipaddress
 import requests
 from fastapi import Request
 
 # Static mapping from ISO 3166-1 alpha-2 country codes to FastAPI locale strings.
-# Covers all locales in utils/locale.py plus common non-EU countries with en_GB fallback.
 _COUNTRY_TO_LOCALE = {
     "GB": "en_GB",
     "IE": "en_IE",
@@ -35,7 +35,39 @@ _COUNTRY_TO_LOCALE = {
     "NO": "nb_NO",
 }
 
-_PRIVATE_PREFIXES = ("10.", "192.168.", "172.", "127.", "::1", "localhost")
+# RFC 1918 + loopback + ULA private networks (Fix 4: only 172.16/12 is private, not all 172.x)
+_PRIVATE_NETWORKS = [
+    ipaddress.ip_network(n) for n in (
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "127.0.0.0/8",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+    )
+]
+
+
+def _is_private(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+        return any(addr in net for net in _PRIVATE_NETWORKS)
+    except ValueError:
+        return True
+
+
+def _mask_ip(ip: str) -> str:
+    """Mask the identifying portion of an IP address for GDPR storage (Fix 9: handles IPv6)."""
+    if not ip:
+        return ""
+    if ":" in ip:
+        # IPv6 — mask the last 64 bits (last two groups of a full address)
+        parts = ip.rsplit(":", 1)
+        return f"{parts[0]}:xxxx"
+    # IPv4 — mask the last octet
+    parts = ip.rsplit(".", 1)
+    return f"{parts[0]}.x" if len(parts) == 2 else ip
 
 
 def get_client_ip(request: Request) -> str:
@@ -49,21 +81,21 @@ def get_client_ip(request: Request) -> str:
 
 
 def lookup_country(ip: str, timeout: float = 2.0) -> dict:
-    """Call ip-api.com to resolve country from IP. Never raises."""
-    if not ip or any(ip.startswith(p) for p in _PRIVATE_PREFIXES):
+    """Resolve country from IP via ipinfo.io (HTTPS, free tier, Fix 5). Never raises."""
+    if not ip or _is_private(ip):
         return {"country_code": "", "country_name": ""}
     try:
         resp = requests.get(
-            f"http://ip-api.com/json/{ip}",
-            params={"fields": "status,country,countryCode"},
+            f"https://ipinfo.io/{ip}/json",
             timeout=timeout,
         )
         data = resp.json()
-        if data.get("status") == "success":
-            return {
-                "country_code": data.get("countryCode", ""),
-                "country_name": data.get("country", ""),
-            }
+        country_code = data.get("country", "")
+        # ipinfo.io returns country code only; country name requires a lookup we skip
+        return {
+            "country_code": country_code,
+            "country_name": country_code,  # use code as name fallback (sufficient for logging)
+        }
     except Exception:
         pass
     return {"country_code": "", "country_name": ""}

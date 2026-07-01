@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
+from pymongo.errors import DuplicateKeyError
 from datetime import datetime, timezone
 
 from utils.dependencies import verify_token
@@ -34,10 +35,16 @@ def pair_qr_to_device(body: PairQRRequest, _: None = Depends(verify_token)):
         raise HTTPException(status_code=409, detail="QR code is already paired to a different device")
 
     now = datetime.now(timezone.utc).isoformat()
-    result = qr_collection.update_one(
-        {"hex_key": hex_key, "device_id": None},
-        {"$set": {"device_id": body.device_id, "paired_at": now, "status": "paired"}},
-    )
+    try:
+        # Fix 1: match on device_id absent (not explicitly None) to align with partial index
+        result = qr_collection.update_one(
+            {"hex_key": hex_key, "device_id": {"$exists": False}},
+            {"$set": {"device_id": body.device_id, "paired_at": now, "status": "paired"}},
+        )
+    except DuplicateKeyError:
+        # Fix 11: race condition — another request paired this device_id first
+        raise HTTPException(status_code=409, detail="This device is already paired to another QR code")
+
     if result.modified_count == 0:
         raise HTTPException(status_code=409, detail="QR code is already paired to a different device")
 

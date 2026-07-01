@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
 from routers.qr.generate_qr_collection import qr_collection
-from utils.ip_geolocation import get_client_ip, lookup_country, country_code_to_locale
+from utils.ip_geolocation import get_client_ip, lookup_country, country_code_to_locale, _mask_ip
 
 router = APIRouter(tags=["QR"])
 
@@ -23,7 +23,11 @@ def scan_qr(hex_key: str, request: Request):
     if not _HEX_RE.match(hex_key):
         raise HTTPException(status_code=404, detail="QR code not found")
 
-    doc = qr_collection.find_one({"hex_key": hex_key})
+    # Fix 8: projection excludes qr_image_b64 (large field not needed for scan redirect)
+    doc = qr_collection.find_one(
+        {"hex_key": hex_key},
+        {"qr_image_b64": 0},
+    )
     if not doc:
         raise HTTPException(status_code=404, detail="QR code not found")
 
@@ -31,12 +35,9 @@ def scan_qr(hex_key: str, request: Request):
     geo = lookup_country(ip)
     locale = country_code_to_locale(geo["country_code"])
 
-    # Mask last octet for GDPR
-    ip_masked = re.sub(r"\.\d+$", ".x", ip) if ip else ""
-
     scan_event = {
         "scanned_at": datetime.now(timezone.utc).isoformat(),
-        "ip_masked": ip_masked,
+        "ip_masked": _mask_ip(ip),  # Fix 9: handles both IPv4 and IPv6
         "country_code": geo["country_code"],
         "country_name": geo["country_name"],
         "resolved_locale": locale,
@@ -59,12 +60,10 @@ def scan_qr(hex_key: str, request: Request):
     device_params = doc.get("device_params") or {}
 
     if device_id:
-        # Already paired — show the registered device info
         params = {"id": device_id, "clientKey": client_key, "locale": locale}
         redirect_url = f"{FRONTEND_BASE_URL}/device?{urlencode(params)}"
 
     elif custom_sku:
-        # Pre-linked to a product — go straight to the product registration page
         params = {"clientKey": client_key, "locale": locale, "id": custom_sku}
         if device_params.get("serial"):
             params["serial"] = device_params["serial"]
@@ -77,7 +76,6 @@ def scan_qr(hex_key: str, request: Request):
         redirect_url = f"{FRONTEND_BASE_URL}/product?{urlencode(params)}"
 
     elif device_params.get("make") and device_params.get("model"):
-        # IoT device QR without a custom_sku — use make/model/serial
         params = {"clientKey": client_key, "locale": locale}
         params["make"] = device_params["make"]
         params["model"] = device_params["model"]
@@ -94,7 +92,6 @@ def scan_qr(hex_key: str, request: Request):
         redirect_url = f"{FRONTEND_BASE_URL}/product?{urlencode(params)}"
 
     else:
-        # Generic QR — go to start for product search
         params = {"qr": hex_key, "locale": locale, "clientKey": client_key}
         redirect_url = f"{FRONTEND_BASE_URL}/start?{urlencode(params)}"
 

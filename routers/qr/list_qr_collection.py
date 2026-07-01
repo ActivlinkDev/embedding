@@ -37,7 +37,8 @@ def list_qr_collection(
         query["batch_id"] = batch_id
 
     total = qr_collection.count_documents(query)
-    docs = list(qr_collection.find(query).skip(offset).limit(limit))
+    # Fix 10: stable sort so skip/limit pagination returns consistent results
+    docs = list(qr_collection.find(query).sort("created_at", 1).skip(offset).limit(limit))
     return {
         "total": total,
         "limit": limit,
