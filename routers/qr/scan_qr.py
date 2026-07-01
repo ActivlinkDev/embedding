@@ -6,7 +6,7 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
-from routers.qr.generate_qr_collection import qr_collection
+from routers.qr.generate_qr_collection import qr_collection, clientkey_collection
 from utils.ip_geolocation import get_client_ip, lookup_country, country_code_to_locale, _mask_ip
 
 router = APIRouter(tags=["QR"])
@@ -55,13 +55,16 @@ def scan_qr(hex_key: str, request: Request):
     )
 
     client_key = doc.get("client_key", "")
+    client_doc = clientkey_collection.find_one({"ClientKey": client_key}) or {}
+    base_url = (client_doc.get("redirect_base_url") or FRONTEND_BASE_URL).rstrip("/")
+
     device_id = doc.get("device_id")
     custom_sku = doc.get("custom_sku")
     device_params = doc.get("device_params") or {}
 
     if device_id:
         params = {"id": device_id, "clientKey": client_key, "locale": locale}
-        redirect_url = f"{FRONTEND_BASE_URL}/device?{urlencode(params)}"
+        redirect_url = f"{base_url}/device?{urlencode(params)}"
 
     elif custom_sku:
         params = {"clientKey": client_key, "locale": locale, "id": custom_sku}
@@ -73,7 +76,7 @@ def scan_qr(hex_key: str, request: Request):
             params["model"] = device_params["model"]
         if device_params.get("gtin"):
             params["gtin"] = device_params["gtin"]
-        redirect_url = f"{FRONTEND_BASE_URL}/product?{urlencode(params)}"
+        redirect_url = f"{base_url}/product?{urlencode(params)}"
 
     elif device_params.get("make") and device_params.get("model"):
         params = {"clientKey": client_key, "locale": locale}
@@ -83,16 +86,16 @@ def scan_qr(hex_key: str, request: Request):
             params["serial"] = device_params["serial"]
         if device_params.get("gtin"):
             params["gtin"] = device_params["gtin"]
-        redirect_url = f"{FRONTEND_BASE_URL}/product?{urlencode(params)}"
+        redirect_url = f"{base_url}/product?{urlencode(params)}"
 
     elif device_params.get("gtin"):
         params = {"clientKey": client_key, "locale": locale, "gtin": device_params["gtin"]}
         if device_params.get("serial"):
             params["serial"] = device_params["serial"]
-        redirect_url = f"{FRONTEND_BASE_URL}/product?{urlencode(params)}"
+        redirect_url = f"{base_url}/product?{urlencode(params)}"
 
     else:
         params = {"qr": hex_key, "locale": locale, "clientKey": client_key}
-        redirect_url = f"{FRONTEND_BASE_URL}/start?{urlencode(params)}"
+        redirect_url = f"{base_url}/start?{urlencode(params)}"
 
     return RedirectResponse(url=redirect_url, status_code=302)
