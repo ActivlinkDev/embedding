@@ -16,7 +16,7 @@ registered device, so this path starts from a CustomSKU and never writes a
 ``Devices`` doc.
 """
 
-from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from pymongo import MongoClient
@@ -66,6 +66,13 @@ class WidgetQuoteRequest(WidgetPriceRequest):
 def _to_int(val, default=0):
     try:
         return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(val, default=0.0):
+    try:
+        return float(val)
     except (TypeError, ValueError):
         return default
 
@@ -121,7 +128,7 @@ def resolve_widget_inputs(payload: WidgetPriceRequest):
         gtee = _to_int(guarantees.get("Labour")) or _to_int(guarantees.get("Parts"))
 
     # Price — request value, fall back to MSRP
-    price = payload.price or _to_int(lsd.get("MSRP"))
+    price = payload.price or _to_float(lsd.get("MSRP"))
 
     # Purchase date — request value, else today (new purchase)
     purchase_date = (payload.purchaseDate or "").strip() or datetime.utcnow().strftime("%Y-%m-%d")
@@ -136,14 +143,21 @@ def resolve_widget_inputs(payload: WidgetPriceRequest):
         gtee=gtee,
         currency=currency,
     )
-    age_in_months = calculate_age_in_months(purchase_date)
+    try:
+        age_in_months = calculate_age_in_months(purchase_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid purchaseDate; expected YYYY-MM-DD")
     return assignment_request, age_in_months, client_doc, customsku_doc, lsd
 
 
 def compute_options(payload: WidgetPriceRequest):
     """Run assignment + rating for a widget request. Returns (grouped, bracket, currency)."""
     assignment_request, age_in_months, _client_doc, _sku, _lsd = resolve_widget_inputs(payload)
+    return _compute_options_from_assignment(assignment_request, age_in_months)
 
+
+def _compute_options_from_assignment(assignment_request, age_in_months):
+    """Run assignment + rating from already-resolved inputs. Returns (grouped, bracket, currency)."""
     assignment_result = product_assignment(assignment_request)
     products = assignment_result.get("products") or []
     if not products:
@@ -175,11 +189,13 @@ def compute_options(payload: WidgetPriceRequest):
 
 # ---------- Cache ----------
 
-def _cache_read(custom_sku_id, locale, age, price):
+def _cache_read(custom_sku_id, locale, age, price, gtee, currency):
     doc = widget_cache_collection.find_one({
         "customSkuId": custom_sku_id,
         "locale": locale,
         "age": age,
+        "gtee": gtee,
+        "currency": currency,
         "priceLow": {"$lte": price},
         "priceHigh": {"$gte": price},
     })
@@ -198,14 +214,23 @@ def _cache_invalidate(custom_sku_id, locale=None):
     widget_cache_collection.delete_many(query)
 
 
-def _cache_write(custom_sku_id, locale, age, price, bracket, currency, grouped):
+def _cache_write(custom_sku_id, locale, age, price, gtee, bracket, currency, grouped):
     low, high = bracket if bracket else (price, price)
     widget_cache_collection.update_one(
-        {"customSkuId": custom_sku_id, "locale": locale, "age": age, "priceLow": low, "priceHigh": high},
+        {
+            "customSkuId": custom_sku_id,
+            "locale": locale,
+            "age": age,
+            "gtee": gtee,
+            "currency": currency,
+            "priceLow": low,
+            "priceHigh": high,
+        },
         {"$set": {
             "customSkuId": custom_sku_id,
             "locale": locale,
             "age": age,
+            "gtee": gtee,
             "priceLow": low,
             "priceHigh": high,
             "currency": currency,
@@ -218,17 +243,22 @@ def _cache_write(custom_sku_id, locale, age, price, bracket, currency, grouped):
 
 def _priced_options(payload: WidgetPriceRequest):
     """Return (grouped, currency), using the cache when fresh."""
-    # Resolve age cheaply for the cache key (purchase_date defaults to today)
-    purchase_date = (payload.purchaseDate or "").strip() or datetime.utcnow().strftime("%Y-%m-%d")
-    age = calculate_age_in_months(purchase_date)
+    assignment_request, age_in_months, _client_doc, _sku, _lsd = resolve_widget_inputs(payload)
+    price = assignment_request.price
 
-    cached = _cache_read(payload.customSkuId, payload.locale, age, payload.price)
+    cached = _cache_read(
+        payload.customSkuId, payload.locale, age_in_months, price,
+        assignment_request.gtee, assignment_request.currency,
+    )
     if cached:
         return cached.get("options", []), cached.get("currency")
 
-    grouped, bracket, currency = compute_options(payload)
+    grouped, bracket, currency = _compute_options_from_assignment(assignment_request, age_in_months)
     if grouped:
-        _cache_write(payload.customSkuId, payload.locale, age, payload.price, bracket, currency, grouped)
+        _cache_write(
+            payload.customSkuId, payload.locale, age_in_months, price,
+            assignment_request.gtee, bracket, currency, grouped,
+        )
     return grouped, currency
 
 
@@ -298,12 +328,14 @@ def widget_quote(payload: WidgetQuoteRequest, request: Request, _: None = Depend
 @router.post("/widget_quote/refresh")
 def widget_quote_refresh(payload: WidgetPriceRequest, _: None = Depends(verify_token)):
     """Admin: force-rebuild the cache entry for a CustomSKU + locale + price."""
-    grouped, bracket, currency = compute_options(payload)
+    assignment_request, age_in_months, _client_doc, _sku, _lsd = resolve_widget_inputs(payload)
+    grouped, bracket, currency = _compute_options_from_assignment(assignment_request, age_in_months)
     if not grouped:
         raise HTTPException(status_code=404, detail="No protection options to cache")
-    purchase_date = (payload.purchaseDate or "").strip() or datetime.utcnow().strftime("%Y-%m-%d")
-    age = calculate_age_in_months(purchase_date)
-    _cache_write(payload.customSkuId, payload.locale, age, payload.price, bracket, currency, grouped)
+    _cache_write(
+        payload.customSkuId, payload.locale, age_in_months, assignment_request.price,
+        assignment_request.gtee, bracket, currency, grouped,
+    )
     return {"status": "ok", "cached_options": len(grouped)}
 
 
@@ -325,11 +357,18 @@ def warm_widget_cache(client_key: str, custom_sku_id: str, locale: str, price: O
         payload = WidgetPriceRequest(
             clientKey=client_key, customSkuId=custom_sku_id, price=price, locale=locale
         )
-        grouped, bracket, currency = compute_options(payload)
+        assignment_request, age_in_months, _client_doc, _sku, _lsd = resolve_widget_inputs(payload)
+        grouped, bracket, currency = _compute_options_from_assignment(assignment_request, age_in_months)
+
+        # Always drop existing cache rows for this SKU/locale: even when
+        # recomputation yields no options (category/MSRP/guarantees changed
+        # such that nothing matches), stale rows must not keep being served.
+        _cache_invalidate(custom_sku_id, locale)
         if grouped:
-            _cache_invalidate(custom_sku_id, locale)
-            age = calculate_age_in_months(datetime.utcnow().strftime("%Y-%m-%d"))
-            _cache_write(custom_sku_id, locale, age, price, bracket, currency, grouped)
+            _cache_write(
+                custom_sku_id, locale, age_in_months, assignment_request.price,
+                assignment_request.gtee, bracket, currency, grouped,
+            )
             print(f"[WIDGET-CACHE] warmed {custom_sku_id} / {locale}")
     except Exception as e:
         print(f"[WIDGET-CACHE] warm failed for {custom_sku_id}/{locale}: {e}")

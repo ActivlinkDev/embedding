@@ -261,7 +261,10 @@ def price_and_group(requests: List[RateRequest], log_errors: bool = True):
 
     # --- Group responses ---
     grouped = group_responses(enriched_results)
-    price_bracket = (bracket_low, bracket_high) if bracket_low is not None and bracket_high is not None else None
+    if bracket_low is not None and bracket_high is not None and bracket_low <= bracket_high:
+        price_bracket = (bracket_low, bracket_high)
+    else:
+        price_bracket = None
     return grouped, price_bracket
 
 
