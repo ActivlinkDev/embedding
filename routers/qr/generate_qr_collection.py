@@ -40,7 +40,7 @@ try:
 except Exception:
     pass
 
-FASTAPI_BASE_URL = os.getenv("FASTAPI_BASE_URL", "").rstrip("/")
+FASTAPI_BASE_URL = os.getenv("FASTAPI_BASE_URL", "https://api.activlink.io").rstrip("/")
 MAX_BATCH = 500
 
 
