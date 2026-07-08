@@ -12,7 +12,7 @@ from routers.qr.generate_qr_collection import qr_collection, clientkey_collectio
 
 router = APIRouter(tags=["QR"])
 
-FASTAPI_BASE_URL = os.getenv("FASTAPI_BASE_URL", "").rstrip("/")
+FASTAPI_BASE_URL = os.getenv("FASTAPI_BASE_URL", "https://api.activlink.io").rstrip("/")
 
 
 class DeviceQRRequest(BaseModel):
