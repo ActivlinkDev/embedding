@@ -4,8 +4,10 @@ import importlib
 import asyncio, traceback
 from fastapi import FastAPI, Request
 from routers.quote import router as quote_router
+from routers.auth import router as auth_router
 
 OPENAPI_TAGS = [
+    {"name": "Auth", "description": "Service-client authentication: exchange credentials for a short-lived JWT."},
     {"name": "Catalog", "description": "Category, SKU, and client catalog lookups."},
     {"name": "Localization", "description": "Locale lookups and mappings."},
     {"name": "Enrichment", "description": "Third-party enrichment and AI extraction."},
@@ -170,6 +172,7 @@ for name, module_path in ROUTERS.items():
         continue
     _include_router(module_path)
 app.include_router(quote_router)
+app.include_router(auth_router)
 
 # -------- Background poller (multi-mailbox) --------
 if os.getenv("ENABLE_EMAIL_POLL", "false").lower() == "true":
