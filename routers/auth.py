@@ -64,8 +64,21 @@ def issue_token(body: TokenRequest):
 
 class CreateClientRequest(BaseModel):
     client_id: str = Field(..., description="Unique identifier for the caller, e.g. 'frontend' or 'AO-manufacturer'")
-    scopes: List[str] = Field(..., min_length=1, description="Scopes granted to this caller, e.g. ['sku:read']")
-    client_key: Optional[str] = Field(None, description="ClientKey.ClientKey this caller is scoped to, if any")
+    scopes: List[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Scopes granted to this caller, e.g. ['sku:read']. Add 'clientkey:*' to reach every "
+            "tenant; otherwise the caller reaches only the client_key below."
+        ),
+    )
+    client_key: Optional[str] = Field(
+        None,
+        description=(
+            "ClientKey.ClientKey this caller is bound to. Leave null only for callers holding "
+            "'clientkey:*' — a null binding without that scope reaches no tenant data at all."
+        ),
+    )
 
 
 class CreateClientResponse(BaseModel):
