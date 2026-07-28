@@ -2,6 +2,7 @@ import os
 import hmac
 import logging
 import email.message
+from typing import Optional
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
@@ -165,6 +166,18 @@ async def verify_token(request: Request, credentials: HTTPAuthorizationCredentia
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid or missing token",
     )
+
+
+def caller_client_key(request: Request, _: None = Depends(verify_token)) -> Optional[str]:
+    """The tenant this caller is pinned to, or None if it may act on any client.
+
+    `_enforce_client_key` only constrains requests that *name* a ClientKey. Routes that reach
+    tenant-owned data by another identifier — a record id, a customer id, or no filter at all —
+    must apply this to their own queries, and 404 records whose owner does not match. Records
+    with an empty/missing owner field are treated as not belonging to a pinned caller.
+    """
+    caller = getattr(request.state, "caller", {}) or {}
+    return caller.get("client_key") or None
 
 
 def require_scope(scope: str):

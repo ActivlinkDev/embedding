@@ -186,22 +186,38 @@ Rolling this out to callers that already exist: set `ENFORCE_CLIENT_KEY_SCOPE=fa
 violation is then logged as `[AUTH-SCOPE]` without a 403, so you can see which credentials are
 reaching outside their tenant before enforcement starts returning errors.
 
+### Row-level scoping
+
+Rejecting requests that *name* another tenant is not enough on its own: an endpoint can reach
+tenant data by a record id, a customer id, or no filter at all. So the contract, order and quote
+routes also constrain their own queries via the `caller_client_key` dependency:
+
+| Route | Behaviour for a pinned caller |
+| --- | --- |
+| `GET /contracts`, `GET /orders` | Filter forced to the caller's `client_key`, whatever the query string says. |
+| `GET /customers/{id}/contracts`, `.../orders`, `GET /devices/{id}/contracts` | Same filter applied. |
+| `GET /contracts/{id}`, `GET /orders/{id}`, `GET /quote/{id}` | `404` if the record belongs to another tenant. |
+| `POST /contracts/{id}/cancel`, `.../resend` | `404` on another tenant's contract — mutations are scoped too. |
+| `POST /contracts/jobs/*` | `403`. These sweep every tenant, so they are closed to pinned callers. |
+
+Cross-tenant reads return **404, not 403**, so a pinned caller cannot use the status code to
+discover that another tenant's record id exists.
+
+Records whose owner field is empty or missing are invisible to a pinned caller. That matters for
+orders: `contract_service.py` backfills an order's `client_key` from its first child contract, so
+an unbackfilled order has `""` and will not appear. Quote documents store the owner as camelCase
+`clientKey`, unlike contracts and orders.
+
+Writing a new route that touches tenant-owned data? Take `scope: str | None = Depends(caller_client_key)`
+and apply it to the query. The dependency alone will not cover you unless the request names a ClientKey.
+
 ### What this does not cover
 
-The check constrains requests that **name** a ClientKey. It cannot constrain a request that
-reaches tenant data by another identifier, so a pinned caller can still:
-
-- list every tenant's records on endpoints where the filter is optional — `GET /contracts` and
-  `GET /orders` query all clients when `client_key` is omitted;
-- read a single record by id — `GET /contracts/{contract_id}`, `GET /orders/{order_id}` and
-  `GET /quote/{quote_id}` look up by `_id` alone and never compare the document's `client_key`.
-
-Closing that needs row-level scoping in those routes: apply `request.state.caller["client_key"]`
-to the query when the caller is pinned, and 404 a record whose `client_key` differs. The contract
-and order documents already carry `client_key`, so the data supports it.
-
-Also not covered: `multipart/form-data` bodies, since parsing them would consume file uploads. No
+`multipart/form-data` bodies are not inspected, since parsing them would consume file uploads. No
 current route takes a ClientKey that way, but a new one would need its own check.
+
+Routes outside contracts/orders/quotes that reach tenant data by a non-ClientKey identifier have
+not been audited for this. The dependency still blocks any request that names another tenant.
 
 ### Scopes
 
