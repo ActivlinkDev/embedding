@@ -44,6 +44,15 @@ ACCESS_TOKEN_EXPIRES_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRES_MINUTES", "45
 # Legacy single shared secret, kept only as a migration fallback in utils/dependencies.py.
 LEGACY_API_TOKEN = os.getenv("API_TOKEN")
 
+# Scope required to manage ServiceClient credentials. WILDCARD_SCOPE is what the legacy static
+# token carries during migration; a stored client may also hold it, so both count as admin.
+ADMIN_SCOPE = "admin:clients"
+WILDCARD_SCOPE = "*"
+
+
+class LastAdminClientError(Exception):
+    """Deactivating this client would leave no active holder of ADMIN_SCOPE."""
+
 if not JWT_SIGNING_SECRET and not LEGACY_API_TOKEN:
     raise RuntimeError(
         "Neither JWT_SIGNING_SECRET nor API_TOKEN is set. "
@@ -138,15 +147,54 @@ def rotate_service_client_secret(client_id: str, new_secret: str, rotated_by: Op
     return result.matched_count > 0
 
 
+def _holds_admin_scope(doc: dict) -> bool:
+    return any(s in (ADMIN_SCOPE, WILDCARD_SCOPE) for s in doc.get("scopes", []))
+
+
+def _active_admin_count(exclude_client_id: Optional[str] = None) -> int:
+    query: dict = {"active": True, "scopes": {"$in": [ADMIN_SCOPE, WILDCARD_SCOPE]}}
+    if exclude_client_id is not None:
+        query["client_id"] = {"$ne": exclude_client_id}
+    return _service_clients.count_documents(query)
+
+
 def set_service_client_active(client_id: str, active: bool) -> bool:
     """Enable/disable a client. Disabling takes effect at the next /auth/token call —
-    already-issued JWTs stay valid until they expire. Returns False if not found."""
+    already-issued JWTs stay valid until they expire. Returns False if not found.
+
+    Refuses to deactivate the last active holder of ADMIN_SCOPE (raises
+    LastAdminClientError): with the legacy static API_TOKEN switched off, that would leave
+    nobody able to manage credentials over the API, recoverable only via direct Mongo access.
+    """
     if _service_clients is None:
         raise RuntimeError("MONGO_URI not configured")
-    result = _service_clients.update_one(
-        {"client_id": client_id}, {"$set": {"active": active}}
-    )
-    return result.matched_count > 0
+
+    if active:
+        result = _service_clients.update_one({"client_id": client_id}, {"$set": {"active": True}})
+        return result.matched_count > 0
+
+    doc = _service_clients.find_one({"client_id": client_id})
+    if doc is None:
+        return False
+
+    guarded = _holds_admin_scope(doc) and doc.get("active", False)
+    if guarded and _active_admin_count(exclude_client_id=client_id) == 0:
+        raise LastAdminClientError(
+            f"'{client_id}' is the only active client holding '{ADMIN_SCOPE}'. "
+            "Create another admin client before deactivating this one."
+        )
+
+    _service_clients.update_one({"client_id": client_id}, {"$set": {"active": False}})
+
+    # Re-check after the write: two concurrent deactivations can each see the other as a
+    # surviving admin. Whichever write lands second finds zero admins left and undoes itself.
+    if guarded and _active_admin_count() == 0:
+        _service_clients.update_one({"client_id": client_id}, {"$set": {"active": True}})
+        raise LastAdminClientError(
+            f"'{client_id}' is the only active client holding '{ADMIN_SCOPE}'. "
+            "Create another admin client before deactivating this one."
+        )
+    return True
 
 
 def generate_client_secret() -> str:

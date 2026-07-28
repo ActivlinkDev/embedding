@@ -24,6 +24,11 @@ ALLOW_LEGACY_API_TOKEN = os.getenv("ALLOW_LEGACY_API_TOKEN", "true").lower() == 
 # (useful when first pinning existing callers, to catch over-broad credentials before they 403).
 ENFORCE_CLIENT_KEY_SCOPE = os.getenv("ENFORCE_CLIENT_KEY_SCOPE", "true").lower() == "true"
 
+# Scope granting access to every tenant. Tenant access is fail-closed, so a caller with no
+# client_key binding needs this to reach any tenant data at all — issuing a credential without
+# a binding is then a credential that can do nothing, rather than one that can do everything.
+CLIENT_KEY_WILDCARD_SCOPE = "clientkey:*"
+
 security = HTTPBearer()  # 👈 built-in bearer token scheme
 
 # ClientKey is spelled several ways across the routers (ClientKey, clientKey, client_key,
@@ -103,30 +108,64 @@ async def _request_client_keys(request: Request) -> set:
     return found
 
 
-async def _enforce_client_key(request: Request, caller: dict) -> None:
-    """A caller pinned to one client_key may only touch that client's data."""
-    allowed = caller.get("client_key")
-    if not allowed:
-        return  # unpinned credential (first-party callers, legacy static token)
+def _is_unrestricted(caller: dict) -> bool:
+    """Whether this caller may act across every tenant. "*" is the legacy static token's scope,
+    kept working until ALLOW_LEGACY_API_TOKEN=false."""
+    scopes = caller.get("scopes", [])
+    return CLIENT_KEY_WILDCARD_SCOPE in scopes or "*" in scopes
 
+
+def _reject_or_log(caller: dict, detail: str, log_args: tuple) -> None:
+    logger.warning(*log_args)
+    if ENFORCE_CLIENT_KEY_SCOPE:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+
+async def _enforce_client_key(request: Request, caller: dict) -> None:
+    """Tenant access is fail-closed: a caller reaches a ClientKey only by being pinned to it, or
+    by holding CLIENT_KEY_WILDCARD_SCOPE. A credential with neither — client_key null and no
+    wildcard — reaches no tenant data at all, so one issued without a binding by mistake fails
+    closed rather than silently seeing every tenant's records.
+    """
+    allowed = caller.get("client_key")
     requested = await _request_client_keys(request)
+
+    if not allowed:
+        # Requests that name no ClientKey are not tenant-addressed (health, /auth/token,
+        # category and locale lookups), so an unpinned caller is left alone there.
+        if not requested or _is_unrestricted(caller):
+            return
+        _reject_or_log(
+            caller,
+            f"Caller is not bound to a ClientKey and lacks the '{CLIENT_KEY_WILDCARD_SCOPE}' scope",
+            (
+                "[AUTH-SCOPE] ServiceClient '%s' is unbound and lacks '%s'; requested client_key(s) "
+                "%s on %s%s",
+                caller.get("client_id"),
+                CLIENT_KEY_WILDCARD_SCOPE,
+                sorted(requested),
+                request.url.path,
+                "" if ENFORCE_CLIENT_KEY_SCOPE else " — not enforced (ENFORCE_CLIENT_KEY_SCOPE=false)",
+            ),
+        )
+        return
+
     mismatched = sorted(k for k in requested if k != allowed)
     if not mismatched:
         return
 
-    logger.warning(
-        "[AUTH-SCOPE] ServiceClient '%s' (client_key=%s) requested client_key(s) %s on %s%s",
-        caller.get("client_id"),
-        allowed,
-        mismatched,
-        request.url.path,
-        "" if ENFORCE_CLIENT_KEY_SCOPE else " — not enforced (ENFORCE_CLIENT_KEY_SCOPE=false)",
+    _reject_or_log(
+        caller,
+        f"Caller is scoped to ClientKey {allowed}",
+        (
+            "[AUTH-SCOPE] ServiceClient '%s' (client_key=%s) requested client_key(s) %s on %s%s",
+            caller.get("client_id"),
+            allowed,
+            mismatched,
+            request.url.path,
+            "" if ENFORCE_CLIENT_KEY_SCOPE else " — not enforced (ENFORCE_CLIENT_KEY_SCOPE=false)",
+        ),
     )
-    if ENFORCE_CLIENT_KEY_SCOPE:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Caller is scoped to ClientKey {allowed}",
-        )
 
 
 async def verify_token(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -175,9 +214,26 @@ def caller_client_key(request: Request, _: None = Depends(verify_token)) -> Opti
     tenant-owned data by another identifier — a record id, a customer id, or no filter at all —
     must apply this to their own queries, and 404 records whose owner does not match. Records
     with an empty/missing owner field are treated as not belonging to a pinned caller.
+
+    Returning None means "no tenant filter", so an unbound caller must earn it with
+    CLIENT_KEY_WILDCARD_SCOPE. Without that scope it is refused here rather than handed an
+    unfiltered query — the same fail-closed rule `_enforce_client_key` applies, for the routes
+    where the tenant is never named in the request.
     """
     caller = getattr(request.state, "caller", {}) or {}
-    return caller.get("client_key") or None
+    pinned = caller.get("client_key") or None
+    if pinned is None and ENFORCE_CLIENT_KEY_SCOPE and not _is_unrestricted(caller):
+        logger.warning(
+            "[AUTH-SCOPE] ServiceClient '%s' is unbound and lacks '%s'; refused unfiltered access to %s",
+            caller.get("client_id"),
+            CLIENT_KEY_WILDCARD_SCOPE,
+            request.url.path,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Caller is not bound to a ClientKey and lacks the '{CLIENT_KEY_WILDCARD_SCOPE}' scope",
+        )
+    return pinned
 
 
 def require_scope(scope: str):
