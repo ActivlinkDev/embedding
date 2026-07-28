@@ -177,15 +177,31 @@ including nested objects — must equal it, or the request is rejected:
 ```
 
 Name matching ignores case and underscores, so `ClientKey`, `clientKey`, `client_key`, `clientkey`
-and `Client_Key` are all covered. Requests carrying no ClientKey at all are unaffected, as are
-callers whose `client_key` is `null` (first-party callers, and the legacy static token).
+and `Client_Key` are all covered. Body inspection mirrors FastAPI's own content-type rules, so it
+sees every structured JSON media type (`application/merge-patch+json`, `application/vnd.api+json`,
+…) and bodies sent with no `Content-Type` — anything the route itself would decode. Callers whose
+`client_key` is `null` are unaffected (first-party callers, and the legacy static token).
 
 Rolling this out to callers that already exist: set `ENFORCE_CLIENT_KEY_SCOPE=false` first. Every
 violation is then logged as `[AUTH-SCOPE]` without a 403, so you can see which credentials are
 reaching outside their tenant before enforcement starts returning errors.
 
-Known gap: `multipart/form-data` bodies are not inspected — parsing them would consume file
-uploads. No current route takes a ClientKey that way, but a new one would need its own check.
+### What this does not cover
+
+The check constrains requests that **name** a ClientKey. It cannot constrain a request that
+reaches tenant data by another identifier, so a pinned caller can still:
+
+- list every tenant's records on endpoints where the filter is optional — `GET /contracts` and
+  `GET /orders` query all clients when `client_key` is omitted;
+- read a single record by id — `GET /contracts/{contract_id}`, `GET /orders/{order_id}` and
+  `GET /quote/{quote_id}` look up by `_id` alone and never compare the document's `client_key`.
+
+Closing that needs row-level scoping in those routes: apply `request.state.caller["client_key"]`
+to the query when the caller is pinned, and 404 a record whose `client_key` differs. The contract
+and order documents already carry `client_key`, so the data supports it.
+
+Also not covered: `multipart/form-data` bodies, since parsing them would consume file uploads. No
+current route takes a ClientKey that way, but a new one would need its own check.
 
 ### Scopes
 

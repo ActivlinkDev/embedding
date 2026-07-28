@@ -1,6 +1,7 @@
 import os
 import hmac
 import logging
+import email.message
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
@@ -49,6 +50,32 @@ def _collect_from_payload(node, depth: int, found: set) -> None:
             _collect_from_payload(item, depth + 1, found)
 
 
+def _body_kind(request: Request) -> str:
+    """How FastAPI will decode this body — mirrors the content-type logic in fastapi.routing,
+    so the check can never inspect less than the route itself parses. Returns json/form/skip.
+
+    Notably JSON covers every `application/*+json` structured syntax (merge-patch+json,
+    vnd.api+json, …) and a body sent with no Content-Type at all, both of which FastAPI binds
+    to a Pydantic model. multipart/form-data is deliberately skipped: parsing it would consume
+    the upload stream.
+    """
+    content_type_value = request.headers.get("content-type")
+    if not content_type_value:
+        return "json"
+
+    message = email.message.Message()
+    message["content-type"] = content_type_value
+    if message.get_content_maintype() != "application":
+        return "skip"
+
+    subtype = message.get_content_subtype()
+    if subtype == "json" or subtype.endswith("+json"):
+        return "json"
+    if subtype == "x-www-form-urlencoded":
+        return "form"
+    return "skip"
+
+
 async def _request_client_keys(request: Request) -> set:
     """Every ClientKey value this request is asking to act on: path, query, then body."""
     found: set = set()
@@ -58,12 +85,12 @@ async def _request_client_keys(request: Request) -> set:
             if _is_client_key_name(key) and isinstance(value, str):
                 found.add(value)
 
-    content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    kind = _body_kind(request)
     try:
-        if content_type == "application/json":
+        if kind == "json":
             # Starlette caches the body, so reading it here does not consume it for the route.
             _collect_from_payload(await request.json(), 0, found)
-        elif content_type == "application/x-www-form-urlencoded":
+        elif kind == "form":
             for key, value in (await request.form()).items():
                 if _is_client_key_name(key) and isinstance(value, str):
                     found.add(value)
