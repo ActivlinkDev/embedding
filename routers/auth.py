@@ -7,6 +7,11 @@ from pydantic import BaseModel, Field
 from utils.dependencies import require_scope
 from utils.jwt_auth import (
     ACCESS_TOKEN_EXPIRES_MINUTES,
+    # Scope required to manage ServiceClient credentials. The legacy static API_TOKEN holds the
+    # wildcard "*" scope during migration, so it can bootstrap the first admin client — one more
+    # reason to set ALLOW_LEGACY_API_TOKEN=false as soon as every caller has moved over.
+    ADMIN_SCOPE,
+    LastAdminClientError,
     authenticate_service_client,
     create_service_client,
     generate_client_secret,
@@ -17,11 +22,6 @@ from utils.jwt_auth import (
 )
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
-
-# Scope required to manage ServiceClient credentials. The legacy static API_TOKEN holds the
-# wildcard "*" scope during migration, so it can bootstrap the first admin client — one more
-# reason to set ALLOW_LEGACY_API_TOKEN=false as soon as every caller has moved over.
-ADMIN_SCOPE = "admin:clients"
 
 
 class TokenRequest(BaseModel):
@@ -160,12 +160,18 @@ def rotate_client_secret(client_id: str, caller: dict = Depends(require_scope(AD
 @router.patch("/clients/{client_id}", response_model=ServiceClientSummary)
 def set_client_active(client_id: str, body: SetActiveRequest, _: dict = Depends(require_scope(ADMIN_SCOPE))):
     """Enable or revoke a client. Revoking blocks new /auth/token calls; tokens already issued
-    stay valid until they expire (at most ACCESS_TOKEN_EXPIRES_MINUTES)."""
+    stay valid until they expire (at most ACCESS_TOKEN_EXPIRES_MINUTES).
+
+    Revoking the last active admin:clients holder is refused with 409 — it would lock everyone
+    out of credential management once the legacy static token is disabled.
+    """
     try:
         found = set_service_client_active(client_id, body.active)
         if not found:
             raise HTTPException(status_code=404, detail=f"ServiceClient '{client_id}' not found")
         updated = next((c for c in list_service_clients() if c["client_id"] == client_id), None)
+    except LastAdminClientError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     if updated is None:
