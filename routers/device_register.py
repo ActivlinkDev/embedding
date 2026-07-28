@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional, List, Any
-from utils.dependencies import verify_token
+from utils.dependencies import require_scope
 from pymongo import MongoClient
 from bson import ObjectId
 import os
@@ -145,7 +145,7 @@ def price_is_missing(val):
 # ------------------------------------------------------------
 
 @router.post("/device-register")
-def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_token)):
+def device_register(payload: SimpleRegisterRequest, _: dict = Depends(require_scope("device:write"))):
     validate_mandatory_fields(payload)
 
     # 1. Lookup client document by clientkey (MUST match exactly)

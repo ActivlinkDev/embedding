@@ -5,7 +5,7 @@ from bson import ObjectId
 import os
 from dotenv import load_dotenv
 
-from utils.dependencies import verify_token
+from utils.dependencies import require_scope
 
 load_dotenv()
 
@@ -30,7 +30,7 @@ class DeleteCustomSKURequest(BaseModel):
 
 
 @router.post("/delete_custom_sku")
-def delete_custom_sku(data: DeleteCustomSKURequest, _: None = Depends(verify_token)):
+def delete_custom_sku(data: DeleteCustomSKURequest, _: dict = Depends(require_scope("sku:write"))):
     """Delete a single CustomSKU by id, scoped to the client that owns it."""
     clientkey_doc = clientkey_collection.find_one({"ClientKey": data.ClientKey})
     if not clientkey_doc or "Client_ID" not in clientkey_doc:

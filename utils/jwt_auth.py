@@ -14,6 +14,9 @@ from typing import Optional
 import jwt
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
+from dotenv import load_dotenv
+
+load_dotenv()
 
 MONGO_URI = os.getenv("MONGO_URI")
 _client = MongoClient(MONGO_URI) if MONGO_URI else None
