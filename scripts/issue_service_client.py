@@ -5,15 +5,18 @@ Usage:
         [--client-key AOPON12345] [--created-by "your-name"]
 
 Prints the raw client_secret once — only its hash is stored, so save it now.
+
+The same operation is available over HTTP as POST /auth/clients (see the Auth section of
+/docs), which needs an 'admin:clients' scope. Use this CLI to bootstrap the first admin
+client, or whenever you have Mongo access but not an admin token.
 """
 import argparse
-import secrets
 import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.jwt_auth import create_service_client  # noqa: E402
+from utils.jwt_auth import create_service_client, generate_client_secret  # noqa: E402
 
 
 def main() -> None:
@@ -24,7 +27,7 @@ def main() -> None:
     parser.add_argument("--created-by", default=None, help="Who is issuing this credential")
     args = parser.parse_args()
 
-    client_secret = secrets.token_urlsafe(32)
+    client_secret = generate_client_secret()
 
     try:
         create_service_client(

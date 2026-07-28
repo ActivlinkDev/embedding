@@ -112,6 +112,47 @@ def authenticate_service_client(client_id: str, client_secret: str) -> Optional[
     return doc
 
 
+def list_service_clients() -> list[dict]:
+    """All ServiceClients without their secret hashes — safe to return over the API."""
+    if _service_clients is None:
+        raise RuntimeError("MONGO_URI not configured")
+    return list(
+        _service_clients.find({}, {"_id": 0, "secret_hash": 0}).sort("created_at", 1)
+    )
+
+
+def rotate_service_client_secret(client_id: str, new_secret: str, rotated_by: Optional[str] = None) -> bool:
+    """Replace a client's secret hash. Returns False if the client does not exist."""
+    if _service_clients is None:
+        raise RuntimeError("MONGO_URI not configured")
+    result = _service_clients.update_one(
+        {"client_id": client_id},
+        {
+            "$set": {
+                "secret_hash": _hash_secret(new_secret),
+                "rotated_at": datetime.datetime.utcnow(),
+                "rotated_by": rotated_by,
+            }
+        },
+    )
+    return result.matched_count > 0
+
+
+def set_service_client_active(client_id: str, active: bool) -> bool:
+    """Enable/disable a client. Disabling takes effect at the next /auth/token call —
+    already-issued JWTs stay valid until they expire. Returns False if not found."""
+    if _service_clients is None:
+        raise RuntimeError("MONGO_URI not configured")
+    result = _service_clients.update_one(
+        {"client_id": client_id}, {"$set": {"active": active}}
+    )
+    return result.matched_count > 0
+
+
+def generate_client_secret() -> str:
+    return secrets.token_urlsafe(32)
+
+
 # ---------------------------------------------------------------------------
 # JWT issuance / verification
 # ---------------------------------------------------------------------------
