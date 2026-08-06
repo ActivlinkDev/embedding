@@ -3,6 +3,8 @@ import stripe
 import os
 from pymongo import MongoClient
 
+from utils.api_docs import error, json_response
+
 router = APIRouter(tags=["Payments"])
 
 # Set your Stripe secret key
@@ -28,8 +30,50 @@ def serialize_price(price):
         "livemode": price.get("livemode"),
     }
 
-@router.post("/sync_stripe_prices")
+@router.post(
+    "/sync_stripe_prices",
+    summary="Import new Stripe prices into the local catalogue",
+    response_description="How many prices were newly imported, and which ones.",
+    responses={
+        200: json_response(
+            "The sync completed. `inserted_count` is `0` when nothing new was found — the "
+            "normal result of a repeat run.",
+            {
+                "inserted_count": 1,
+                "inserted_prices": [
+                    {
+                        "id": "price_1QxYz123456",
+                        "product": "prod_QxYz123456",
+                        "currency": "gbp",
+                        "unit_amount": 7149,
+                        "recurring": None,
+                        "nickname": "Extended warranty 24m",
+                        "active": True,
+                        "type": "one_time",
+                        "created": 1786000000,
+                        "livemode": False,
+                    }
+                ],
+            },
+        ),
+        500: error("Stripe could not be reached, or the import failed part-way.", "Error syncing Stripe prices: ..."),
+    },
+)
 def sync_stripe_prices():
+    """
+    **Operational endpoint.** Copy Stripe's active prices into the local `Stripe_Price_ID`
+    collection.
+
+    Takes no parameters. Every active price is paged through and any not already stored is
+    inserted; existing records are **never updated or deleted**, so this only ever adds. Running
+    it twice in a row is safe — the second run reports `inserted_count: 0`.
+
+    Because it only inserts, a price changed or deactivated in Stripe will **not** be corrected
+    here; the local copy keeps the values captured at first import.
+
+    Only prices new to this run appear in `inserted_prices`. A failure part-way through leaves
+    the prices already inserted in place — re-run to continue.
+    """
     try:
         prices = []
         starting_after = None

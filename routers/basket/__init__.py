@@ -5,6 +5,7 @@ from pymongo import MongoClient, ReturnDocument
 from bson import ObjectId
 from datetime import datetime
 import os
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from .ratebasket import rate_basket, RateBasketRequest
 
@@ -19,70 +20,121 @@ devices_collection = db["Devices"]
 
 
 class AddToBasketRequest(BaseModel):
+    """One line to add to a basket — either a purchase or a declined offer.
+
+    **Which fields are required depends on `add_to_basket`:**
+
+    | `add_to_basket` | Required |
+    | --- | --- |
+    | `true` (default) | `quote_id`, `product_id`, `optionref` |
+    | `false` | `deviceId` (or a `quote_id` that carries one) |
+
+    Everything else is optional. Omit `basket_id` to start a new basket; pass it to append to an
+    existing one.
+    """
+
     # When add_to_basket is true, quote_id is required. For skipped items (add_to_basket=false), quote_id is optional.
     quote_id: Optional[str] = Field(
         default=None,
-        description="Quotes._id as string (required when add_to_basket=true; optional for skipped items)",
+        description="**Required when `add_to_basket` is true.** The `Quotes._id` this line is bought from. Optional for skipped items.",
+        examples=["68a1c2d3e4b21d0f8c9e7712"],
     )
     # product_id/optionref are required only when add_to_basket is true
     product_id: Optional[str] = Field(
         default=None,
-        description="Group product_id inside quote.responses (required when add_to_basket=true)",
+        description="**Required when `add_to_basket` is true.** Which product group inside the quote's `responses` is being bought.",
+        examples=["ACME-EW-STD"],
     )
     optionref: Optional[int] = Field(
         default=None,
         ge=0,
-        description="Index into the group's options array (required when add_to_basket=true)",
+        description="**Required when `add_to_basket` is true.** **Zero-based index** into that group's `options` array — the position, not the cover term.",
+        examples=[0],
     )
     # Optional root-level metadata to persist when creating a new Basket_Quotes document
     client: Optional[str] = Field(
         default=None,
-        description="Client identifier to store on the Basket_Quotes root when creating a new basket",
-        example="activlink",
+        description="Client identifier stored on the basket root. Only used when creating a new basket; derived from the quote when omitted.",
+        examples=["ACME-UK"],
     )
     locale: Optional[str] = Field(
         default=None,
-        description="Locale to store on the Basket_Quotes root when creating a new basket",
-        example="en-GB",
+        description="Locale stored on the basket root. Only used when creating a new basket; derived from the quote when omitted.",
+        examples=["en_GB"],
     )
-    product_name: Optional[str] = None
-    product_description: Optional[str] = None
+    product_name: Optional[str] = Field(
+        None,
+        description="Display name for this line, carried through to checkout.",
+        examples=["Acme Extended Warranty — 24 months"],
+    )
+    product_description: Optional[str] = Field(
+        None,
+        description="Display description for this line.",
+        examples=["Parts and labour cover for your dishwasher"],
+    )
     product_images: Optional[List[str]] = Field(
         default=None,
-        description="Array of product image URLs to persist on the basket line-item",
-        example=["https://cdn.example.com/img1.jpg", "https://cdn.example.com/img2.jpg"],
+        description="Image URLs stored on the basket line and shown at checkout.",
+        examples=[["https://cdn.example.com/img1.jpg"]],
     )
     make: Optional[str] = Field(
         default=None,
-        description="Optional device make to store on the basket line item (overrides value derived from quote if provided)",
-        example="Apple",
+        description="Device make for this line. Overrides the value derived from the quote or the registered device.",
+        examples=["Bosch"],
     )
     model: Optional[str] = Field(
         default=None,
-        description="Optional device model to store on the basket line item (overrides value derived from quote if provided)",
-        example="iPhone 13",
+        description="Device model for this line. Overrides the value derived from the quote or the registered device.",
+        examples=["SMS6ZCI00G"],
     )
     promo_id: Optional[str] = Field(
         default=None,
-        description="Optional PromoID to attach to the basket line or skipped item",
-        example="10YP",
+        description="Promotion id to attach to this line or skipped entry.",
+        examples=["10YP"],
     )
     add_to_basket: Optional[bool] = Field(
         default=True,
-        description="If true, append as a basket line item. If false, store quote/device in 'skipped_items' instead.",
+        description=(
+            "`true` (default) adds a purchase line. `false` records the device in "
+            "`skipped_items` instead — the customer was offered cover and declined."
+        ),
+        examples=[True],
     )
     # Optional category for skipped items when product_id is not provided
     category: Optional[str] = Field(
         default=None,
-        description="Optional category used when adding a skipped item without specifying product_id",
+        description="Category for a skipped item when no `product_id` is given. Ignored for purchase lines.",
+        examples=["Dishwasher"],
     )
     # Optional deviceId to support creating skipped entries without a quote
     deviceId: Optional[str] = Field(
         default=None,
-        description="Device identifier to store on the basket entry (used when quote_id is not provided)",
+        description="**Required for skipped items with no `quote_id`.** The device this entry refers to.",
+        examples=["6820f1c9a4b21d0f8c9e4471"],
     )
     # Basket control: pass basket_id to append to an existing basket document
-    basket_id: Optional[str] = Field(None, description="Existing Basket_Quotes _id to append to")
+    basket_id: Optional[str] = Field(
+        None,
+        description="Existing basket to append to. Omit to create a new basket.",
+        examples=["68b2d1f0a4b21d0f8c9e8801"],
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "quote_id": "68a1c2d3e4b21d0f8c9e7712",
+                "product_id": "ACME-EW-STD",
+                "optionref": 0,
+                "client": "ACME-UK",
+                "locale": "en_GB",
+                "product_name": "Acme Extended Warranty — 24 months",
+                "make": "Bosch",
+                "model": "SMS6ZCI00G",
+                "add_to_basket": True,
+                "basket_id": None,
+            }
+        }
+    }
 
 
 def _serialize_basket_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -97,8 +149,73 @@ def _serialize_basket_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-@router.post("/basket/add")
+@router.post(
+    "/basket/add",
+    summary="Add a line to a basket, or record a declined offer",
+    response_description="The whole basket document after the change, including recalculated totals.",
+    responses=secured({
+        200: json_response("The line was added and the basket re-rated.", {
+                "_id": "68b2d1f0a4b21d0f8c9e8801",
+                "status": "draft",
+                "client": "ACME-UK",
+                "locale": "en_GB",
+                "created_at": "2026-08-06T10:14:52.113000",
+                "Basket": [
+                    {
+                        "line_id": "68b2d1f0a4b21d0f8c9e8802",
+                        "deviceId": "6820f1c9a4b21d0f8c9e4471",
+                        "quote_id": "68a1c2d3e4b21d0f8c9e7712",
+                        "product_id": "ACME-EW-STD",
+                        "product_name": "Acme Extended Warranty — 24 months",
+                        "currency": "GBP",
+                        "category": "Dishwasher",
+                        "make": "Bosch",
+                        "model": "SMS6ZCI00G",
+                        "price": 449.99,
+                        "poc": 24,
+                        "mode": "live",
+                        "rounded_price_pence": 7149,
+                    }
+                ],
+                "skipped_items": [],
+                "subtotal": 7149,
+                "discount": 0,
+                "final_total": 7149,
+                "mode": "live",
+            }),
+        400: error(
+            "A malformed id, a field missing for the chosen mode (`product_id`/`optionref`/"
+            "`quote_id` when adding, `deviceId` when skipping), or `optionref` out of range.",
+            "product_id is required when add_to_basket=true",
+        ),
+        404: error("The quote does not exist, or that `product_id` is not in it.", "Product not found in quote responses"),
+        500: error("The basket could not be written.", "Failed to upsert basket"),
+    }),
+)
 def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
+    """
+    Add a line to a multi-device basket — or record that cover was **declined** for a device.
+
+    **Two modes, set by `add_to_basket`:**
+
+    - **`true` (default)** — append a purchase line. Requires `quote_id`, `product_id` and
+      `optionref` (the zero-based index into that product's `options`). Price, currency,
+      category and term are copied from the quote, so the line always reflects what was quoted.
+    - **`false`** — append to `skipped_items` instead. Requires a `deviceId`, directly or via the
+      quote. Nothing is charged; this exists so a journey can record which devices were offered
+      cover and turned it down.
+
+    **Basket lifecycle.** Omit `basket_id` to create a new basket (returned with its `_id`); pass
+    it to append to an existing one. Every add re-rates the whole basket, so `subtotal`,
+    `discount`, `final_total` and `best_rule` in the response are current — multi-device
+    discounts appear as soon as the second line lands.
+
+    Make and model are resolved in order: what you send, then the quote, then the registered
+    device. Each line gets a `line_id`, which is the precise handle for
+    `DELETE /basket/{basket_id}/item/{device_id}`.
+
+    The full basket document is returned, not just the added line.
+    """
     # 1) Load and validate the quote if provided
     quote = None
     if payload.quote_id:
@@ -320,9 +437,55 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
     return _serialize_basket_doc(result)
 
 
-@router.get("/basket/{basket_id}")
+@router.get(
+    "/basket/{basket_id}",
+    summary="Fetch a basket by id",
+    response_description="The basket document as stored.",
+    responses=secured({
+        200: json_response("The basket was found.", {
+                "_id": "68b2d1f0a4b21d0f8c9e8801",
+                "status": "draft",
+                "client": "ACME-UK",
+                "locale": "en_GB",
+                "created_at": "2026-08-06T10:14:52.113000",
+                "Basket": [
+                    {
+                        "line_id": "68b2d1f0a4b21d0f8c9e8802",
+                        "deviceId": "6820f1c9a4b21d0f8c9e4471",
+                        "quote_id": "68a1c2d3e4b21d0f8c9e7712",
+                        "product_id": "ACME-EW-STD",
+                        "product_name": "Acme Extended Warranty — 24 months",
+                        "currency": "GBP",
+                        "category": "Dishwasher",
+                        "make": "Bosch",
+                        "model": "SMS6ZCI00G",
+                        "price": 449.99,
+                        "poc": 24,
+                        "mode": "live",
+                        "rounded_price_pence": 7149,
+                    }
+                ],
+                "skipped_items": [],
+                "subtotal": 7149,
+                "discount": 0,
+                "final_total": 7149,
+                "mode": "live",
+            }),
+        400: error("`basket_id` is not a valid 24-character ObjectId.", "Invalid basket_id; must be a valid ObjectId string"),
+        404: error("No basket with this id.", "Basket not found"),
+    }),
+)
 def get_basket(basket_id: str, _: None = Depends(verify_token)):
-    """Return the full basket document by _id."""
+    """
+    Fetch a basket in full: its purchase lines (`Basket`), declined devices (`skipped_items`),
+    and the totals from the last rating (`subtotal`, `discount`, `final_total`, `best_rule`).
+
+    Path parameter `basket_id` is mandatory. Totals are returned **as last calculated**, not
+    recomputed on read — they are refreshed when lines are added or when `POST /basket/rate` is
+    called.
+
+    `status` is `draft` until payment; `POST /basket/payment/create` moves it on.
+    """
     try:
         bid = ObjectId(basket_id)
     except Exception:
@@ -334,7 +497,15 @@ def get_basket(basket_id: str, _: None = Depends(verify_token)):
     return _serialize_basket_doc(doc)
 
 
-@router.delete("/basket/{basket_id}/item/{device_id}")
+@router.delete(
+    "/basket/{basket_id}/item/{device_id}",
+    summary="Remove a purchase line from a basket",
+    response_description="The basket document after the removal.",
+    responses=secured({
+        400: error("`basket_id` is not a valid 24-character ObjectId.", "Invalid basket_id; must be a valid ObjectId string"),
+        404: error("No basket with this id.", "Basket not found"),
+    }),
+)
 def delete_basket_item(
     basket_id: str,
     device_id: str,
@@ -346,10 +517,21 @@ def delete_basket_item(
     line_id: Optional[str] = Query(None, description="Optional per-line id to delete a single line precisely"),
     _: None = Depends(verify_token),
 ):
-    """Delete a single item in Basket array by deviceId and optional narrowing filters, then return updated doc.
+    """
+    Remove a purchase line from a basket.
 
-    Note: MongoDB $pull removes all matches. With provided filters (e.g. deviceId + poc), we expect to uniquely match 1 item.
-    For absolute precision, consider migrating to per-line unique IDs in future.
+    `basket_id` and `device_id` are mandatory; every query parameter is an optional narrowing
+    filter.
+
+    **Removal matches every line that fits the criteria.** With `device_id` alone, all lines for
+    that device go — which is what you want when a device is removed from the order, but not when
+    it has two cover terms in the basket. To delete exactly one line, pass the **`line_id`** from
+    the basket document: it is matched on its own and ignores every other filter. Failing that,
+    narrow with `poc`, `product_id`, `rounded_price_pence`, `mode` or `quote_id`.
+
+    Removing a line that does not exist is **not** an error — the basket is returned unchanged.
+    Only a missing basket returns `404`. Note that totals are **not** re-rated here; call
+    `POST /basket/rate` afterwards to refresh them.
     """
     try:
         bid = ObjectId(basket_id)
@@ -384,7 +566,15 @@ def delete_basket_item(
     return _serialize_basket_doc(doc)
 
 
-@router.delete("/basket/{basket_id}/skipped/{device_id}")
+@router.delete(
+    "/basket/{basket_id}/skipped/{device_id}",
+    summary="Remove a declined-offer entry from a basket",
+    response_description="The basket document after the removal.",
+    responses=secured({
+        400: error("`basket_id` is not a valid 24-character ObjectId.", "Invalid basket_id; must be a valid ObjectId string"),
+        404: error("No basket with this id.", "Basket not found"),
+    }),
+)
 def delete_skipped_item(
     basket_id: str,
     device_id: str,
@@ -395,10 +585,19 @@ def delete_skipped_item(
     line_id: Optional[str] = Query(None, description="Optional per-line id to delete a single skipped line precisely"),
     _: None = Depends(verify_token),
 ):
-    """Delete a single entry in skipped_items by deviceId and optional narrowing filters, then return updated doc.
+    """
+    Remove an entry from a basket's `skipped_items` — for instance when a customer changes their
+    mind and now wants cover for a device they previously declined.
 
-    Note: MongoDB $pull removes all matches. With provided filters (e.g. deviceId + quote_id), we expect to uniquely match 1 entry.
-    For absolute precision, you can provide a per-line `line_id` to remove a specific entry.
+    `basket_id` and `device_id` are mandatory; the query parameters narrow the match.
+
+    **Removal matches every entry that fits the criteria**, so `device_id` alone clears all
+    skipped entries for that device. Pass the **`line_id`** from the basket document to remove
+    exactly one; it takes precedence over every other filter.
+
+    Removing something that is not there is not an error — the basket comes back unchanged. Only
+    a missing basket returns `404`. Purchase lines are untouched; use
+    `DELETE /basket/{basket_id}/item/{device_id}` for those.
     """
     try:
         bid = ObjectId(basket_id)

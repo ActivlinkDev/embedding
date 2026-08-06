@@ -7,6 +7,8 @@ import os
 import logging
 import requests
 
+from utils.api_docs import error, json_response
+
 logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter(tags=["Payments"])
@@ -16,53 +18,143 @@ TINYURL_API_KEY = os.getenv("TINYURL_API_KEY")
 TINYURL_API_URL = "https://api.tinyurl.com/create"
 
 class ModeEnum(str, Enum):
+    """`payment` charges once; `subscription` bills on a recurring schedule."""
+
     payment = "payment"
     subscription = "subscription"
 
 class CheckoutSessionRequest(BaseModel):
+    """Everything needed to build a Stripe Checkout Session.
+
+    **Mandatory:** `product_name`, `unit_amount`, `currency`, `quantity`, `success_url`,
+    `cancel_url`, `internal_reference` and `mode`. Everything else has a working default.
+    """
+
     # Core product info
-    product_name: str = Field(..., example="Test Product")
-    product_description: Optional[str] = Field(   # ✅ NEW
-        default=None, example="Extended 3-year protection for your device"
+    product_name: str = Field(
+        ...,
+        description="**Mandatory.** Product name shown on the Stripe Checkout page.",
+        examples=["Acme Extended Warranty — 24 months"],
     )
-    product_images: Optional[List[HttpUrl]] = Field(  # ✅ NEW
-        default=None, example=["https://yourcdn.com/images/product.png"]
+    product_description: Optional[str] = Field(
+        default=None,
+        description="Sub-heading under the product name on the Checkout page.",
+        examples=["Extended 3-year protection for your device"],
+    )
+    product_images: Optional[List[HttpUrl]] = Field(
+        default=None,
+        description="Absolute image URLs shown on the Checkout page. Must be publicly reachable by Stripe.",
+        examples=[["https://cdn.example.com/images/cover.png"]],
     )
 
     unit_amount: int = Field(
-        ..., example=2500, description="Amount in the smallest currency unit (e.g. cents)"
+        ...,
+        description=(
+            "**Mandatory.** Amount in the **smallest currency unit** — pence, cents. "
+            "£71.49 is `7149`, not `71.49`. `rounded_price_pence` from `/rate_request` is "
+            "already in this form."
+        ),
+        examples=[7149],
     )
-    currency: str = Field(..., example="usd")
-    quantity: int = Field(..., gt=0, example=1)
+    currency: str = Field(..., description="**Mandatory.** ISO 4217 code, lower-case for Stripe.", examples=["gbp"])
+    quantity: int = Field(..., gt=0, description="**Mandatory.** Number of units. Must be greater than 0.", examples=[1])
 
     # Subscription fields (ignored for payments)
     recurring_interval: Optional[str] = Field(
-        default=None, example="month", description="For subscriptions: 'day', 'week', 'month', or 'year'"
+        default=None,
+        description="**Subscriptions only** — `day`, `week`, `month` or `year`. Defaults to `month`. Ignored when `mode` is `payment`.",
+        examples=["month"],
     )
     recurring_interval_count: Optional[int] = Field(
-        default=1, example=1, description="For subscriptions: Number of intervals between billings"
+        default=1,
+        description="**Subscriptions only** — intervals between billings. Ignored when `mode` is `payment`.",
+        examples=[1],
     )
 
     # Customer / session details
-    customer_email: Optional[EmailStr] = Field(default=None, example="customer@email.com")
+    customer_email: Optional[EmailStr] = Field(
+        default=None,
+        description="Pre-fills the email field. Must be a valid address if supplied.",
+        examples=["jane.okafor@example.com"],
+    )
     customer_phone: Optional[str] = Field(
         default=None,
-        example="+447700900123",
         description=(
-            "E.164 phone number. Stripe Checkout can only pre-fill the phone field "
-            "from an existing Customer, so this creates/reuses a Stripe Customer "
-            "with the phone set and attaches it to the session."
+            "E.164 phone number. Stripe Checkout can only pre-fill the phone field from an "
+            "existing Customer, so supplying this creates or reuses a Stripe Customer carrying "
+            "the number and attaches it to the session. If that lookup fails, checkout still "
+            "proceeds with email pre-fill only."
         ),
+        examples=["+447700900123"],
     )
-    allow_promotion_codes: bool = Field(default=False)
-    success_url: str = Field(..., example="https://yourdomain.com/success")
-    cancel_url: str = Field(..., example="https://yourdomain.com/cancel")
-    phone_number_collection: bool = Field(default=True)
-    internal_reference: str = Field(..., example="order-12345")
-    payment_method_types: Optional[List[str]] = Field(default=["card"], example=["card", "alipay"])
-    mode: ModeEnum = Field(..., example="payment", description="Stripe session mode: payment or subscription")
-    metadata: Optional[Dict[str, str]] = Field(default_factory=dict, example={"order_id": "1234"})
-    locale: Optional[str] = Field(default=None, example="fr")
+    allow_promotion_codes: bool = Field(
+        default=False,
+        description="Show the promotion-code box on the Checkout page.",
+        examples=[False],
+    )
+    success_url: str = Field(
+        ...,
+        description="**Mandatory.** Where Stripe sends the customer after payment. `?session_id={CHECKOUT_SESSION_ID}` is appended automatically.",
+        examples=["https://shop.example.com/cover/success"],
+    )
+    cancel_url: str = Field(
+        ...,
+        description="**Mandatory.** Where Stripe sends the customer if they abandon checkout.",
+        examples=["https://shop.example.com/cover/cancel"],
+    )
+    phone_number_collection: bool = Field(
+        default=True,
+        description="Ask for a phone number during checkout. On by default.",
+        examples=[True],
+    )
+    internal_reference: str = Field(
+        ...,
+        description=(
+            "**Mandatory.** Your own reference for this payment. Stored in the session metadata "
+            "and echoed back by the Stripe webhook — this is how a payment is reconciled to a quote."
+        ),
+        examples=["quote-68a1c2d3e4b21d0f8c9e7712"],
+    )
+    payment_method_types: Optional[List[str]] = Field(
+        default=["card"],
+        description="Stripe payment method types to offer. Defaults to card only.",
+        examples=[["card"]],
+    )
+    mode: ModeEnum = Field(
+        ...,
+        description="**Mandatory.** `payment` for a one-off charge, `subscription` for recurring billing.",
+        examples=["payment"],
+    )
+    metadata: Optional[Dict[str, str]] = Field(
+        default_factory=dict,
+        description="Extra key/value pairs stored on the Stripe session. String values only.",
+        examples=[{"quote_id": "68a1c2d3e4b21d0f8c9e7712", "device_id": "6820f1c9a4b21d0f8c9e4471"}],
+    )
+    locale: Optional[str] = Field(
+        default=None,
+        description="Stripe Checkout display language, e.g. `en`, `fr`. Stripe auto-detects when omitted.",
+        examples=["en"],
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "product_name": "Acme Extended Warranty — 24 months",
+                "product_description": "Parts and labour cover for your dishwasher",
+                "unit_amount": 7149,
+                "currency": "gbp",
+                "quantity": 1,
+                "customer_email": "jane.okafor@example.com",
+                "customer_phone": "+447700900123",
+                "success_url": "https://shop.example.com/cover/success",
+                "cancel_url": "https://shop.example.com/cover/cancel",
+                "internal_reference": "quote-68a1c2d3e4b21d0f8c9e7712",
+                "mode": "payment",
+                "metadata": {"quote_id": "68a1c2d3e4b21d0f8c9e7712"},
+                "locale": "en",
+            }
+        }
+    }
 
 def build_line_items(request: CheckoutSessionRequest):
     price_data = {
@@ -147,10 +239,55 @@ def shorten_with_tinyurl(long_url: str) -> str:
     except requests.RequestException as e:
         raise HTTPException(status_code=500, detail=f"TinyURL API error: {e}")
 
-@router.post("/generate_checkout_session")
+@router.post(
+    "/generate_checkout_session",
+    summary="Create a Stripe Checkout session and a short payment link",
+    response_description="The checkout URL, a shortened link, the session id, and pre-fill diagnostics.",
+    responses={
+        200: json_response(
+            "The session was created and the link shortened.",
+            {
+                "checkout_url": "https://checkout.stripe.com/c/pay/cs_test_a1B2c3D4e5F6",
+                "checkout_url_short": "https://tinyurl.com/2p8kd4xr",
+                "session_id": "cs_test_a1B2c3D4e5F6",
+                "expires_at": 1786000000,
+                "status": "open",
+                "customer": "cus_QxYz123456",
+                "prefill_phone": "+447700900123",
+                "prefill_email": "jane.okafor@example.com",
+            },
+        ),
+        400: error("Stripe rejected the session — bad currency, amount, or URL.", "Stripe error: Invalid currency: xyz"),
+        500: error("The session could not be created, or the link shortener failed.", "TinyURL API error: ..."),
+        502: error("TinyURL accepted the request but returned no shortened URL.", "No shortened URL returned from TinyURL"),
+    },
+)
 def generate_checkout_session(request: CheckoutSessionRequest):
     """
-    Generate a Stripe Checkout Session and return the session URL, session id, and a TinyURL short link.
+    Create a Stripe Checkout session for a cover purchase and return a link the customer can pay
+    through.
+
+    The line item is built from `product_name`, `unit_amount`, `currency` and `quantity`.
+    **`unit_amount` is in the smallest currency unit** — pass `rounded_price_pence` from
+    `/rate_request` directly, never the decimal price.
+
+    `internal_reference` is stored in the session metadata and comes back on the Stripe webhook,
+    which is how a completed payment is matched to the quote that produced it. Set it to
+    something you can reconcile.
+
+    **Pre-fill behaviour.** `customer_email` pre-fills the email field on its own. A
+    `customer_phone` additionally causes a Stripe Customer to be found or created carrying that
+    number, since Checkout can only pre-fill a phone from an existing Customer. If that lookup
+    fails, checkout is **not** blocked — it falls back to email pre-fill, and the `customer`,
+    `prefill_phone` and `prefill_email` fields in the response tell you what actually reached
+    Stripe.
+
+    **This endpoint is not authenticated** and does not consult a quote — it charges whatever
+    amount it is given, so only call it from a trusted server-side context, never straight from a
+    browser. To create a link from a stored quote instead, use `POST /generate_payment_link`.
+
+    Both a full `checkout_url` and a shortened `checkout_url_short` (via TinyURL) are returned;
+    the short form is the one to put in an SMS.
     """
     try:
         session_params = {

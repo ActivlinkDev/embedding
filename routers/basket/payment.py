@@ -5,6 +5,7 @@ from bson import ObjectId
 from pymongo import MongoClient
 import os
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from routers.generate_payment_link import (
     generate_checkout_session,
@@ -20,22 +21,67 @@ basket_collection = db["Basket_Quotes"]
 
 
 class BasketPaymentRequest(BaseModel):
-    basket_id: str = Field(..., description="Basket_Quotes _id as string")
+    """Checkout details for a basket. Only `basket_id` is mandatory — everything else overrides
+    a default derived from the basket."""
+
+    basket_id: str = Field(
+        ...,
+        description="**Mandatory.** The basket to charge for. Must contain at least one line.",
+        examples=["68b2d1f0a4b21d0f8c9e8801"],
+    )
     email: Optional[EmailStr] = Field(
         None,
         validation_alias=AliasChoices("email", "customerEmail"),
-        description="Customer email for Stripe session",
+        description="Customer email, used to pre-fill Stripe Checkout. Accepted as `email` or `customerEmail`; must be valid if sent.",
+        examples=["jane.okafor@example.com"],
     )
     customer_phone: Optional[str] = Field(
         None,
         validation_alias=AliasChoices("customerPhone", "customer_phone", "phone"),
-        description="Validated customer phone (E.164) used to pre-fill the Stripe checkout phone field",
+        description=(
+            "E.164 phone number used to pre-fill the Stripe phone field. Accepted as "
+            "`customerPhone`, `customer_phone` or `phone`."
+        ),
+        examples=["+447700900123"],
     )
-    product_name: Optional[str] = Field(None, description="Override product name for Stripe")
-    product_description: Optional[str] = Field(None, description="Override product description for Stripe")
-    product_images: Optional[List[str]] = Field(None, description="Override product images (URLs) for Stripe")
-    success_url: Optional[str] = Field(None, description="Success redirect URL for Stripe session")
-    cancel_url: Optional[str] = Field(None, description="Cancel redirect URL for Stripe session")
+    product_name: Optional[str] = Field(
+        None,
+        description="Line description on the Checkout page. Defaults to the winning discount rule's name, else `Basket checkout`.",
+        examples=["Acme device protection — 2 items"],
+    )
+    product_description: Optional[str] = Field(
+        None,
+        description="Sub-heading on the Checkout page. Defaults to `Basket items checkout`.",
+        examples=["Cover for your dishwasher and washing machine"],
+    )
+    product_images: Optional[List[str]] = Field(
+        None,
+        description="Images for the Checkout page. Defaults to images already on the basket lines.",
+        examples=[["https://cdn.example.com/images/cover.png"]],
+    )
+    success_url: Optional[str] = Field(
+        None,
+        description="Where Stripe sends the customer after payment. **Set this** — the fallback is a placeholder domain.",
+        examples=["https://shop.example.com/cover/success"],
+    )
+    cancel_url: Optional[str] = Field(
+        None,
+        description="Where Stripe sends the customer if they abandon checkout.",
+        examples=["https://shop.example.com/cover/cancel"],
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "basket_id": "68b2d1f0a4b21d0f8c9e8801",
+                "email": "jane.okafor@example.com",
+                "customerPhone": "+447700900123",
+                "product_name": "Acme device protection — 2 items",
+                "success_url": "https://shop.example.com/cover/success",
+                "cancel_url": "https://shop.example.com/cover/cancel",
+            }
+        }
+    }
 
 
 def _extract_currency(items: list[dict[str, Any]]) -> str:
@@ -89,8 +135,53 @@ def _collect_product_images(items: list[dict[str, Any]], limit: int = 6) -> List
     return out
 
 
-@router.post("/basket/payment/create")
+@router.post(
+    "/basket/payment/create",
+    summary="Create a Stripe checkout session for a whole basket",
+    response_description="The same payload as `/generate_checkout_session`: URLs, session id and pre-fill diagnostics.",
+    responses=secured({
+        200: json_response(
+            "The session was created for the basket total.",
+            {
+                "checkout_url": "https://checkout.stripe.com/c/pay/cs_test_a1B2c3D4e5F6",
+                "checkout_url_short": "https://tinyurl.com/2p8kd4xr",
+                "session_id": "cs_test_a1B2c3D4e5F6",
+                "expires_at": 1786000000,
+                "status": "open",
+                "customer": "cus_QxYz123456",
+                "prefill_phone": "+447700900123",
+                "prefill_email": "jane.okafor@example.com",
+            },
+        ),
+        400: error(
+            "`basket_id` is malformed, the basket has no lines, or no total could be determined "
+            "from it.",
+            "Basket is empty",
+        ),
+        404: error("No basket with this id.", "Basket not found"),
+        500: error("Stripe session creation failed.", "Internal error during Stripe session creation: ..."),
+    }),
+)
 def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(verify_token)):
+    """
+    Charge a whole basket in **one** Stripe Checkout session — a single line item for the basket
+    total, not one per device.
+
+    **The amount comes from the basket**, in this order: `final_total` (discount applied), then
+    `subtotal`, then the sum of the lines' `rounded_price_pence`. The caller cannot set it. If
+    none of those yields a positive figure the request is rejected with `400`, so rate the basket
+    before checkout if the totals may be stale.
+
+    Currency, locale and Stripe mode are taken from the basket lines, defaulting to `gbp` and
+    `payment`. The basket id is passed as `internal_reference` and repeated in the metadata
+    alongside client and source, so the webhook can reconcile the payment to the basket.
+
+    `success_url` and `cancel_url` **should be supplied** — the built-in fallbacks are
+    placeholders and will send customers somewhere unhelpful.
+
+    The response is whatever `/generate_checkout_session` returns, including the shortened link
+    and the pre-fill diagnostics.
+    """
     # 1) Load basket
     try:
         bid = ObjectId(req.basket_id.strip())

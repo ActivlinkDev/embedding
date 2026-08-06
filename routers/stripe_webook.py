@@ -1,5 +1,7 @@
 from fastapi import APIRouter, Request, HTTPException, Header
 import stripe
+
+from utils.api_docs import error, json_response
 import os
 import sys
 from pymongo import MongoClient
@@ -50,11 +52,48 @@ except Exception:
         create_contract = None
         contract_svc = None
 
-@router.post("/stripe/webhook")
+@router.post(
+    "/stripe/webhook",
+    summary="Stripe webhook receiver (called by Stripe, not by you)",
+    response_description="Acknowledgement that the event was received and processed.",
+    responses={
+        200: json_response("The event was accepted. Unrecognised event types are acknowledged and ignored.", {"status": "success"}),
+        400: error(
+            "The body is not valid JSON, or the `stripe-signature` header is missing or does "
+            "not verify against `STRIPE_WEBHOOK_SECRET`.",
+            "Invalid Stripe signature",
+        ),
+        500: error("The event verified but could not be stored or processed. Stripe will retry.", "DB error: ..."),
+    },
+)
 async def stripe_webhook(
     request: Request,
     stripe_signature: str = Header(None, alias="stripe-signature")
 ):
+    """
+    Receive payment events from Stripe. **Stripe calls this endpoint — you never do.**
+
+    Authentication is by **signature, not bearer token**: the raw body is verified against the
+    `stripe-signature` header using `STRIPE_WEBHOOK_SECRET`. A missing or invalid signature is
+    rejected with `400`, so the endpoint cannot be driven by an untrusted caller.
+
+    **Events acted on:**
+
+    | Event | Effect |
+    | --- | --- |
+    | `checkout.session.completed` | Store the session, find or create the customer, and issue the contracts for the order |
+    | `invoice.paid` | Activate or renew the contracts on that subscription |
+    | `charge.refunded` | Mark the affected contract refunded |
+    | `customer.subscription.deleted` | Cancel the contracts on that subscription |
+
+    Any other event type is acknowledged with `200` and ignored — do not treat success as proof
+    that anything was processed.
+
+    Contracts are issued **here**, not at checkout: nothing exists until Stripe confirms payment.
+    That makes this the endpoint to check when a paid order has no contract. Downstream failures
+    inside a handled event are logged and swallowed so Stripe is not retried into a loop; only
+    verification and storage failures return an error status.
+    """
     # Log incoming request details
     payload = await request.body()
     print(f"[Stripe Webhook] Received payload: {payload}", file=sys.stderr)
