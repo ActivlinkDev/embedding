@@ -24,6 +24,7 @@ from bson import ObjectId
 from datetime import datetime, timedelta
 import os
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from .product_assignment import (
     product_assignment,
@@ -47,18 +48,82 @@ CACHE_TTL = timedelta(days=7)
 # ---------- Models ----------
 
 class WidgetPriceRequest(BaseModel):
-    clientKey: str = Field(..., example="AOPON12345")
-    customSkuId: str = Field(..., example="64f7a1e4b9c1f2a3d4e5f6a7")
-    price: float = Field(..., example=999.99)
-    locale: str = Field(..., example="en_GB")
-    currency: Optional[str] = Field(None, example="GBP")
-    purchaseDate: Optional[str] = Field(None, description="YYYY-MM-DD; defaults to today (new purchase)")
-    gtee: Optional[int] = Field(None, description="Guarantee duration override (months)")
+    """A product in a storefront basket, priced for the widget.
+
+    The device does not need to be registered: the widget prices straight from the catalogue,
+    so `customSkuId` plus `locale` stands in for a device record.
+    """
+
+    clientKey: str = Field(
+        ...,
+        description="**Mandatory.** Tenant key. Also decides whether the widget is enabled and which origins may call it.",
+        examples=["acme_uk_live"],
+    )
+    customSkuId: str = Field(
+        ...,
+        description="**Mandatory.** CustomSKU id (24-character ObjectId) for the product being viewed. Must belong to this client **and** carry the requested locale.",
+        examples=["681aa2f1c4b21d0f8c9e0012"],
+    )
+    price: float = Field(
+        ...,
+        description="**Mandatory field**, but `0` is allowed and falls back to the SKU's `MSRP` for that locale. Send the actual basket price when you have it — it changes the premium.",
+        examples=[449.99],
+    )
+    locale: str = Field(..., description="**Mandatory.** Locale of the storefront, e.g. `en_GB`.", examples=["en_GB"])
+    currency: Optional[str] = Field(
+        None,
+        description="Currency override. Otherwise resolved from the SKU's locale data, then from `Locale_Params`.",
+        examples=["GBP"],
+    )
+    purchaseDate: Optional[str] = Field(
+        None,
+        description="**`YYYY-MM-DD`.** Defaults to today, i.e. a new purchase. Any other format returns `400`.",
+        examples=["2026-08-06"],
+    )
+    gtee: Optional[int] = Field(
+        None,
+        description="Guarantee duration override in months. Otherwise the SKU's labour guarantee, falling back to parts.",
+        examples=[12],
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "clientKey": "acme_uk_live",
+                "customSkuId": "681aa2f1c4b21d0f8c9e0012",
+                "price": 449.99,
+                "locale": "en_GB",
+                "currency": "GBP",
+                "purchaseDate": None,
+                "gtee": None,
+            }
+        }
+    }
 
 
 class WidgetQuoteRequest(WidgetPriceRequest):
-    productId: str = Field(..., description="Chosen product id")
-    optionId: Optional[str] = Field(None, description="Chosen option identifier (e.g. poc)")
+    """Everything in `WidgetPriceRequest`, plus what the shopper actually chose."""
+
+    productId: str = Field(..., description="**Mandatory.** The product id the shopper selected.", examples=["ACME-EW-STD"])
+    optionId: Optional[str] = Field(
+        None,
+        description="The selected cover term, normally the `poc` value in months. Recorded on the quote as `selected.optionId`.",
+        examples=["24"],
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "clientKey": "acme_uk_live",
+                "customSkuId": "681aa2f1c4b21d0f8c9e0012",
+                "price": 449.99,
+                "locale": "en_GB",
+                "currency": "GBP",
+                "productId": "ACME-EW-STD",
+                "optionId": "24",
+            }
+        }
+    }
 
 
 # ---------- Helpers ----------
@@ -283,9 +348,57 @@ def _enforce_origin(request: Request, client_doc):
 
 # ---------- Endpoints ----------
 
-@router.post("/widget_price")
+@router.post(
+    "/widget_price",
+    summary="Price cover options for the storefront widget (nothing stored)",
+    response_description="The priced options to display, the currency, and the widget's checkout mode.",
+    responses=secured({
+        200: json_response("Options available for this product.", {
+                "currency": "GBP",
+                "mode": "redirect",
+                "options": [
+                    {
+                        "product_id": "ACME-EW-STD",
+                        "client": "ACME-UK",
+                        "currency": "GBP",
+                        "locale": "en_GB",
+                        "category": "Dishwasher",
+                        "age": 0,
+                        "price": 449.99,
+                        "multi_count": 1,
+                        "source": "web",
+                        "options": [
+                            {"status": "ok", "poc": 24, "mode": "live", "rate": 71.34, "rounded_price": 71.49, "rounded_price_pence": 7149},
+                            {"status": "ok", "poc": 36, "mode": "live", "rate": 96.18, "rounded_price": 96.49, "rounded_price_pence": 9649},
+                        ],
+                    }
+                ],
+            }),
+        400: error("`customSkuId` is malformed, or `purchaseDate` is not `YYYY-MM-DD`.", "Invalid customSkuId"),
+        403: error("The widget is disabled for this client, or the browser `Origin` is not on the client's allow-list.", "Origin not allowed"),
+        404: error("Unknown `clientKey`, no such CustomSKU for this client and locale, or nothing is offerable.", "No protection options available for this product"),
+    }),
+)
 def widget_price(payload: WidgetPriceRequest, request: Request, _: None = Depends(verify_token)):
-    """Display-only: priced options for the drawer. No quote is persisted."""
+    """
+    Price the cover options to show in the storefront widget. **Read-only — no quote is stored.**
+
+    Everything the pricing needs is resolved from the catalogue rather than a registered device:
+    the CustomSKU supplies the category and, when `price`, `currency` or `gtee` are omitted, the
+    MSRP, currency and guarantee for that locale. `purchaseDate` defaults to today, so the device
+    is treated as new.
+
+    Results come from a **cache** keyed on the SKU, locale, price band, age, guarantee and
+    currency, which is why repeated views are fast and why an edit to the SKU refreshes it in the
+    background. Use `POST /widget_quote/refresh` to force a rebuild.
+
+    `mode` in the response is the client's configured checkout behaviour (`redirect` by default)
+    — the widget uses it to decide how to proceed once the shopper picks an option.
+
+    Beyond the bearer token, this endpoint is guarded by the client's own settings: a client with
+    `widget_enabled: false` gets `403`, and a browser `Origin` outside the client's
+    `allowed_domains` is rejected. Call `POST /widget_quote` once the shopper commits.
+    """
     client_doc = clientkey_collection.find_one({"ClientKey": payload.clientKey})
     _enforce_origin(request, client_doc)
 
@@ -300,9 +413,33 @@ def widget_price(payload: WidgetPriceRequest, request: Request, _: None = Depend
     }
 
 
-@router.post("/widget_quote")
+@router.post(
+    "/widget_quote",
+    summary="Commit the shopper's widget selection as a stored quote",
+    response_description="The id of the newly stored quote.",
+    responses=secured({
+        200: json_response("The quote was stored.", {"quote_id": "68a1c2d3e4b21d0f8c9e7712"}),
+        400: error("`customSkuId` is malformed, or `purchaseDate` is not `YYYY-MM-DD`.", "Invalid customSkuId"),
+        403: error("The widget is disabled for this client, or the browser `Origin` is not allowed.", "Origin not allowed"),
+        404: error("Unknown `clientKey`, no such CustomSKU for this client and locale, or nothing is offerable.", "No protection options available for this product"),
+    }),
+)
 def widget_quote(payload: WidgetQuoteRequest, request: Request, _: None = Depends(verify_token)):
-    """Commit: create the quote when the shopper proceeds. Returns quote_id."""
+    """
+    Commit the shopper's choice: re-price the options and **persist them as a quote**.
+
+    This is the write counterpart to `POST /widget_price` — same inputs plus `productId` and
+    `optionId`, same pricing path. Options are recomputed here rather than trusted from the
+    display call, so a tampered price cannot be carried into a quote.
+
+    The stored quote records `customSkuId`, `locale`, `currency`, `source: "widget"` and the
+    shopper's `selected` product and option. Only `quote_id` is returned; fetch the full quote
+    with `GET /quote/{quote_id}`, or turn it into a payment with
+    `POST /generate_payment_link`.
+
+    Note the quote holds **every** priced option, not just the selected one — the selection is
+    recorded alongside them rather than filtering them.
+    """
     client_doc = clientkey_collection.find_one({"ClientKey": payload.clientKey})
     _enforce_origin(request, client_doc)
 
@@ -325,9 +462,33 @@ def widget_quote(payload: WidgetQuoteRequest, request: Request, _: None = Depend
     return {"quote_id": quote_id}
 
 
-@router.post("/widget_quote/refresh")
+@router.post(
+    "/widget_quote/refresh",
+    summary="Rebuild the widget price cache for one SKU, locale and price",
+    response_description="Confirmation and how many option groups were cached.",
+    responses=secured({
+        200: json_response("The cache entry was rebuilt.", {"status": "ok", "cached_options": 1}),
+        400: error("`customSkuId` is malformed, or `purchaseDate` is not `YYYY-MM-DD`.", "Invalid customSkuId"),
+        404: error("Unknown `clientKey`, no such CustomSKU for this client and locale, or nothing to cache.", "No protection options to cache"),
+    }),
+)
 def widget_quote_refresh(payload: WidgetPriceRequest, _: None = Depends(verify_token)):
-    """Admin: force-rebuild the cache entry for a CustomSKU + locale + price."""
+    """
+    **Operational endpoint.** Force a rebuild of the widget price cache for one CustomSKU,
+    locale, price, age, guarantee and currency combination.
+
+    Pricing is recomputed from the assignment rules and written straight to the cache, so the
+    next `POST /widget_price` for the same combination serves the fresh figures. No quote is
+    stored and nothing is returned to a shopper.
+
+    You normally do not need this: the cache is warmed automatically whenever a CustomSKU is
+    created or updated. Reach for it after changing rating configuration — which those hooks do
+    not observe — or to verify a pricing change before it reaches a storefront.
+
+    `cached_options` is the number of product groups written. Unlike `/widget_price`, this
+    endpoint does **not** apply the widget's origin or enabled checks; it is not meant to be
+    called from a browser.
+    """
     assignment_request, age_in_months, _client_doc, _sku, _lsd = resolve_widget_inputs(payload)
     grouped, bracket, currency = _compute_options_from_assignment(assignment_request, age_in_months)
     if not grouped:

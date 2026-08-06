@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from datetime import datetime
 import os
@@ -20,17 +21,40 @@ error_log_stripe_collection = db["Error_Log_Stripe"]
 # --- Models ---
 
 class RateRequest(BaseModel):
-    product_id: str = Field(..., example="")
-    currency: str = Field(..., example="")
-    locale: str = Field(..., example="")
-    poc: int = Field(..., example=0)
-    category: str = Field(..., example="")
-    age: int = Field(..., example=0)
-    price: float = Field(..., example=0)
-    multi_count: int = Field(..., example=0)
-    client: str = Field(..., example="acme_corp")
-    source: str = Field(..., example="web_app")
-    mode: str = Field(..., example="live")
+    """One product/term combination to price. **Every field is mandatory**, and each one has to
+    match the rating configuration — a value with no configured factor fails that line.
+
+    These are exactly the entries returned by `GET /assign_product_for_device/{device_id}`, so
+    the usual flow is to pass those straight through rather than assembling them by hand.
+    """
+
+    product_id: str = Field(..., description="**Mandatory.** The cover product being priced.", examples=["ACME-EW-STD"])
+    currency: str = Field(..., description="**Mandatory.** ISO 4217 currency, e.g. `GBP`.", examples=["GBP"])
+    locale: str = Field(..., description="**Mandatory.** Locale; must have a configured `localeFactor`.", examples=["en_GB"])
+    poc: int = Field(
+        ...,
+        description="**Mandatory.** Period of cover in months; must have a configured `pocFactor`.",
+        examples=[24],
+    )
+    category: str = Field(..., description="**Mandatory.** Device category; must have a configured `categoryFactor`.", examples=["Dishwasher"])
+    age: int = Field(
+        ...,
+        description="**Mandatory.** Device age in months; must have a configured `ageFactor`. `0` is valid here.",
+        examples=[15],
+    )
+    price: float = Field(
+        ...,
+        description="**Mandatory.** Device price; must fall inside a configured `priceFactor` band.",
+        examples=[449.99],
+    )
+    multi_count: int = Field(
+        ...,
+        description="**Mandatory.** Number of devices covered together; must have a configured `multiFactor`.",
+        examples=[1],
+    )
+    client: str = Field(..., description="**Mandatory.** `Client_ID` whose rating configuration applies.", examples=["ACME-UK"])
+    source: str = Field(..., description="**Mandatory.** Sales channel the rating is defined for.", examples=["web"])
+    mode: str = Field(..., description="**Mandatory.** Rating mode, e.g. `live` or `test`.", examples=["live"])
 
     def missing_fields(self):
         missing = []
@@ -45,9 +69,56 @@ class RateRequest(BaseModel):
         return missing
 
 class RateRequestBatch(BaseModel):
-    deviceId: Optional[str] = Field(None, example="abc-123")
-    clientKey: Optional[str] = Field(None, description="Client key associated with this quote")
-    requests: List[RateRequest]
+    """A batch of lines to price together and store as one quote."""
+
+    deviceId: Optional[str] = Field(
+        None,
+        description="Device this quote is for. Stored on the quote so it can be found later.",
+        examples=["6820f1c9a4b21d0f8c9e4471"],
+    )
+    clientKey: Optional[str] = Field(
+        None,
+        description="Tenant key recorded against the quote. Recommended — it is how quotes are attributed.",
+        examples=["acme_uk_live"],
+    )
+    requests: List[RateRequest] = Field(..., description="**Mandatory.** One entry per product/term combination to price.")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "deviceId": "6820f1c9a4b21d0f8c9e4471",
+                "clientKey": "acme_uk_live",
+                "requests": [
+                    {
+                        "product_id": "ACME-EW-STD",
+                        "currency": "GBP",
+                        "locale": "en_GB",
+                        "poc": 24,
+                        "category": "Dishwasher",
+                        "age": 15,
+                        "price": 449.99,
+                        "multi_count": 1,
+                        "client": "ACME-UK",
+                        "source": "web",
+                        "mode": "live",
+                    },
+                    {
+                        "product_id": "ACME-EW-STD",
+                        "currency": "GBP",
+                        "locale": "en_GB",
+                        "poc": 36,
+                        "category": "Dishwasher",
+                        "age": 15,
+                        "price": 449.99,
+                        "multi_count": 1,
+                        "client": "ACME-UK",
+                        "source": "web",
+                        "mode": "live",
+                    },
+                ],
+            }
+        }
+    }
 
 # --- Utilities (Unchanged) ---
 
@@ -284,11 +355,89 @@ def store_quote(grouped, device_id=None, client_key=None, extra=None):
 
 # --- Endpoint ---
 
-@router.post("/rate_request")
+@router.post(
+    "/rate_request",
+    summary="Price cover options and store them as a quote",
+    response_description="The stored quote id and the priced options, grouped by product.",
+    responses=secured({
+        200: json_response(
+            "Every line was processed. Options carry `status: \"ok\"` when priced and "
+            "`status: \"error\"` when no rating configuration matched.",
+            {
+                "quote_id": "68a1c2d3e4b21d0f8c9e7712",
+                "responses": [
+                    {
+                        "product_id": "ACME-EW-STD",
+                        "client": "ACME-UK",
+                        "currency": "GBP",
+                        "locale": "en_GB",
+                        "category": "Dishwasher",
+                        "age": 15,
+                        "price": 449.99,
+                        "multi_count": 1,
+                        "source": "web",
+                        "options": [
+                            {
+                                "status": "ok",
+                                "poc": 24,
+                                "mode": "live",
+                                "rate": 71.34,
+                                "rounded_price": 71.49,
+                                "rounded_price_pence": 7149,
+                                "factors": {
+                                    "base_fee": 42.0,
+                                    "locale_factor": 1.0,
+                                    "poc_factor": 1.4,
+                                    "category_factor": 1.15,
+                                    "age_factor": 1.05,
+                                    "price_factor": 1.0,
+                                    "multi_factor": 1.0,
+                                },
+                            },
+                            {
+                                "status": "error",
+                                "poc": 60,
+                                "mode": "live",
+                                "error": {
+                                    "message": "No rating config found matching all input fields.",
+                                    "details": [{"doc_id": "6712c0f1a4b21d0f8c9e0031", "reasons": ["poc 60 has no pocFactor"]}],
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+        ),
+    }),
+)
 def rate_request(
     payload: RateRequestBatch,
     _: None = Depends(verify_token)
 ):
+    """
+    Price one or more cover options and persist the result as a quote.
+
+    Each entry in `requests` is matched against the client's `Rating` configuration, and the
+    premium is the product of its factors:
+
+    `base_fee × locale_factor × poc_factor × category_factor × age_factor × price_factor × multi_factor`
+
+    The result is rounded up to the nearest `.49` or `.99` — `rounded_price` is what to charge,
+    `rounded_price_pence` the same value in minor units for payment providers, and `rate` the raw
+    figure before rounding. The `factors` block shows exactly how the price was reached.
+
+    **Responses are grouped, not one-per-request.** Lines sharing a product, client, currency,
+    locale, category, age, price, multi-count and source collapse into a single entry, with one
+    `options` element per cover term — which is what a "choose 24 or 36 months" UI needs.
+
+    **Per-line failure is not request failure.** A line with no matching rating configuration
+    comes back as an option with `status: "error"` and the reasons it failed, while the rest are
+    priced normally; the whole call still returns `200`. Failures are logged to
+    `Error_Log_RateRequest`.
+
+    Every call **writes a quote** to the `Quotes` collection and returns its `quote_id`, which
+    `GET /quote/{quote_id}` and the payment-link endpoints consume. There is no dry-run mode.
+    """
     grouped, _bracket = price_and_group(payload.requests)
 
     # Store grouped responses in Quotes collection

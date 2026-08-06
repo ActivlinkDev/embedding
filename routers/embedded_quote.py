@@ -5,6 +5,7 @@ from pymongo import MongoClient
 from bson import ObjectId
 import os
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 
 # Import the existing assignment and rating logic
@@ -15,16 +16,87 @@ router = APIRouter(tags=["Quotes"])
 
 
 class EmbeddedQuoteRequest(BaseModel):
-    device_id: str = Field(..., example="64f7a1e4b9c1f2a3d4e5f6a7")
-    clientKey: Optional[str] = Field(None, description="Optional clientKey to pass through to rate_request")
+    """The device to quote for."""
+
+    device_id: str = Field(
+        ...,
+        description="**Mandatory.** Id of an already-registered device, as returned by `POST /device-register`.",
+        examples=["6820f1c9a4b21d0f8c9e4471"],
+    )
+    clientKey: Optional[str] = Field(
+        None,
+        description=(
+            "Tenant key to record on the quote. When omitted it falls back to the device's "
+            "`registrationParameters.clientRef`, which may not be a ClientKey at all — pass it "
+            "explicitly if the quote needs to be attributed reliably."
+        ),
+        examples=["acme_uk_live"],
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {"device_id": "6820f1c9a4b21d0f8c9e4471", "clientKey": "acme_uk_live"}
+        }
+    }
 
 
-@router.post("/embedded_quote")
+@router.post(
+    "/embedded_quote",
+    summary="Quote a registered device in one call (assign, then rate)",
+    response_description="The stored quote id, the priced options, and the assignment behind them.",
+    responses=secured({
+        200: json_response(
+            "The device was assigned products and those were priced.",
+            {
+                "quote_id": "68a1c2d3e4b21d0f8c9e7712",
+                "responses": [
+                    {
+                        "product_id": "ACME-EW-STD",
+                        "client": "ACME-UK",
+                        "currency": "GBP",
+                        "locale": "en_GB",
+                        "category": "Dishwasher",
+                        "age": 15,
+                        "price": 449.99,
+                        "multi_count": 1,
+                        "source": "web",
+                        "options": [
+                            {"status": "ok", "poc": 24, "mode": "live", "rate": 71.34, "rounded_price": 71.49, "rounded_price_pence": 7149},
+                            {"status": "ok", "poc": 36, "mode": "live", "rate": 96.18, "rounded_price": 96.49, "rounded_price_pence": 9649},
+                        ],
+                    }
+                ],
+                "assignment": {
+                    "Inputs": {"client": "ACME-UK", "source": "web", "category": "Dishwasher", "price": 449.99, "locale": "en_GB", "currency": "GBP"},
+                    "DistinctProductIds": ["ACME-EW-STD"],
+                },
+            },
+        ),
+        400: error("The device id is malformed, or the stored device is missing a required field.", "Device 'currency' is missing or blank."),
+        404: error("The device does not exist, or nothing was assignable to it.", "No products assigned for device"),
+        500: error("Assignment or rating failed unexpectedly.", "Rate request error: ..."),
+    }),
+)
 async def embedded_quote(payload: EmbeddedQuoteRequest, _: None = Depends(verify_token)):
-    """Create a quote for a device by chaining product assignment and rate request.
+    """
+    Quote a registered device in a single call — the convenience wrapper used by embedded
+    journeys.
 
-    Input: { device_id }
-    Output: { quote_id }
+    It chains the two steps you would otherwise make yourself:
+
+    1. `GET /assign_product_for_device/{device_id}` — work out which products and terms the
+       device qualifies for, reading everything from the stored device.
+    2. `POST /rate_request` — price every one of them and persist the result as a quote.
+
+    You get back the `quote_id`, the grouped priced `responses`, and the `assignment` those
+    prices came from, so a UI can render options without a second round trip.
+
+    **Errors propagate from the underlying steps** — a device that exists but qualifies for
+    nothing returns `404`, and a device missing `client`, `source`, `locale` or `currency`
+    returns `400`. Unlike `/rate_request`, which reports per-line failures inside a `200`, this
+    endpoint has nothing to return if assignment itself fails.
+
+    Only `device_id` is mandatory.
     """
     device_id = payload.device_id
 
