@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field, field_validator, constr
 from datetime import datetime
 from itertools import combinations
 from typing import Any, Dict, List, Set
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from pymongo import MongoClient
 import os
@@ -191,14 +192,76 @@ def log_and_raise_error(error_type, error_detail, payload, status=404):
 # -------------------- Pydantic Model ------------------------
 
 class ProductAssignmentRequest(BaseModel):
-    client: str = Field(..., example="")
-    source: str = Field(..., example="")
-    category: str = Field(..., example="")
-    price: float = Field(..., example=0)
-    locale: str = Field(..., example="")
-    purchase_date: str = Field(..., example="")
-    gtee: int = Field(..., example=0)
-    currency: constr(strip_whitespace=True, min_length=3, max_length=3, pattern="^[A-Z]{3}$") = Field(..., example="GBP")
+    """The facts about a device that decide which cover products it qualifies for.
+
+    **Every field is mandatory**, and beyond mere presence the endpoint rejects blank strings
+    and — for `price` and `gtee` — the value `0`, with `422`.
+    """
+
+    client: str = Field(
+        ...,
+        description="**Mandatory.** `Client_ID` the assignment rules belong to (not the ClientKey).",
+        examples=["ACME-UK"],
+    )
+    source: str = Field(
+        ...,
+        description="**Mandatory.** Sales channel the rules are defined for, e.g. `web`, `pos`.",
+        examples=["web"],
+    )
+    category: str = Field(
+        ...,
+        description="**Mandatory.** Product category, matched against the rule document.",
+        examples=["Dishwasher"],
+    )
+    price: float = Field(
+        ...,
+        description=(
+            "**Mandatory and non-zero.** Purchase price, matched against each rule's "
+            "`msrpLow`/`msrpHigh` band. `0` is rejected with `422`."
+        ),
+        examples=[449.99],
+    )
+    locale: str = Field(
+        ...,
+        description="**Mandatory.** Locale code; must appear in the rule's `locale` list.",
+        examples=["en_GB"],
+    )
+    purchase_date: str = Field(
+        ...,
+        description=(
+            "**Mandatory, `YYYY-MM-DD`.** Any other format is rejected with `422`. Used to "
+            "derive `age_in_months`, which must fall inside the rule's `monthsLow`/`monthsHigh`."
+        ),
+        examples=["2025-05-01"],
+    )
+    gtee: int = Field(
+        ...,
+        description=(
+            "**Mandatory and non-zero.** Manufacturer guarantee in months; must appear in the "
+            "rule's `guaranteeDuration` list. `0` is rejected with `422`."
+        ),
+        examples=[12],
+    )
+    currency: constr(strip_whitespace=True, min_length=3, max_length=3, pattern="^[A-Z]{3}$") = Field(
+        ...,
+        description="**Mandatory.** Exactly three upper-case letters (ISO 4217), e.g. `GBP`.",
+        examples=["GBP"],
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "client": "ACME-UK",
+                "source": "web",
+                "category": "Dishwasher",
+                "price": 449.99,
+                "locale": "en_GB",
+                "purchase_date": "2025-05-01",
+                "gtee": 12,
+                "currency": "GBP",
+            }
+        }
+    }
 
     @field_validator("purchase_date")
     def validate_purchase_date_format(cls, v):
@@ -225,8 +288,66 @@ class ProductAssignmentRequest(BaseModel):
 
 # ------------------------ Endpoint --------------------------
 
-@router.post("/product_assignment")
+@router.post(
+    "/product_assignment",
+    summary="Find the cover products a device qualifies for",
+    response_description="The matched assignment document and its products, or an empty list plus diagnostics.",
+    responses=secured({
+        200: json_response(
+            "The request was valid. `products` may still be empty — see `match_diagnostics` "
+            "when it is.",
+            {
+                "input": {
+                    "client": "ACME-UK",
+                    "source": "web",
+                    "category": "Dishwasher",
+                    "price": 449.99,
+                    "locale": "en_GB",
+                    "purchase_date": "2025-05-01",
+                    "gtee": 12,
+                    "currency": "GBP",
+                },
+                "doc_id": "6712c0f1a4b21d0f8c9e0031",
+                "age_in_months": 15,
+                "products": [
+                    {
+                        "productId": "ACME-EW-STD",
+                        "POC": {"mode": "live", "durationMonths": [24, 36]},
+                    }
+                ],
+            },
+        ),
+        422: error(
+            "A mandatory field is missing or blank, `price`/`gtee` is `0`, `purchase_date` is "
+            "not `YYYY-MM-DD`, or `currency` is not three upper-case letters. The failure is "
+            "also written to `Error_Log_ProductAssignment`.",
+            "The following required field(s) are missing or blank: price, gtee",
+        ),
+    }),
+)
 def product_assignment(payload: ProductAssignmentRequest, _: None = Depends(verify_token)):
+    """
+    Match a device against the `ProductAssignment` rules and return the cover products it
+    qualifies for.
+
+    Matching happens in two stages:
+
+    1. **Document level** — `client`, `source` and `category` must match an assignment document.
+    2. **Criteria level** — within that document, a criteria block must accept the `locale`,
+       the `gtee`, the derived `age_in_months`, the `price` band and the `currency`.
+
+    `age_in_months` is calculated from `purchase_date` to today and returned so you can see what
+    was actually matched against.
+
+    **No match is not an error.** The response is still `200`, with `products: []` plus
+    `match_diagnostics` — a per-field account of which criteria rejected the device (for example
+    `price 449.99 not in [0, 300]`) — and `details` listing the near-miss combinations tried.
+    The same diagnostics are logged to `Error_Log_ProductAssignment`. Only a malformed request
+    returns `422`.
+
+    If the device is already registered, prefer `GET /assign_product_for_device/{device_id}`,
+    which fills these inputs in from the stored device.
+    """
     # Validate required fields
     debug_print("\n==== PRODUCT ASSIGNMENT DEBUG ====")
     debug_print("INPUT PAYLOAD:", payload.dict())
