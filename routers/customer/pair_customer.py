@@ -3,6 +3,8 @@ from pymongo import MongoClient
 from bson import ObjectId
 import os
 
+from utils.api_docs import error, json_response
+
 router = APIRouter(tags=["Customers"])
 
 # Setup Mongo client and collections
@@ -13,22 +15,54 @@ basket_collection = db["Basket_Quotes"]
 devices_collection = db["Devices"]
 
 
-@router.post("/pair-customer")
+@router.post(
+    "/pair-customer",
+    summary="Attach a basket's devices to a customer",
+    response_description="Per-device outcome and update counts for both the customer and the devices.",
+    responses={
+        200: json_response(
+            "The pairing ran. **Inspect the counts and `errors`** — a device that could not be "
+            "updated is reported here, not raised.",
+            {
+                "customer_update": {"matched": 1, "modified": 2},
+                "customer_device_updates": {"attempted": 2, "matched": 2, "modified": 2, "errors": []},
+                "device_update": {"attempted": 2, "matched": 2, "modified": 2, "errors": []},
+                "devices": [
+                    {"deviceId": "6820f1c9a4b21d0f8c9e4471", "status": "contract"},
+                    {"deviceId": "6820f1c9a4b21d0f8c9e4472", "status": "registered"},
+                ],
+            },
+        ),
+        400: error("`customer_id` or `basket_id` is not a valid 24-character ObjectId.", "Invalid basket_id"),
+        404: error("The basket or the customer does not exist.", "Customer not found"),
+    },
+)
 def pair_customer(
-    customer_id: str = Body(...),
-    basket_id: str = Body(...),
+    customer_id: str = Body(..., description="**Mandatory.** The customer to attach the devices to.", examples=["6820f1c9a4b21d0f8c9e9001"]),
+    basket_id: str = Body(..., description="**Mandatory.** The basket whose devices are being paired.", examples=["68b2d1f0a4b21d0f8c9e8801"]),
 ):
-    """Attach deviceIds from the basket (Basket and skipped_items) to the Customer document.
+    """
+    Link every device in a basket to a customer — the step that turns an anonymous basket into
+    an owned one, normally run after payment.
 
-    Request body:
-      { "customer_id": "<hexid>", "basket_id": "<hexid>" }
+    Devices are collected from **both** basket arrays and get a status accordingly:
 
-    Behavior:
-      - Load the basket by _id from Basket_Quotes
-      - Collect all deviceId values from `Basket` entries and `skipped_items`
-      - Update the Customer document (by _id) adding the deviceIds to a `deviceIds` array
-        using $addToSet / $each so duplicates are not created.
-      - Return summary with counts and any not-found errors.
+    - lines in `Basket` → **`contract`** (cover was bought)
+    - entries in `skipped_items` → **`registered`** (cover was declined)
+
+    A device in both lists is recorded as `contract`.
+
+    Two writes happen per device: the `Devices` record gets
+    `registrationStatus: "assigned"` and the customer's id, and the customer's `devices` array
+    gets a `{deviceId, status}` entry, replacing any previous entry for that device. Re-running
+    the call is therefore safe — statuses are replaced, not duplicated.
+
+    **Failures are reported, not raised.** A device that cannot be updated appears in the
+    relevant `errors` array while the rest still process, and the call returns `200`. Check
+    `matched` against `attempted` to confirm everything landed. An empty basket returns zeroed
+    counts without touching anything.
+
+    Both ids are mandatory. **This endpoint is not authenticated.**
     """
     # Validate ids
     try:

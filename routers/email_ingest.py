@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from motor.motor_asyncio import AsyncIOMotorClient
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 
 # ✅ FastAPI router object
@@ -52,12 +53,46 @@ def get_db():
 # Pydantic Models
 # ----------------------
 class ExtractRequest(BaseModel):
-    raw_email_text: str = Field(..., description="Full email text or HTML")
+    """A receipt email to parse."""
+
+    raw_email_text: str = Field(
+        ...,
+        description=(
+            "**Mandatory.** The email body, plain text or HTML. HTML is detected automatically "
+            "and converted to text before extraction."
+        ),
+        examples=["Order ORD-2026-00918\nBosch SMS6ZCI00G Dishwasher — £449.99\nPurchased 01/05/2025"],
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "raw_email_text": "Order ORD-2026-00918\nBosch SMS6ZCI00G Dishwasher — £449.99\nPurchased 01/05/2025"
+            }
+        }
+    }
 
 class ExtractResponse(BaseModel):
-    receipt_id: Optional[str] = None
-    extracted: Dict[str, Any]
-    warnings: List[str] = Field(default_factory=list)
+    """What was extracted from one email, and what the extractor was unsure about."""
+
+    receipt_id: Optional[str] = Field(
+        None,
+        description="Id of the stored receipt document.",
+        examples=["68e1f2a3b4c5d6e7f8090011"],
+    )
+    extracted: Dict[str, Any] = Field(
+        ...,
+        description=(
+            "The structured fields the model found — retailer, order reference, purchase date, "
+            "totals and line items. **The key set is not fixed**: it depends on what the email "
+            "contained, so treat every field as optional and check before use."
+        ),
+    )
+    warnings: List[str] = Field(
+        default_factory=list,
+        description="Fields that were guessed, missing or ambiguous. A non-empty list is worth reviewing before trusting the data.",
+        examples=[["purchase_date inferred from email header"]],
+    )
 
 # ----------------------
 # Utilities
@@ -159,8 +194,47 @@ async def poll_mailbox(config: dict, limit: int = 10) -> List[ExtractResponse]:
 # ----------------------
 # Routes
 # ----------------------
-@router.post("/parse", response_model=ExtractResponse, dependencies=[Depends(verify_token)])
+@router.post(
+    "/parse",
+    response_model=ExtractResponse,
+    dependencies=[Depends(verify_token)],
+    summary="Extract purchase details from a receipt email",
+    response_description="The structured fields extracted, the stored receipt id, and any warnings.",
+    responses=secured({
+        200: json_response("The email was parsed and stored.", {
+                "receipt_id": "68e1f2a3b4c5d6e7f8090011",
+                "extracted": {
+                    "retailer": "Acme Retail UK",
+                    "order_reference": "ORD-2026-00918",
+                    "purchase_date": "2025-05-01",
+                    "currency": "GBP",
+                    "total": 449.99,
+                    "items": [
+                        {"make": "Bosch", "model": "SMS6ZCI00G", "description": "Series 6 Dishwasher", "price": 449.99}
+                    ],
+                    "customer_email": "jane.okafor@example.com",
+                },
+                "warnings": ["purchase_date inferred from email header"],
+            }),
+    }),
+)
 async def parse_email(req: ExtractRequest):
+    """
+    Parse a receipt email and pull out the purchase details — retailer, order reference, date,
+    totals and line items.
+
+    Paste the email in as `raw_email_text`, plain text or HTML; HTML is converted to text first.
+    Extraction is done by an LLM, so **treat the result as a best effort**: the `extracted` key
+    set varies with the email, and `warnings` lists anything guessed or missing. Check `warnings`
+    before feeding the output into registration.
+
+    Every parse is **stored** as a receipt document and its id returned — there is no dry-run
+    mode. Nothing is registered as a device here; that is a separate step using the extracted
+    fields.
+
+    Use this for a one-off email you already hold. For mailboxes the platform monitors, use
+    `POST /email/ingest/poll`.
+    """
     from utils import email_extract as EE
     text = EE.html_to_text(req.raw_email_text) if "<html" in req.raw_email_text.lower() else req.raw_email_text
     extracted, warns = EE.extract_structured_fields_strict_json(text)
@@ -181,8 +255,57 @@ async def parse_email(req: ExtractRequest):
 
     return ExtractResponse(receipt_id=receipt_id, extracted=extracted, warnings=warns)
 
-@router.post("/poll", response_model=List[ExtractResponse], dependencies=[Depends(verify_token)])
-async def poll(id: str, limit: int = Query(10, ge=1, le=200)):
+@router.post(
+    "/poll",
+    response_model=List[ExtractResponse],
+    dependencies=[Depends(verify_token)],
+    summary="Poll a configured mailbox and parse unread receipts",
+    response_description="One entry per email processed, in the order read.",
+    responses=secured({
+        200: json_response(
+            "The mailbox was polled. An empty array means there was nothing unread.",
+            [{
+                "receipt_id": "68e1f2a3b4c5d6e7f8090011",
+                "extracted": {
+                    "retailer": "Acme Retail UK",
+                    "order_reference": "ORD-2026-00918",
+                    "purchase_date": "2025-05-01",
+                    "currency": "GBP",
+                    "total": 449.99,
+                    "items": [
+                        {"make": "Bosch", "model": "SMS6ZCI00G", "description": "Series 6 Dishwasher", "price": 449.99}
+                    ],
+                    "customer_email": "jane.okafor@example.com",
+                },
+                "warnings": ["purchase_date inferred from email header"],
+            }],
+        ),
+        404: error("No mailbox is configured with this id.", "No mailbox config found for id=acme-receipts"),
+    }),
+)
+async def poll(
+    id: str = Query(
+        ...,
+        description="**Mandatory.** Id of a configured mailbox, from `mailboxes.json` or `MAILBOXES_JSON`.",
+        examples=["acme-receipts"],
+    ),
+    limit: int = Query(10, ge=1, le=200, description="Maximum unread emails to process in this run. Between 1 and 200.", examples=[10]),
+):
+    """
+    Connect to a configured mailbox over IMAP, parse its **unread** receipt emails, and store
+    what was extracted.
+
+    `id` is mandatory and must match a mailbox in the deployment's configuration; an unknown id
+    returns `404`. `limit` caps how many emails one run handles.
+
+    **Processed emails are marked as read**, so a second call does not reprocess them — which
+    also means a failed downstream step cannot be recovered by simply polling again. Each email
+    is stored as a receipt with its headers, attachments and extracted fields; the response
+    carries one entry per email, each with its own `warnings`.
+
+    This is the same work the background poller does when `ENABLE_EMAIL_POLL` is on; call it
+    directly to force a run or when the poller is disabled.
+    """
     config = next((c for c in MAILBOXES if c["id"] == id), None)
     if not config:
         raise HTTPException(404, f"No mailbox config found for id={id}")

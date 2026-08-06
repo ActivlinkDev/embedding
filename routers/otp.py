@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, Request, Response
 from pydantic import BaseModel, Field
 from typing import Dict, Tuple
 import os, time, hmac, hashlib, base64, random, requests
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 
 router = APIRouter(
@@ -116,16 +117,65 @@ def _send_sms(number: str, message: str):
 
 # Schemas
 class OtpRequestIn(BaseModel):
-    phone: str = Field(..., description="E.164 phone number with leading +")
-    channel: str | None = Field(default="sms")
+    """Where to send the one-time code."""
+
+    phone: str = Field(
+        ...,
+        description="**Mandatory.** E.164 phone number **with a leading `+`**. Anything else is rejected with `422`.",
+        examples=["+447700900123"],
+    )
+    channel: str | None = Field(
+        default="sms",
+        description="Delivery channel. `sms` is the only supported value; anything else returns `422`.",
+        examples=["sms"],
+    )
+
+    model_config = {"json_schema_extra": {"example": {"phone": "+447700900123", "channel": "sms"}}}
 
 class OtpVerifyIn(BaseModel):
-    phone: str
-    code: str
-    channel: str | None = Field(default="sms")
+    """The code the customer typed in, and the number it was sent to."""
 
-@router.post("/request")
+    phone: str = Field(
+        ...,
+        description="**Mandatory.** The same number the code was requested for — the code is stored against it.",
+        examples=["+447700900123"],
+    )
+    code: str = Field(..., description="**Mandatory.** The code from the SMS.", examples=["482913"])
+    channel: str | None = Field(default="sms", description="Must match the request channel. `sms` only.", examples=["sms"])
+
+    model_config = {"json_schema_extra": {"example": {"phone": "+447700900123", "code": "482913", "channel": "sms"}}}
+
+@router.post(
+    "/request",
+    summary="Send a one-time code by SMS",
+    response_description="Confirmation, the masked destination, and whether an existing code was reused.",
+    responses=secured({
+        200: json_response(
+            "A code is now active for this number.",
+            {"success": True, "destination_masked": "+44 ***** **0123", "reused": False},
+        ),
+        422: error("`phone` has no leading `+`, or `channel` is not `sms`.", "invalid phone format"),
+        500: error("The SMS gateway is not configured or could not be reached.", "SMS API key not configured"),
+    }),
+)
 def request_otp(req: OtpRequestIn, response: Response, _: None = Depends(verify_token)):
+    """
+    Send a one-time code to a phone number.
+
+    The code is valid for **5 minutes** and allows **5 verification attempts**. Requesting again
+    within **30 seconds** does not send a second SMS — the existing code stays valid and the
+    response comes back with `reused: true`. After that window a fresh code is generated and the
+    previous one stops working.
+
+    A signed `otp_fallback` cookie is also set as a delivery fallback, so `POST /otp/verify` can
+    still succeed if the server-side record has been lost.
+
+    `phone` is mandatory and **must be E.164 with a leading `+`**; `channel` defaults to `sms`,
+    the only supported value. `destination_masked` is safe to display back to the customer.
+
+    Note that codes are held **in process memory**, so a restart or a second replica invalidates
+    outstanding codes — the cookie fallback is what covers that case.
+    """
     phone = req.phone.strip()
     channel = req.channel or "sms"
     if channel != "sms":
@@ -161,8 +211,47 @@ def request_otp(req: OtpRequestIn, response: Response, _: None = Depends(verify_
 
     return {"success": True, "destination_masked": mask_destination(phone), "reused": reused}
 
-@router.post("/verify")
+@router.post(
+    "/verify",
+    summary="Check a one-time code",
+    response_description="Confirmation that the code was accepted.",
+    responses=secured({
+        200: json_response(
+            "The code was correct. `fallback: \"cookie\"` means it was matched against the "
+            "signed cookie because the server-side record was gone.",
+            {"success": True},
+        ),
+        400: error(
+            "The code was rejected. `detail` says why: `not_found`, `expired`, "
+            "`too_many_attempts` or `invalid_code`.",
+            "invalid_code",
+        ),
+        422: error("`channel` is not `sms`.", "unsupported channel"),
+    }),
+)
 def verify_otp(req: OtpVerifyIn, request: Request, response: Response, _: None = Depends(verify_token)):
+    """
+    Check the code a customer entered.
+
+    All three inputs must line up: the code is stored against the `phone` and `channel` it was
+    requested for. On success the `otp_fallback` cookie is cleared and the code is consumed.
+
+    **Failure reasons** arrive as `400` with `detail` set to one of:
+
+    | `detail` | Meaning |
+    | --- | --- |
+    | `not_found` | No code outstanding for this number — never requested, or already used |
+    | `expired` | More than 5 minutes since it was issued |
+    | `too_many_attempts` | 5 wrong guesses; request a new code |
+    | `invalid_code` | Wrong code, attempt counted |
+
+    If the server-side record is missing but the request carries a valid signed `otp_fallback`
+    cookie matching this phone and code, verification succeeds with `fallback: "cookie"`. That is
+    the normal path after a restart, since codes live in process memory.
+
+    Verifying does **not** by itself sign the customer in — follow with
+    `POST /customer/mark-verified` to issue the verified-customer cookie.
+    """
     phone = req.phone.strip()
     code = req.code.strip()
     channel = req.channel or "sms"
