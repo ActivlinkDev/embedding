@@ -95,7 +95,7 @@ class ClientKeyEntry(BaseModel):
 
 
 class LoginResponse(BaseModel):
-    username: str = Field(..., examples=["jane.okafor"])
+    username: str = Field(..., description="The authenticated user.", examples=["jane.okafor"])
     clientId: str = Field(..., description="The client this user is scoped to.", examples=["ACME-UK"])
     clientKeys: list[ClientKeyEntry] = Field(
         ..., description="Every ClientKey belonging to that client. Never empty — login fails with `404` if there are none."
@@ -136,16 +136,16 @@ class CreateUserRequest(BaseModel):
 
 
 class CreateUserResponse(BaseModel):
-    username: str = Field(..., examples=["sam.reeves"])
-    clientId: str = Field(..., examples=["ACME-UK"])
+    username: str = Field(..., description="The created user's username.", examples=["sam.reeves"])
+    clientId: str = Field(..., description="The client they belong to.", examples=["ACME-UK"])
     role: str = Field(..., description="Always `user` — the API creates no other role.", examples=["user"])
     created_at: str = Field(..., description="UTC ISO-8601 timestamp.", examples=["2026-08-06T10:14:52.113000Z"])
 
 
 class PortalUserEntry(BaseModel):
-    username: str = Field(..., examples=["sam.reeves"])
-    clientId: str = Field(..., examples=["ACME-UK"])
-    role: str = Field(..., examples=["user"])
+    username: str = Field(..., description="The user's username, unique portal-wide.", examples=["sam.reeves"])
+    clientId: str = Field(..., description="The client they belong to.", examples=["ACME-UK"])
+    role: str = Field(..., description="Always `user` for API-created accounts.", examples=["user"])
     created_at: str | None = Field(None, description="Null for users created before this was recorded.", examples=["2026-08-06T10:14:52.113000Z"])
 
 

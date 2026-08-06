@@ -2,6 +2,8 @@ import gzip
 import json
 import os
 import sys
+
+from utils.api_docs import json_response
 import traceback
 import logging
 from datetime import datetime, timezone
@@ -270,13 +272,48 @@ def _slim_payload(body: dict) -> dict:
     return {**body, "tasks": tasks_out}
 
 
-@router.post("/webhook")
+@router.post(
+    "/webhook",
+    summary="DataforSEO postback receiver (called by DataforSEO, not by you)",
+    response_description="Acknowledgement, with a per-task account of what was processed.",
+    responses={
+        200: json_response(
+            "**Always returned**, even when processing failed — see `processed` for what "
+            "actually happened.",
+            {
+                "status": "ok",
+                "processed": [
+                    {
+                        "function": "products",
+                        "master_sku_id": "681aa2f1c4b21d0f8c9e0044",
+                        "locale": "en_GB",
+                        "status": "ok",
+                        "product_id": "1234567890123456789",
+                    }
+                ],
+            },
+        ),
+    },
+)
 async def dseo_webhook(request: Request):
     """
-    Receives DataforSEO postback callbacks for merchant/google/products and
-    merchant/google/product_info tasks. Handles gzip-compressed bodies, stores
-    a trimmed payload, then dispatches to the correct handler.
-    Always returns 200 so DataforSEO does not retry.
+    Receive completed enrichment tasks from DataforSEO. **DataforSEO calls this endpoint — you
+    never do.**
+
+    It handles the postbacks for both task types: `merchant/google/products` (prices) and
+    `merchant/google/product_info` (details). Bodies may be gzip-compressed. A trimmed copy of
+    every payload is stored for audit — the bulky `items` arrays are stripped — and the data is
+    written onto the matching MasterSKU's locale record.
+
+    **It always returns `200`**, even when a task cannot be matched or stored, so DataforSEO does
+    not retry into a loop. The real outcome is in `processed`, one entry per task, each with its
+    own `status`. Treat the status code as "received", never as "succeeded".
+
+    When a shopping task yields a Google `Product_ID`, a `product_info` task is scheduled
+    automatically — which is why one submission can produce two postbacks.
+
+    There is **no bearer token** on this endpoint; the `id` query parameter is the task
+    correlation, not a credential.
     """
     task_id = request.query_params.get("id")
 

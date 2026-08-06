@@ -3,6 +3,7 @@ from typing import List
 import httpx
 import os
 from pymongo import MongoClient
+from utils.api_docs import error
 from utils.dependencies import verify_token
 from utils.locale import resolve_strapi_locale, LocaleNotSupportedError
 
@@ -28,12 +29,53 @@ def _get_locale_params_collection():
         # If Mongo is unreachable or DNS fails, fall back to pure transform without DB mapping
         return None
 
-@router.get("/props_lookup")
+@router.get(
+    "/props_lookup",
+    summary="Fetch product marketing copy from the CMS",
+    response_description="The CMS entries for the requested products, in the requested locale.",
+    responses={
+        200: {
+            "description": (
+                "Strapi's response, forwarded unchanged. The shape is defined by the CMS "
+                "content type, not by this API."
+            ),
+            "content": {"application/json": {}},
+        },
+        400: error("The locale has no Strapi equivalent configured.", "Locale 'xx_XX' is not supported"),
+        500: error("Strapi could not be reached.", "..."),
+    },
+)
 async def props_lookup(
-    locale: str = Query(..., example="es_ES"),
-    product_ids: List[str] = Query(..., alias="product_ids[]", example=["EX1", "WF1"]),
+    locale: str = Query(
+        ...,
+        description="**Mandatory.** Locale in underscore form (`es_ES`). Translated to the CMS's hyphenated form (`es-ES`) automatically.",
+        examples=["es_ES"],
+    ),
+    product_ids: List[str] = Query(
+        ...,
+        alias="product_ids[]",
+        description=(
+            "**Mandatory.** One or more product ids. Note the parameter name is literally "
+            "`product_ids[]`; repeat it once per id."
+        ),
+        examples=[["EX1", "WF1"]],
+    ),
     _: None = Depends(verify_token)
 ):
+    """
+    Fetch the marketing copy (props) for one or more cover products from the CMS.
+
+    This is what the storefront and widget render alongside a price: benefit bullets, terms
+    summaries and display text, in the customer's language.
+
+    Both parameters are mandatory, and the query parameter really is spelled **`product_ids[]`**
+    — repeat it for each id. The `locale` you send is the API's underscore form; it is mapped to
+    the CMS's hyphenated form, preferring the mapping stored in `Locale_Params` and falling back
+    to a built-in table. A locale with no CMS equivalent returns `400`.
+
+    The response is **Strapi's JSON, forwarded unchanged** — its shape belongs to the CMS content
+    type, not to this API.
+    """
     # Delegate to the in-process helper so other modules can call this
     # without going through FastAPI dependency injection.
     try:

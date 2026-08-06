@@ -53,7 +53,7 @@ class RuleResult(BaseModel):
 class RateBasketResponse(BaseModel):
     """The basket's totals and the discount rules considered. All amounts are in minor units."""
 
-    basket_id: str = Field(..., examples=["68b2d1f0a4b21d0f8c9e8801"])
+    basket_id: str = Field(..., description="The basket that was priced.", examples=["68b2d1f0a4b21d0f8c9e8801"])
     subtotal: int = Field(..., description="Sum of every line before discount, in minor units.", examples=[14298])
     eligible_rules: List[RuleResult] = Field(
         ...,

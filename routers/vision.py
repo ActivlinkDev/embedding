@@ -1,10 +1,11 @@
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl
 from typing import Dict, Any
 import openai
 import os
 import json
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 
 # --- Import your category matching tools ---
@@ -101,17 +102,69 @@ def extract_device_info_from_image(image_url: str, model: str = "gpt-4o") -> Dic
         raise ValueError(f"OpenAI Vision API error: {e}")
 
 class DeviceImageRequest(BaseModel):
-    image_url: HttpUrl
+    """The image to read device details from."""
 
-@router.post("/device_info_from_image")
+    image_url: HttpUrl = Field(
+        ...,
+        description=(
+            "**Mandatory.** Publicly reachable URL of the photo — typically a rating plate or "
+            "serial label. Must be fetchable by OpenAI; a signed or private URL will fail."
+        ),
+        examples=["https://cdn.example.com/uploads/rating-plate-8841203.jpg"],
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {"image_url": "https://cdn.example.com/uploads/rating-plate-8841203.jpg"}
+        }
+    }
+
+@router.post(
+    "/device_info_from_image",
+    summary="Read device details from a photo of its label",
+    response_description="The details read from the image, plus the category it was matched to.",
+    responses=secured({
+        200: json_response(
+            "The image was read. **Values are model output** — verify before storing.",
+            {
+                "device_info": {
+                    "make": "Bosch",
+                    "model": "SMS6ZCI00G",
+                    "serial": "SN-8841203",
+                    "device_category": "dishwasher",
+                    "country": "Germany",
+                    "matched_category": "Dishwasher",
+                    "match_similarity": 0.91,
+                }
+            },
+        ),
+        500: error(
+            "The image could not be fetched or read — unreachable URL, unreadable photo, or a "
+            "vision API failure.",
+            "OpenAI Vision API error: ...",
+        ),
+    }),
+)
 def device_info_from_image(
     req: DeviceImageRequest,
     _: None = Depends(verify_token)
 ):
     """
-    Receives an image URL, uses OpenAI GPT-4o vision to extract device info.
-    Matches the category and returns both inside device_info.
-    Auth required.
+    Read a device's details from a photo — typically the rating plate or serial label a customer
+    photographs during registration.
+
+    The image is analysed by a vision model, which returns `make`, `model`, `serial`,
+    `device_category` and `country`. The free-text category is then matched against the known
+    category list, adding `matched_category` and a `match_similarity` score.
+
+    **Every value is model output and can be wrong.** Blank strings come back for fields the
+    model could not read, and `match_similarity` is worth checking before trusting
+    `matched_category`. Treat the result as a form pre-fill for the customer to confirm, not as
+    verified data.
+
+    `image_url` is mandatory and must be **publicly reachable** — the image is fetched by the
+    vision API, not proxied through this service. Nothing is stored: the response is the only
+    output.
     """
     try:
         device_info = extract_device_info_from_image(str(req.image_url))

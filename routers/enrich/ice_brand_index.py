@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from utils.api_docs import json_response, secured
 from utils.dependencies import verify_token
 
 load_dotenv()
@@ -40,15 +41,42 @@ REQUEST_TIMEOUT = 15.0       # seconds per individual lookup
 # ---------------------------------------------------------------------------
 
 class IcecatIdentifier(BaseModel):
-    gtin: Optional[str] = Field(None, description="GTIN / EAN / UPC")
-    brand: Optional[str] = Field(None, description="Brand name (required if no GTIN)")
-    productcode: Optional[str] = Field(None, description="Manufacturer product code (required if no GTIN)")
-    ref: Optional[str] = Field(None, description="Optional caller reference echoed back in the result")
+    """One product to look up. Every field is optional individually, but each entry needs
+    **either a `gtin` or both `brand` and `productcode`** — an entry with neither cannot be
+    looked up and comes back with `status: "error"`."""
+
+    gtin: Optional[str] = Field(None, description="GTIN / EAN / UPC. Tried first.", examples=["5011773057240"])
+    brand: Optional[str] = Field(None, description="Brand name. Required with `productcode` when there is no GTIN.", examples=["Bosch"])
+    productcode: Optional[str] = Field(None, description="Manufacturer product code. Required with `brand`.", examples=["SMS6ZCI00G"])
+    ref: Optional[str] = Field(
+        None,
+        description="Your own reference, echoed back on the matching result — the reliable way to correlate results with your records.",
+        examples=["row-17"],
+    )
 
 
 class BatchLookupRequest(BaseModel):
-    identifiers: list[IcecatIdentifier] = Field(..., min_items=1, max_items=200)
-    lang: str = Field("en", description="2-letter language code")
+    """Up to 200 products to look up in one call."""
+
+    identifiers: list[IcecatIdentifier] = Field(
+        ...,
+        min_items=1,
+        max_items=200,
+        description="**Mandatory. Between 1 and 200 entries.** Requests outside that range are rejected with `422`.",
+    )
+    lang: str = Field("en", description="Two-letter language code applied to every lookup in the batch.", examples=["en"])
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "lang": "en",
+                "identifiers": [
+                    {"gtin": "5011773057240", "ref": "row-1"},
+                    {"brand": "Bosch", "productcode": "SMS4HCI40G", "ref": "row-2"},
+                ],
+            }
+        }
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -113,19 +141,57 @@ async def _lookup_one(
 # Endpoint
 # ---------------------------------------------------------------------------
 
-@router.post("/batch-lookup", dependencies=[Depends(verify_token)])
+@router.post(
+    "/batch-lookup",
+    dependencies=[Depends(verify_token)],
+    summary="Look up many products in Icecat at once",
+    response_description="A count summary plus one result per identifier, in the order submitted.",
+    responses=secured({
+        200: json_response(
+            "The batch ran. Per-identifier failures appear inside `results`; the call itself "
+            "still succeeds.",
+            {
+                "summary": {"total": 2, "found": 1, "not_found": 1, "errors": 0},
+                "results": [
+                    {
+                        "ref": "row-1",
+                        "tried": ["gtin"],
+                        "status": "found",
+                        "data": {"GeneralInfo": {"Title": "Bosch Series 6 Dishwasher", "Brand": "Bosch"}},
+                    },
+                    {
+                        "ref": "row-2",
+                        "tried": ["gtin", "brand+productcode"],
+                        "status": "not_found",
+                        "error": "HTTP 404",
+                        "data": None,
+                    },
+                ],
+            },
+        ),
+    }),
+)
 async def batch_lookup(body: BatchLookupRequest):
     """
-    Look up multiple products in Icecat concurrently.
+    Look up many products in Icecat in one call — the bulk form of `GET /ice/lookup`, for
+    catalogue imports and coverage checks.
 
-    Supply up to 200 identifiers per request — each can use a GTIN or a
-    brand + productcode pair.  An optional `ref` field is echoed back so you
-    can correlate results with your own records.
+    Between **1 and 200** identifiers per request; each needs either a `gtin` or a
+    `brand`+`productcode` pair. Lookups run concurrently (10 at a time, 15 second timeout each)
+    and results come back **in the order submitted**.
 
-    Returns one result object per identifier with:
-    - `status`: "found" | "not_found" | "error"
-    - `data`: full Icecat product sheet (when found)
-    - `error`: reason string (when not found or errored)
+    **A failed lookup does not fail the request.** Every identifier gets a result object:
+
+    | Field | Meaning |
+    | --- | --- |
+    | `status` | `found`, `not_found`, or `error` |
+    | `data` | The Icecat product sheet when found, otherwise `null` |
+    | `error` | Why it failed, e.g. `HTTP 404` |
+    | `tried` | Which strategies were attempted, in order |
+    | `ref` | Your reference, echoed back |
+
+    `summary` gives the counts at a glance. Set `ref` on each identifier — it is the reliable way
+    to line results up with your own rows. Nothing is stored.
     """
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 

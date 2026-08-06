@@ -1,11 +1,12 @@
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pymongo import MongoClient
 import openai
 import os
 import json
 from typing import Optional, List, Dict, Any
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token  # <-- import your auth here
 
 # -------------------------------
@@ -22,8 +23,20 @@ faults_collection = db["Faults"]
 openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class FaultRequest(BaseModel):
-    category: str
-    locale: str
+    """Which category and locale to produce a fault list for. Both are mandatory."""
+
+    category: str = Field(
+        ...,
+        description="**Mandatory.** Device category, matched **exactly** against the stored `Category`. Unknown categories return `404`.",
+        examples=["Dishwasher"],
+    )
+    locale: str = Field(
+        ...,
+        description="**Mandatory.** Locale the faults should be written in, e.g. `fr_FR`.",
+        examples=["fr_FR"],
+    )
+
+    model_config = {"json_schema_extra": {"example": {"category": "Dishwasher", "locale": "fr_FR"}}}
 
 def find_category(faults_collection, category: str) -> Optional[dict]:
     """Look up a document by category in the faults collection."""
@@ -82,17 +95,45 @@ def generate_faults_via_openai(category: str, locale: str, model: str = "gpt-4o"
         raise ValueError(f"OpenAI returned invalid or unparsable content: {str(e)}\nRaw: {content_text}")
     return faults
 
-@router.post("/generate_faults")
+@router.post(
+    "/generate_faults",
+    summary="Get (or generate) the localized fault list for a category",
+    response_description="The fault list for that category and locale, plus what the call did.",
+    responses=secured({
+        200: json_response(
+            "Faults are available. `message` says whether they were already stored or generated now.",
+            {
+                "message": "Locale 'fr_FR' added for category 'Dishwasher'",
+                "Faults": [
+                    "Ne démarre pas",
+                    "N'évacue pas l'eau",
+                    "Fuite d'eau",
+                    "Vaisselle non lavée correctement",
+                ],
+            },
+        ),
+        404: error("No stored category matches this name exactly.", "no category found"),
+        500: error("The language model call or its parsing failed. Nothing was stored — retry.", "OpenAI or parsing error: ..."),
+    }),
+)
 def generate_faults(
     req: FaultRequest,
     _: None = Depends(verify_token)
 ):
     """
-    For a given category and locale:
-    - Checks if category exists. If not, returns 404.
-    - If locale exists, returns existing faults.
-    - If locale does not exist, generates faults via OpenAI and stores for that locale under the category.
-    Auth required.
+    Return the list of common faults for a device category, in a given language — the options
+    shown when a customer reports a problem.
+
+    **Cached, generated on first use.** If the category already has faults for that locale they
+    are returned as-is. If not, they are generated with a language model, **stored against the
+    category**, and returned — so the first call for a new locale is slow and every later call
+    is fast. `message` tells you which happened.
+
+    The category must already exist and is matched **exactly** — `Dishwasher` and `dishwasher`
+    are not the same — and an unknown one returns `404` rather than inventing a category.
+
+    Both fields are mandatory. A generation failure returns `500` and stores nothing, so retrying
+    is safe.
     """
     # Look up the category in Mongo
     doc = find_category(faults_collection, req.category)

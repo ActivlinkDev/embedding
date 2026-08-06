@@ -10,7 +10,7 @@ import os, io, json, anyio, sys, pathlib, logging
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
-from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Query
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from bson import ObjectId
 from openai import OpenAI
@@ -26,6 +26,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # ---------- Auth: utils.dependencies → dependencies → fallback ----------
+from utils.api_docs import error, json_response, secured
+
 verify_token = None
 try:
     from utils.dependencies import verify_token as _vt  # preferred (your utils folder)
@@ -204,11 +206,41 @@ def _recalculate_scores(model_result: dict, script_config: dict) -> dict:
 
 # ---------- Routes ----------
 
-@router.post("/transcribe")
+@router.post(
+    "/transcribe",
+    summary="Transcribe a call recording",
+    response_description="The stored transcript, its id, and the language detected.",
+    responses=secured({
+        200: json_response(
+            "The recording was transcribed and stored.",
+            {
+                "transcript_id": "6900a1b2c3d4e5f6a7b80011",
+                "language": "en",
+                "text": "Good morning, you're through to Acme. My name is Sam…",
+            },
+        ),
+        500: error("Transcription failed. Nothing was stored — retry.", "Transcription failed: ..."),
+    }),
+)
 async def transcribe(
-    file: UploadFile = File(..., description="Audio file (mp3/wav/m4a)"),
-    language: Optional[str] = Form(None),
+    file: UploadFile = File(..., description="**Mandatory.** The audio file to transcribe — mp3, wav or m4a. Sent as multipart form data."),
+    language: Optional[str] = Form(
+        None,
+        description="Language hint, e.g. `en`. Detected automatically when omitted; set it for short or noisy audio where detection is unreliable.",
+    ),
 ):
+    """
+    Transcribe a call recording to text and store it.
+
+    Send the audio as **multipart form data**, not JSON. `file` is mandatory; `language` is an
+    optional hint that improves accuracy on short or noisy recordings.
+
+    The transcript is stored and its `transcript_id` returned — pass that to `POST /qa/score` to
+    have the call assessed. To do both in one request, use `POST /qa/process` instead.
+
+    Transcription is model-generated and imperfect; treat the text as evidence to review, not as
+    a verbatim record.
+    """
     data = await file.read()
     fobj = io.BytesIO(data); fobj.name = file.filename or "audio.wav"
 
@@ -234,13 +266,78 @@ async def transcribe(
         "text": doc["text"],
     }
 
-@router.post("/score")
+@router.post(
+    "/score",
+    summary="Score a transcript against a named script",
+    response_description="The stored result id and the full scored breakdown.",
+    responses=secured({
+        200: json_response(
+            "The transcript was scored and the result stored.",
+            {
+                "result_id": "6900b2c3d4e5f6a7b8c90022",
+                "transcript_id": "6900a1b2c3d4e5f6a7b80011",
+                "payload": {
+                    "sections": {
+                        "opening": {
+                            "score": 100.0,
+                            "passed": True,
+                            "checks": [
+                                {"id": "greeting", "met": True, "evidence": "Good morning, you're through to Acme."},
+                                {"id": "identify_agent", "met": True, "evidence": "My name is Sam."},
+                            ],
+                        },
+                        "compliance": {
+                            "score": 50.0,
+                            "passed": False,
+                            "checks": [
+                                {"id": "state_recording", "met": True, "evidence": "This call is recorded."},
+                                {"id": "confirm_consent", "met": False, "evidence": ""},
+                            ],
+                        },
+                    },
+                    "prohibited_flags": [],
+                    "key_misses": ["confirm_consent"],
+                    "final": {"weighted_score": 72.5, "summary": "Strong opening; consent was not confirmed."},
+                },
+            },
+        ),
+        400: error("Neither `transcript_text` nor `transcript_id` was supplied.", "Provide transcript_text or transcript_id"),
+        404: error("No such transcript, or no script config with that name.", "script_name not found"),
+        500: error("Scoring failed. Nothing was stored — retry.", "Scoring failed: ..."),
+    }),
+)
 async def score(
-    transcript_text: Optional[str] = None,
-    transcript_id: Optional[str] = None,
-    script_name: str = Form(...),   # REQUIRED now
-    model: Optional[str] = None,
+    transcript_text: Optional[str] = Query(
+        None,
+        description="The transcript to score, inline. **Either this or `transcript_id` is required**; this one wins if both are sent.",
+    ),
+    transcript_id: Optional[str] = Query(
+        None,
+        description="Id of a transcript stored by `POST /qa/transcribe`. Used when `transcript_text` is absent.",
+    ),
+    script_name: str = Form(..., description="**Mandatory.** Name of a script config saved via `POST /qa/scripts`. Unknown names return `404`."),
+    model: Optional[str] = Query(None, description="Override the scoring model. Defaults to the configured one."),
 ):
+    """
+    Score a call transcript against a named script config — the checklist of things an agent was
+    supposed to say.
+
+    Supply the transcript **either** inline as `transcript_text` **or** by `transcript_id`; one of
+    the two is required, and the inline text wins if both are given. `script_name` is mandatory
+    and must name a config saved via `POST /qa/scripts`.
+
+    **Scoring is deliberately split.** The model only decides whether each checkpoint was met and
+    quotes the evidence; the numbers are then recalculated server-side from the script's weights,
+    so the same transcript and script always produce the same score.
+
+    In the result, each section scores the proportion of its **required** checks that were met and
+    passes at 70; `final.weighted_score` combines sections using the script's weights.
+    `key_misses` lists the required checks that failed, and `prohibited_flags` records anything
+    forbidden that was said — currently reported without affecting the score.
+
+    Every call stores a result and returns its `result_id`; retrieve it later with
+    `GET /qa/result/{result_id}`.
+    """
     # Resolve transcript
     if not transcript_text and transcript_id:
         tdoc = await _db[COL_TRANSCRIPTS].find_one({"_id": _as_obj_id(transcript_id)})
@@ -283,13 +380,65 @@ async def score(
         "payload": result,
     }
 
-@router.post("/process", summary="Upload audio + (script) → transcribe + score")
+@router.post(
+    "/process",
+    summary="Transcribe and score a recording in one call",
+    response_description="The same payload as `POST /qa/score`: the result id and the scored breakdown.",
+    responses=secured({
+        200: json_response(
+            "The recording was transcribed and scored.",
+            {
+                "result_id": "6900b2c3d4e5f6a7b8c90022",
+                "transcript_id": "6900a1b2c3d4e5f6a7b80011",
+                "payload": {
+                    "sections": {
+                        "opening": {
+                            "score": 100.0,
+                            "passed": True,
+                            "checks": [
+                                {"id": "greeting", "met": True, "evidence": "Good morning, you're through to Acme."},
+                                {"id": "identify_agent", "met": True, "evidence": "My name is Sam."},
+                            ],
+                        },
+                        "compliance": {
+                            "score": 50.0,
+                            "passed": False,
+                            "checks": [
+                                {"id": "state_recording", "met": True, "evidence": "This call is recorded."},
+                                {"id": "confirm_consent", "met": False, "evidence": ""},
+                            ],
+                        },
+                    },
+                    "prohibited_flags": [],
+                    "key_misses": ["confirm_consent"],
+                    "final": {"weighted_score": 72.5, "summary": "Strong opening; consent was not confirmed."},
+                },
+            },
+        ),
+        404: error("No script config with that name.", "script_name not found"),
+        500: error("Transcription or scoring failed.", "Transcription failed: ..."),
+    }),
+)
 async def process_audio(
-    file: UploadFile = File(...),
-    language: Optional[str] = Form(None),
-    script_name: str = Form(...),   # REQUIRED now
-    model: Optional[str] = None,
+    file: UploadFile = File(..., description="**Mandatory.** The audio file to transcribe and score — mp3, wav or m4a."),
+    language: Optional[str] = Form(None, description="Language hint for transcription. Detected automatically when omitted."),
+    script_name: str = Form(..., description="**Mandatory.** Name of the script config to score against."),
+    model: Optional[str] = Query(None, description="Override the scoring model. Defaults to the configured one."),
 ):
+    """
+    Upload a recording and get it transcribed **and** scored in one request — the usual entry
+    point for QA.
+
+    Equivalent to calling `POST /qa/transcribe` then `POST /qa/score` with the resulting
+    transcript id, and it returns exactly what `/qa/score` returns. Sent as **multipart form
+    data**.
+
+    `file` and `script_name` are mandatory; the script must already exist (`POST /qa/scripts`).
+
+    Both steps store their output, so a failure during scoring still leaves the transcript
+    behind — the wasted work is the transcription, not the audio. Scoring itself is deterministic
+    server-side; see `POST /qa/score` for how the numbers are produced.
+    """
     t = await transcribe(file=file, language=language)
     return await score(
         transcript_text=None,
@@ -298,8 +447,57 @@ async def process_audio(
         model=model,
     )
 
-@router.get("/result/{result_id}")
+@router.get(
+    "/result/{result_id}",
+    summary="Retrieve a stored QA result",
+    response_description="The scored breakdown as stored, with the model used and when it ran.",
+    responses=secured({
+        200: json_response(
+            "The result was found.",
+            {
+                "result_id": "6900b2c3d4e5f6a7b8c90022",
+                "transcript_id": "6900a1b2c3d4e5f6a7b80011",
+                "payload": {
+                    "sections": {
+                        "opening": {
+                            "score": 100.0,
+                            "passed": True,
+                            "checks": [
+                                {"id": "greeting", "met": True, "evidence": "Good morning, you're through to Acme."},
+                                {"id": "identify_agent", "met": True, "evidence": "My name is Sam."},
+                            ],
+                        },
+                        "compliance": {
+                            "score": 50.0,
+                            "passed": False,
+                            "checks": [
+                                {"id": "state_recording", "met": True, "evidence": "This call is recorded."},
+                                {"id": "confirm_consent", "met": False, "evidence": ""},
+                            ],
+                        },
+                    },
+                    "prohibited_flags": [],
+                    "key_misses": ["confirm_consent"],
+                    "final": {"weighted_score": 72.5, "summary": "Strong opening; consent was not confirmed."},
+                },
+                "created_at": "2026-08-06T10:14:52.113000+00:00",
+                "model": "gpt-4o",
+            },
+        ),
+        404: error("No result with this id.", "result_id not found"),
+    }),
+)
 async def get_result(result_id: str):
+    """
+    Fetch a QA result produced earlier by `POST /qa/score` or `POST /qa/process`.
+
+    Path parameter `result_id` is mandatory. The `payload` is returned **as it was scored** —
+    nothing is recalculated on read, so a later change to the script config does not alter
+    historic results.
+
+    `model` records which model produced the judgements, which matters when comparing scores
+    across time.
+    """
     doc = await _db[COL_RESULTS].find_one({"_id": _as_obj_id(result_id)})
     if not doc:
         raise HTTPException(status_code=404, detail="result_id not found")
@@ -311,8 +509,35 @@ async def get_result(result_id: str):
         "model": doc.get("model"),
     }
 
-@router.post("/scripts", summary="Save or upsert a named script config")
-async def save_script(name: str = Form(...), config_json: str = Form(...)):
+@router.post(
+    "/scripts",
+    summary="Create or replace a named script config",
+    response_description="The name the config was stored under.",
+    responses=secured({
+        200: json_response("The config was stored.", {"name": "retention-call-v3"}),
+        400: error("`config_json` is not valid JSON.", "Invalid config_json: Expecting value: line 1 column 1"),
+    }),
+)
+async def save_script(
+    name: str = Form(..., description="**Mandatory.** Config name. Saving under an existing name **replaces** it."),
+    config_json: str = Form(..., description="**Mandatory.** The config as a JSON **string**, holding `checkpoints`, `weights` and optional `metadata`."),
+):
+    """
+    Create or replace the script config a call is scored against — the checkpoints an agent is
+    expected to hit and how much each section counts.
+
+    Sent as **multipart form data**, with the config as a **JSON string** in `config_json`, not
+    as a nested object. It must contain `checkpoints` (sections, each listing its checks and
+    which are required) and `weights` (a weight per section); `metadata` is optional and is what
+    `GET /qa/scripts` lists.
+
+    **Saving under an existing name overwrites it** — this is an upsert with no versioning and
+    no confirmation. Results already scored keep the config they used, so history is unaffected,
+    but scores taken before and after a change are not comparable.
+
+    Only the JSON syntax is validated; a config missing `checkpoints` or `weights` is stored
+    happily and fails later at scoring time.
+    """
     try:
         cfg = json.loads(config_json)
     except Exception as e:
@@ -325,8 +550,28 @@ async def save_script(name: str = Form(...), config_json: str = Form(...)):
     )
     return {"name": name}
 
-@router.get("/scripts", summary="List available script configs")
+@router.get(
+    "/scripts",
+    summary="List the available script configs",
+    response_description="Every stored config: its name and metadata only.",
+    responses=secured({
+        200: json_response(
+            "The stored configs, sorted by name. The checkpoints themselves are not included.",
+            [
+                {"name": "retention-call-v3", "metadata": {"owner": "QA team", "updated": "2026-07-14"}},
+                {"name": "sales-outbound-v1", "metadata": {"owner": "Sales", "updated": "2026-03-02"}},
+            ],
+        ),
+    }),
+)
 async def list_scripts():
+    """
+    List the script configs available to score against, sorted by name.
+
+    Takes no parameters. Only `name` and `metadata` are returned — **not** the checkpoints or
+    weights, so this is a picker, not a way to read a config back. Use the names here as
+    `script_name` on `POST /qa/score` and `POST /qa/process`.
+    """
     cur = _db[COL_SCRIPTS].find({}, {"name": 1, "config.metadata": 1}).sort("name", 1)
     out: List[Dict[str, Any]] = []
     async for d in cur:

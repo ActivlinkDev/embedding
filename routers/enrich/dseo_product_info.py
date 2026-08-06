@@ -8,6 +8,7 @@ from pymongo import MongoClient
 from bson import ObjectId
 from dotenv import load_dotenv
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 
 load_dotenv()
@@ -109,15 +110,55 @@ async def submit_dseo_product_info_task(masterSKUid: str, locale: str) -> dict:
     return result
 
 
-@router.post("/product_info", dependencies=[Depends(verify_token)])
+@router.post(
+    "/product_info",
+    dependencies=[Depends(verify_token)],
+    summary="Start a detailed product lookup for a priced MasterSKU",
+    response_description="DataforSEO's task acknowledgement, passed through unchanged.",
+    responses=secured({
+        200: json_response(
+            "The task was **accepted**, not completed. Details arrive later via the webhook.",
+            {
+                "status_code": 20000,
+                "status_message": "Ok.",
+                "tasks": [
+                    {
+                        "id": "08061234-1234-0066-0000-b2c3d4e5f6a7",
+                        "status_code": 20100,
+                        "status_message": "Task Created.",
+                        "data": {"product_id": "1234567890123456789", "tag": "681aa2f1c4b21d0f8c9e0044"},
+                    }
+                ],
+            },
+        ),
+        400: error(
+            "`masterSKUid` is malformed, or no `Product_ID` is stored for this locale — run "
+            "`POST /dseo/shopping` first.",
+            "No Product_ID for locale en_GB",
+        ),
+        404: error("No MasterSKU with this id.", "MasterSKU not found"),
+        502: error("DataforSEO could not be reached or rejected the request.", "DataforSEO error: 502"),
+    }),
+)
 async def create_dseo_product_info_task(
-    masterSKUid: str = Query(..., description="MasterSKU ObjectId"),
-    locale: str = Query("en_GB", description="Locale code — Product_ID must already exist for this locale"),
+    masterSKUid: str = Query(..., description="**Mandatory.** The MasterSKU to enrich.", examples=["681aa2f1c4b21d0f8c9e0044"]),
+    locale: str = Query(
+        "en_GB",
+        description="Locale to enrich. A `Product_ID` must already be stored for it, otherwise `400`.",
+        examples=["en_GB"],
+    ),
 ):
     """
-    Submit a DataforSEO merchant/google/product_info task for the given MasterSKU.
-    The Product_ID stored in Locale_Specific_Data (from the shopping task) is used.
-    Results are delivered via the shared /dseo/webhook endpoint.
+    Start a detailed Google product lookup for a MasterSKU — specifications, images and seller
+    detail beyond the headline price.
+
+    **Requires `POST /dseo/shopping` to have run first** for this locale: the Google
+    `Product_ID` it stored is what this task looks up. Without one the request is rejected with
+    `400`. You rarely need to call this by hand — the webhook chains it automatically when a
+    shopping task returns a `Product_ID`.
+
+    **This is asynchronous.** A `200` means DataforSEO accepted the task; results arrive later at
+    `POST /dseo/webhook`. The response body is DataforSEO's own JSON, forwarded unchanged.
     """
     try:
         result = await submit_dseo_product_info_task(masterSKUid, locale)

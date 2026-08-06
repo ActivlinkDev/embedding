@@ -185,43 +185,43 @@ class CreateClientRequest(BaseModel):
 class CreateClientResponse(BaseModel):
     """The created credential. The secret appears here and nowhere else, ever."""
 
-    client_id: str = Field(..., examples=["AO-manufacturer"])
+    client_id: str = Field(..., description="The identifier the caller authenticates with.", examples=["AO-manufacturer"])
     client_secret: str = Field(
         ...,
         description="Shown once — only its hash is stored. Save it now.",
         examples=["generated-secret-shown-once-save-it-now"],
     )
-    scopes: List[str] = Field(..., examples=[["sku:read", "device:write"]])
-    client_key: Optional[str] = Field(None, examples=["acme_uk_live"])
+    scopes: List[str] = Field(..., description="Scopes granted, as requested.", examples=[["sku:read", "device:write"]])
+    client_key: Optional[str] = Field(None, description="The tenant this credential is pinned to, or `null`.", examples=["acme_uk_live"])
 
 
 class ServiceClientSummary(BaseModel):
     """A stored credential, without its secret."""
 
-    client_id: str = Field(..., examples=["AO-manufacturer"])
-    scopes: List[str] = Field([], examples=[["sku:read", "device:write"]])
-    client_key: Optional[str] = Field(None, examples=["acme_uk_live"])
+    client_id: str = Field(..., description="The credential's identifier.", examples=["AO-manufacturer"])
+    scopes: List[str] = Field([], description="Scopes this credential holds.", examples=[["sku:read", "device:write"]])
+    client_key: Optional[str] = Field(None, description="The tenant it is pinned to, or `null` for unpinned.", examples=["acme_uk_live"])
     active: bool = Field(
         True,
         description="`false` means `POST /auth/token` refuses this credential.",
         examples=[True],
     )
-    created_at: Optional[datetime.datetime] = Field(None, examples=["2026-01-14T09:32:11Z"])
+    created_at: Optional[datetime.datetime] = Field(None, description="When the credential was created.", examples=["2026-01-14T09:32:11Z"])
     created_by: Optional[str] = Field(
         None,
         description="`client_id` of the admin caller that created this credential.",
         examples=["frontend-admin"],
     )
-    rotated_at: Optional[datetime.datetime] = Field(None, examples=["2026-05-02T11:04:56Z"])
-    rotated_by: Optional[str] = Field(None, examples=["frontend-admin"])
+    rotated_at: Optional[datetime.datetime] = Field(None, description="When the secret was last rotated. `null` if never.", examples=["2026-05-02T11:04:56Z"])
+    rotated_by: Optional[str] = Field(None, description="`client_id` of the admin caller that rotated it.", examples=["frontend-admin"])
 
 
 class ListClientsResponse(BaseModel):
-    clients: List[ServiceClientSummary]
+    clients: List[ServiceClientSummary] = Field(..., description="Every stored credential, revoked ones included.")
 
 
 class RotateSecretResponse(BaseModel):
-    client_id: str = Field(..., examples=["AO-manufacturer"])
+    client_id: str = Field(..., description="The credential whose secret was replaced.", examples=["AO-manufacturer"])
     client_secret: str = Field(
         ...,
         description="Shown once — only its hash is stored. Save it now.",

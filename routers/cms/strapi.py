@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Query, HTTPException, Request, Depends
 import os
 import httpx
+from utils.api_docs import error
 from utils.dependencies import verify_token
 
 router = APIRouter(tags=["CMS"])
@@ -14,23 +15,73 @@ if not STRAPI_BASE:
 STRAPI_BEARER_TOKEN = os.getenv("STRAPI_BEARER_TOKEN")
 
 
-@router.get("/cms/strapi")
+@router.get(
+    "/cms/strapi",
+    summary="Read any CMS collection through a controlled proxy",
+    response_description="Strapi's response for the requested route.",
+    responses={
+        200: {
+            "description": (
+                "Strapi's response, forwarded unchanged. The shape is defined by the CMS "
+                "content type, not by this API."
+            ),
+            "content": {"application/json": {}},
+        },
+        400: error(
+            "`route` is not a relative Strapi path — absolute URLs and `..` segments are refused.",
+            "Invalid Strapi route",
+        ),
+        500: error("`STRAPI_BASE_URL` is not configured on this deployment.", "STRAPI_BASE_URL not configured"),
+    },
+)
 async def proxy_strapi(
-    route: str = Query(...),
-    locale: str | None = Query(None),
-    filter_field: str | None = Query(None, description="Optional collection field to filter on (Strapi field name)"),
-    filter_value: list[str] | str | None = Query(None, description="Value(s) to match for filter_field. Provide multiple values to use $in operator."),
+    route: str = Query(
+        ...,
+        description=(
+            "**Mandatory.** Relative Strapi API path, e.g. `pages/home`. A leading slash is "
+            "optional. Absolute URLs and `..` segments are rejected with `400`."
+        ),
+        examples=["pages/home"],
+    ),
+    locale: str | None = Query(
+        None,
+        description="Locale passed straight to Strapi — use the **CMS spelling** (`en-GB`), not the API's `en_GB`.",
+        examples=["en-GB"],
+    ),
+    filter_field: str | None = Query(
+        None,
+        description="Strapi field name to filter on. Has no effect without `filter_value`.",
+        examples=["slug"],
+    ),
+    filter_value: list[str] | str | None = Query(
+        None,
+        description=(
+            "Value to match. Repeat the parameter to match any of several values (`$in`); a "
+            "single value uses `$eq`."
+        ),
+        examples=[["home"]],
+    ),
     request: Request = None,
     _: None = Depends(verify_token),
 ):
-    """Proxy a GET request to Strapi.
+    """
+    Read any CMS collection through a controlled server-side proxy, for content that has no
+    dedicated endpoint.
 
-    Query parameters:
-      - route: path appended to the Strapi base URL (no leading slash required)
-      - locale: optional locale passed as query param to Strapi
+    `route` is mandatory and is appended to the configured Strapi base URL — so
+    `?route=pages/home&locale=en-GB` fetches `{STRAPI_BASE}/pages/home?locale=en-GB`. Only
+    relative paths are accepted: absolute URLs and `..` segments are rejected with `400`, so the
+    proxy cannot be pointed at another host.
 
-    Example: /cms/strapi?route=pages/home&locale=en
-    Will request: {STRAPI_BASE}/pages/home?locale=en
+    **`locale` is passed through verbatim**, so use the CMS spelling (`en-GB`), unlike the other
+    CMS endpoints which take `en_GB` and translate for you.
+
+    Relations are always fully populated (`populate=*`). Filtering is optional: `filter_field`
+    with one `filter_value` becomes an equality match, and repeating `filter_value` becomes an
+    `$in` match.
+
+    The CMS token is applied server-side, so the browser never sees it. The response is
+    **Strapi's JSON, forwarded unchanged**.
     """
     if not STRAPI_BASE:
         raise HTTPException(status_code=500, detail="STRAPI_BASE_URL not configured")

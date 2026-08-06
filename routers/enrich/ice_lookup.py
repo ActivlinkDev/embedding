@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Query, Depends
 import requests
 import os
 from dotenv import load_dotenv
+from utils.api_docs import error
 from utils.dependencies import verify_token
 
 load_dotenv()
@@ -14,13 +15,41 @@ router = APIRouter(
 ICECAT_USERNAME = os.getenv("ICECAT_USER", "")
 BASE_URL = "https://live.icecat.biz/api/"
 
-@router.get("/lookup", dependencies=[Depends(verify_token)])
+@router.get(
+    "/lookup",
+    dependencies=[Depends(verify_token)],
+    summary="Look up a product sheet in Icecat",
+    response_description="Icecat's product sheet, passed through unchanged.",
+    responses={
+        200: {
+            "description": (
+                "Icecat returned a product. The body is **Icecat's own JSON**, forwarded "
+                "verbatim — its shape is defined by Icecat, not by this API."
+            ),
+            "content": {"application/json": {}},
+        },
+        400: error("Neither a `gtin` nor a `brand`+`productcode` pair was supplied.", "You must provide a GTIN or both brand and productcode"),
+        404: error("Icecat has no product for any of the criteria tried.", "Product not found in ICECAT using provided criteria"),
+    },
+)
 def lookup_icecat(
-    lang: str = Query("en", description="2-letter language code (e.g. en, fr, es)"),
-    gtin: str = Query(None, description="GTIN for ICE lookup"),
-    brand: str = Query(None, description="Brand name (used if GTIN fails)"),
-    productcode: str = Query(None, description="Product code (used if GTIN fails)")
+    lang: str = Query("en", description="Two-letter language code for the returned product sheet.", examples=["en"]),
+    gtin: str = Query(None, description="Barcode / GTIN. Tried first; the most reliable identifier.", examples=["5011773057240"]),
+    brand: str = Query(None, description="Brand name. Used only with `productcode`, and only if the GTIN lookup fails.", examples=["Bosch"]),
+    productcode: str = Query(None, description="Manufacturer product code. Used only with `brand`.", examples=["SMS6ZCI00G"]),
 ):
+    """
+    Fetch a product sheet from Icecat — titles, images, specifications and documents used to
+    enrich the SKU catalogue.
+
+    **Supply either a `gtin` or both `brand` and `productcode`**; sending neither is rejected
+    with `400`. When both are supplied the GTIN is tried first and the brand pair is the
+    fallback, so passing both maximises the chance of a hit.
+
+    The response is **Icecat's JSON, unmodified** — this endpoint is a pass-through, so treat the
+    body as Icecat's contract rather than this API's. Nothing is stored; use
+    `POST /sku/create_master_sku` to persist enrichment.
+    """
     if not gtin and not (brand and productcode):
         raise HTTPException(
             status_code=400,
