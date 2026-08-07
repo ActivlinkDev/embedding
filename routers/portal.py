@@ -388,9 +388,13 @@ def list_portal_users(
     """
     List every portal user belonging to one client, sorted by username.
 
-    `clientId` is mandatory and acts as the tenant boundary — there is no way to list users
-    across clients. Password hashes are never included. A client with no users, or an id that
-    does not exist, both return `{"users": []}`.
+    `clientId` is mandatory and selects which client's users are returned — one call cannot span
+    clients. It is **not** an authorization check: the API does not verify that the caller is
+    entitled to that client, so any valid token can list any client's users by supplying their
+    `clientId`. Access to this endpoint is the control, not the parameter.
+
+    Password hashes are never included. A client with no users, or an id that does not exist,
+    both return `{"users": []}`.
     """
     users_col, _ = _get_collections()
     docs = users_col.find(
@@ -427,7 +431,11 @@ def delete_portal_user(
     username: str,
     clientId: str = Query(
         ...,
-        description="**Mandatory.** The client the user must belong to. Guards against cross-client deletes.",
+        description=(
+            "**Mandatory.** The user must belong to this client, so a username alone will not "
+            "match. Note this is **not** checked against the caller's own tenant — see the "
+            "endpoint description."
+        ),
         examples=["ACME-UK"],
     ),
     _: None = Depends(verify_token),
@@ -436,8 +444,14 @@ def delete_portal_user(
     Delete a portal user.
 
     Both the path parameter `username` and the query parameter `clientId` are mandatory, and the
-    delete only matches when **both** agree: a user belonging to another client cannot be deleted
-    by guessing their username, and that case is reported as `404` rather than `403`.
+    delete only matches when **both** agree, so a username alone is not enough to remove someone.
+    A username that exists under a different client returns `404`.
+
+    **This is not a tenant authorization boundary.** The API does not check that the caller is
+    entitled to the `clientId` it was given: `verify_token` scopes fields spelled `clientkey`,
+    and this is a `Client_ID`. Any caller holding a valid token can therefore delete a portal
+    user of any client whose `clientId` and username they know. Treat access to this endpoint,
+    not the `clientId` parameter, as the control.
 
     The operation is idempotent in effect — deleting an already-deleted user returns `404`.
     """

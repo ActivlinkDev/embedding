@@ -123,7 +123,11 @@ def _unique_hex_key(used_in_batch: set, max_attempts: int = 20) -> str:
             "this client.",
             "custom_sku not found for this client",
         ),
-        409: error("A hex key collided at the database level. Nothing was written — retry.", "Duplicate hex key; please retry."),
+        409: error(
+            "A hex key collided at the database level. Codes generated before the collision "
+            "may already be stored — see the description.",
+            "Duplicate hex key; please retry.",
+        ),
         503: error("A unique hex key could not be found after 20 attempts. Retry.", "Unable to generate unique hex key; try again."),
     }),
 )
@@ -143,9 +147,14 @@ def generate_qr_collection(
     Between 1 and 500 codes per call. Bind the batch to a product with `custom_sku` — it must
     belong to this client — or leave it out for generic codes that resolve at scan time.
 
-    **The batch is all-or-nothing**: a key collision aborts the whole insert with `409` and
-    writes nothing, so retry rather than assume partial success. `batch_id` groups the codes for
-    later filtering via `GET /qr-collection`.
+    **A `409` can leave part of the batch behind.** Keys are checked for uniqueness before the
+    insert, but if a concurrent request claims one in between, the insert stops at the collision
+    — and the codes written *before* it stay in the collection. They are valid, scannable codes
+    that no caller was told about, filed under a `batch_id` never returned. Retrying mints a
+    fresh batch rather than completing the old one, so after a `409` list the batch with
+    `GET /qr-collection?batch_id=…` if you need to find or clean up the orphans.
+
+    `batch_id` groups the codes for later filtering via `GET /qr-collection`.
 
     For a single code carrying a specific device's identifiers, use `POST /qr/device-generate`.
     """
@@ -193,7 +202,8 @@ def generate_qr_collection(
         qr_codes.append({"hex_key": hex_key, "scan_url": scan_url, "qr_image_b64": qr_image})
 
     try:
-        # Fix 2: ordered=True so any rare DB-level collision stops cleanly (no partial writes)
+        # ordered=True stops at the first DB-level key collision, but does NOT roll back the
+        # documents already inserted before it — a 409 here can leave a partial batch stored.
         qr_collection.insert_many(docs, ordered=True)
     except DuplicateKeyError:
         raise HTTPException(status_code=409, detail="Duplicate hex key; please retry.")

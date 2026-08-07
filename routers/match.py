@@ -4,7 +4,7 @@ from typing import Optional
 import os
 from pymongo import MongoClient
 
-from utils.api_docs import json_response, secured
+from utils.api_docs import error, json_response, secured
 from utils.common import embed_query, cosine_similarity
 from utils.dependencies import verify_token
 
@@ -102,6 +102,7 @@ def _get_mongo_client():
             "A match, or an empty result. Both are `200` — check `category` and `similarity`.",
             {"category": "Dishwasher", "similarity": 0.8734, "locale_title": "Dishwasher"},
         ),
+        500: error("The embedding request to OpenAI failed or timed out.", "OpenAI API error"),
     }),
 )
 def match_category(
@@ -114,10 +115,13 @@ def match_category(
     The text is embedded with OpenAI, then compared against the category embeddings held in the
     `Category` collection via Atlas `$vectorSearch`. Only the single best candidate is returned.
 
-    **No-match is not an error.** If the search backend is unavailable, returns nothing, or the
-    request fails for any reason, the response is still `200` with
-    `{"category": "", "similarity": 0.0}`. Always check `category` before using the result —
-    and treat `similarity` as advisory, since no minimum threshold is enforced here.
+    **No-match is not an error.** If the search backend is unavailable, times out, or returns
+    nothing, the response is still `200` with `{"category": "", "similarity": 0.0}`. Always check
+    `category` before using the result — and treat `similarity` as advisory, since no minimum
+    threshold is enforced here.
+
+    That fallback covers the **search** stage only. Embedding happens first and is not guarded:
+    if the OpenAI request fails or times out, the call returns `500` rather than an empty match.
 
     `query` is mandatory. `locale` only affects `locale_title`, never the match itself.
     """
