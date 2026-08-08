@@ -84,13 +84,13 @@ def master_locale_price(master_sku_id, locale: str):
 
 
 def propagate_master_price(master_sku_id, locale: str, price, currency=None,
-                           client_id: Optional[str] = None):
+                           client_id: Optional[str] = None, custom_sku_id=None):
     """Copy a newly-resolved master price onto CustomSKUs still missing an MSRP.
 
     Only blank MSRPs are filled — a price the client supplied at creation time is
-    never overwritten. ``client_id`` narrows the update to a single client; the
-    enrichment path leaves it unset because the master price applies to every
-    client carrying that MasterSKU.
+    never overwritten. ``client_id`` narrows the update to a single client and
+    ``custom_sku_id`` to a single CustomSKU; the enrichment path leaves both
+    unset, because a master price applies to every SKU carrying that MasterSKU.
 
     Returns a list of ``(client_key, custom_sku_id, locale)`` tuples for the SKUs
     that were changed so the caller can re-warm their widget quote cache. Never
@@ -115,6 +115,12 @@ def propagate_master_price(master_sku_id, locale: str, price, currency=None,
         }
         if client_id:
             query["Client"] = client_id
+        if custom_sku_id is not None:
+            try:
+                query["_id"] = ObjectId(custom_sku_id)
+            except Exception:
+                logger.warning("[MSRP-BACKFILL] invalid custom_sku_id %r", custom_sku_id)
+                return updated
         candidates = customsku_collection.find(query)
 
         for doc in candidates:

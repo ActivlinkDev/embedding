@@ -148,22 +148,38 @@ def _process_task(task: dict) -> dict:
         f"title={item.get('title')!r} price={item.get('price')} {item.get('currency')}",
         file=sys.stderr,
     )
-
-    # CustomSKUs created before this price landed were persisted with a blank
-    # MSRP, which also left their widget quote cache cold. Fill them in and hand
-    # the affected SKUs back so the caller can re-warm the cache off-request.
-    warm_targets = propagate_master_price(
-        master_sku_id, locale, item.get("price"), item.get("currency")
-    )
-
     return {
         "status": "ok",
         "master_sku_id": master_sku_id,
         "locale": locale,
         "title": item.get("title"),
         "product_id": item.get("product_id"),
-        "warm_targets": warm_targets,
+        "price": item.get("price"),
+        "currency": item.get("currency"),
     }
+
+
+def _backfill_msrp_and_warm(master_sku_id, locale, price, currency):
+    """Fill blank CustomSKU MSRPs from a freshly-enriched master price, then
+    re-warm the widget quote cache for each SKU that changed.
+
+    Scheduled as a background task rather than run inline: it scans and updates
+    an unbounded number of CustomSKUs and then runs the full assignment + rating
+    path per SKU. All of that is blocking, and the postback handler is an
+    ``async def`` sharing a single Uvicorn worker's event loop with every other
+    request. As a sync function, Starlette runs this in a threadpool.
+
+    Never raises — both halves swallow their own errors.
+    """
+    targets = propagate_master_price(master_sku_id, locale, price, currency)
+    if not targets:
+        return
+    # Imported lazily so a failure in the pricing import chain can't stop this
+    # router from loading.
+    from routers.widget_quote import warm_widget_cache
+
+    for client_key, custom_sku_id, warm_locale in targets:
+        warm_widget_cache(client_key, custom_sku_id, warm_locale)
 
 
 def _process_product_info_task(task: dict) -> dict:
@@ -320,20 +336,19 @@ async def dseo_webhook(request: Request, background_tasks: BackgroundTasks):
             processing_results.append({"status": "error", "detail": str(e)})
             continue
 
-        # Re-warm the widget quote cache for any CustomSKU whose MSRP we just
-        # backfilled. Deferred to a background task: warming runs the full
-        # assignment + rating path, which is far too slow to hold the postback
-        # response open for. Imported lazily so a failure in the pricing import
-        # chain can't stop this router from loading.
-        warm_targets = outcome.pop("warm_targets", None) or []
-        if warm_targets:
-            from routers.widget_quote import warm_widget_cache
-
-            for client_key, custom_sku_id, warm_locale in warm_targets:
-                background_tasks.add_task(warm_widget_cache, client_key, custom_sku_id, warm_locale)
-            outcome["msrp_backfilled"] = len(warm_targets)
-
         processing_results.append(outcome)
+
+        # CustomSKUs created before this price landed were persisted with a
+        # blank MSRP, which also left their widget quote cache cold. Backfill
+        # and re-warm them off-request — see _backfill_msrp_and_warm.
+        if fn != "product_info" and outcome.get("status") == "ok":
+            background_tasks.add_task(
+                _backfill_msrp_and_warm,
+                outcome["master_sku_id"],
+                outcome["locale"],
+                outcome.get("price"),
+                outcome.get("currency"),
+            )
 
         # After a successful shopping task, auto-submit product_info if Product_ID was found
         if fn != "product_info" and outcome.get("status") == "ok" and outcome.get("product_id"):

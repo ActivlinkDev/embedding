@@ -88,7 +88,13 @@ def backfill_msrp(
             unpriced.append({"masterSkuId": master_sku_id, "locale": locale})
             continue
         warm_targets.extend(
-            propagate_master_price(master_sku_id, locale, price, currency, client_id=client_id)
+            propagate_master_price(
+                master_sku_id, locale, price, currency,
+                client_id=client_id,
+                # Sibling SKUs can share this master and locale; when the caller
+                # named one CustomSKU, repair only that one.
+                custom_sku_id=query.get("_id"),
+            )
         )
 
     if warm_targets:
