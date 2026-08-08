@@ -105,6 +105,7 @@ ROUTERS = {
     "dseo_shopping": "routers.enrich.dseo_shopping",
     "dseo_product_info": "routers.enrich.dseo_product_info",
     "dseo_webhook": "routers.enrich.dseo_webhook",
+    "eprel_scrape": "routers.eprel_scrape",
 
     # registration / assignment
     "embedded_register_device": "routers.embedded_register_device",

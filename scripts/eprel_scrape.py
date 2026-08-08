@@ -3,7 +3,10 @@
 
 Queries the public API behind https://eprel.ec.europa.eu across all (or selected)
 product groups, filtered by supplier/trademark name, and writes the results to
-JSON (one file per product group) plus an optional flattened CSV.
+JSON (one file per product group) plus an optional flattened CSV and/or MongoDB.
+
+Core EPREL/Mongo logic lives in utils/eprel.py, shared with the
+/eprel/scrape API endpoint (routers/eprel_scrape.py).
 
 Usage:
     python scripts/eprel_scrape.py "Samsung"
@@ -17,12 +20,6 @@ MongoDB:
     Activlink db), keyed on eprelRegistrationNumber, so re-running a scrape
     updates existing documents instead of duplicating them. Connection comes
     from the MONGO_URI env var (a .env file is honoured), db from MONGO_DB.
-
-Notes:
-    - The API sits behind a WAF that rejects requests without a browser-like
-      User-Agent AND a Referer on eprel.ec.europa.eu, hence the headers below.
-    - The supplierOrTrademark filter matches both the registering organisation
-      and the trademark, case-insensitively.
 """
 
 import argparse
@@ -33,71 +30,15 @@ import sys
 import time
 from pathlib import Path
 
-import requests
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from utils import eprel  # noqa: E402
 
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
-
-BASE_URL = "https://eprel.ec.europa.eu/api"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Referer": "https://eprel.ec.europa.eu/screen/home",
-}
-PAGE_LIMIT = 100
-MAX_RETRIES = 4
-
-
-def _get(session: requests.Session, url: str, params: dict | None = None) -> dict | list:
-    delay = 2
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = session.get(url, params=params, timeout=60)
-            if resp.status_code == 200:
-                return resp.json()
-            if resp.status_code in (429, 500, 502, 503, 504):
-                raise requests.RequestException(f"HTTP {resp.status_code}")
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            if attempt == MAX_RETRIES:
-                raise
-            print(f"    retry {attempt}/{MAX_RETRIES - 1} after error: {exc}", file=sys.stderr)
-            time.sleep(delay)
-            delay *= 2
-    raise RuntimeError("unreachable")
-
-
-def get_product_groups(session: requests.Session) -> list[dict]:
-    return _get(session, f"{BASE_URL}/product-groups")
-
-
-def scrape_group(session: requests.Session, url_code: str, manufacturer: str, delay: float) -> list[dict]:
-    """Page through one product group and return every matching model."""
-    hits: list[dict] = []
-    page = 1
-    while True:
-        data = _get(
-            session,
-            f"{BASE_URL}/products/{url_code}",
-            params={
-                "_page": page,
-                "_limit": PAGE_LIMIT,
-                "supplierOrTrademark": manufacturer,
-            },
-        )
-        batch = data.get("hits", [])
-        hits.extend(batch)
-        total = data.get("size", 0)
-        if not batch or len(hits) >= total:
-            return hits
-        page += 1
-        time.sleep(delay)
 
 
 def flatten_for_csv(product: dict, group: str) -> dict:
@@ -121,37 +62,13 @@ def get_mongo_collection(collection_name: str):
     mongo_uri = os.getenv("MONGO_URI")
     if not mongo_uri:
         sys.exit("MONGO_URI is not set (add it to your environment or .env file)")
-    from pymongo import ASCENDING, MongoClient
+    from pymongo import MongoClient
 
     client = MongoClient(mongo_uri)
     db = client[os.getenv("MONGO_DB", "Activlink")]
     coll = db[collection_name]
-    coll.create_index([("eprelRegistrationNumber", ASCENDING)], unique=True)
-    coll.create_index([("supplierOrTrademark", ASCENDING), ("productGroup", ASCENDING)])
+    eprel.ensure_indexes(coll)
     return coll
-
-
-def store_in_mongo(coll, products: list[dict], group: str, manufacturer: str) -> tuple[int, int]:
-    """Upsert products keyed on eprelRegistrationNumber. Returns (upserted, modified)."""
-    from pymongo import ReplaceOne
-
-    ops = []
-    scraped_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    for product in products:
-        ern = product.get("eprelRegistrationNumber")
-        if ern is None:
-            continue
-        doc = {
-            **product,
-            "productGroup": group,
-            "manufacturerQuery": manufacturer,
-            "scrapedAt": scraped_at,
-        }
-        ops.append(ReplaceOne({"eprelRegistrationNumber": ern}, doc, upsert=True))
-    if not ops:
-        return 0, 0
-    result = coll.bulk_write(ops, ordered=False)
-    return result.upserted_count, result.modified_count
 
 
 def main() -> None:
@@ -172,10 +89,9 @@ def main() -> None:
 
     mongo_coll = get_mongo_collection(args.collection) if args.mongo else None
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    session = eprel.make_session()
 
-    all_groups = get_product_groups(session)
+    all_groups = eprel.get_product_groups(session)
     known = {g["url_code"]: g for g in all_groups}
     if args.groups:
         wanted = [g.strip() for g in args.groups.split(",") if g.strip()]
@@ -198,7 +114,7 @@ def main() -> None:
     for group in groups:
         code = group["url_code"]
         print(f"Scraping {group['name']} ({code}) ...")
-        products = scrape_group(session, code, args.manufacturer, args.delay)
+        products = eprel.scrape_group(session, code, args.manufacturer, args.delay)
         summary[code] = len(products)
         print(f"    {len(products)} models")
         if products:
@@ -207,7 +123,7 @@ def main() -> None:
                     json.dump(products, fh, ensure_ascii=False, indent=2)
                 csv_rows.extend(flatten_for_csv(p, code) for p in products)
             if mongo_coll is not None:
-                upserted, modified = store_in_mongo(mongo_coll, products, code, args.manufacturer)
+                upserted, modified = eprel.store_in_mongo(mongo_coll, products, code, args.manufacturer)
                 mongo_upserted += upserted
                 mongo_modified += modified
                 print(f"    mongo: {upserted} new, {modified} updated")
