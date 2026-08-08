@@ -514,6 +514,10 @@ def warm_widget_cache(client_key: str, custom_sku_id: str, locale: str, price: O
             lsd = _lsd_for_locale(sku, locale) if sku else {}
             price = float(lsd.get("MSRP") or 0)
         if not price:
+            # No MSRP yet — typically a SKU created before its MasterSKU price
+            # landed. propagate_master_price re-warms it once enrichment fills
+            # the price in; log so a cold cache is traceable to the cause.
+            print(f"[WIDGET-CACHE] skipped {custom_sku_id} / {locale}: no MSRP")
             return
         payload = WidgetPriceRequest(
             clientKey=client_key, customSkuId=custom_sku_id, price=price, locale=locale
@@ -531,5 +535,11 @@ def warm_widget_cache(client_key: str, custom_sku_id: str, locale: str, price: O
                 assignment_request.gtee, bracket, currency, grouped,
             )
             print(f"[WIDGET-CACHE] warmed {custom_sku_id} / {locale}")
+        else:
+            print(
+                f"[WIDGET-CACHE] no options for {custom_sku_id} / {locale} "
+                f"(category={assignment_request.category!r} price={assignment_request.price} "
+                f"gtee={assignment_request.gtee} currency={assignment_request.currency})"
+            )
     except Exception as e:
         print(f"[WIDGET-CACHE] warm failed for {custom_sku_id}/{locale}: {e}")

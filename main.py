@@ -113,6 +113,7 @@ ROUTERS = {
     "create_custom_sku": "routers.sku.create_custom_sku",
     "update_custom_sku": "routers.sku.update_custom_sku",
     "get_custom_sku": "routers.sku.get_custom_sku",
+    "backfill_msrp": "routers.sku.backfill_msrp",
     "delete_custom_sku": "routers.sku.delete_custom_sku",
     "lookup_master_sku": "routers.sku.lookup_master_sku",
     "lookup_master_sku_all": "routers.sku.lookup_master_sku_all",
