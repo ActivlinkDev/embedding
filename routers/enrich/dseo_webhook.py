@@ -5,11 +5,13 @@ import sys
 import traceback
 import logging
 from datetime import datetime, timezone
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 from pymongo import MongoClient
 from bson import ObjectId
 from dotenv import load_dotenv
+
+from routers.sku.propagate_master_price import propagate_master_price
 
 load_dotenv()
 
@@ -152,7 +154,32 @@ def _process_task(task: dict) -> dict:
         "locale": locale,
         "title": item.get("title"),
         "product_id": item.get("product_id"),
+        "price": item.get("price"),
+        "currency": item.get("currency"),
     }
+
+
+def _backfill_msrp_and_warm(master_sku_id, locale, price, currency):
+    """Fill blank CustomSKU MSRPs from a freshly-enriched master price, then
+    re-warm the widget quote cache for each SKU that changed.
+
+    Scheduled as a background task rather than run inline: it scans and updates
+    an unbounded number of CustomSKUs and then runs the full assignment + rating
+    path per SKU. All of that is blocking, and the postback handler is an
+    ``async def`` sharing a single Uvicorn worker's event loop with every other
+    request. As a sync function, Starlette runs this in a threadpool.
+
+    Never raises — both halves swallow their own errors.
+    """
+    targets = propagate_master_price(master_sku_id, locale, price, currency)
+    if not targets:
+        return
+    # Imported lazily so a failure in the pricing import chain can't stop this
+    # router from loading.
+    from routers.widget_quote import warm_widget_cache
+
+    for client_key, custom_sku_id, warm_locale in targets:
+        warm_widget_cache(client_key, custom_sku_id, warm_locale)
 
 
 def _process_product_info_task(task: dict) -> dict:
@@ -271,7 +298,7 @@ def _slim_payload(body: dict) -> dict:
 
 
 @router.post("/webhook")
-async def dseo_webhook(request: Request):
+async def dseo_webhook(request: Request, background_tasks: BackgroundTasks):
     """
     Receives DataforSEO postback callbacks for merchant/google/products and
     merchant/google/product_info tasks. Handles gzip-compressed bodies, stores
@@ -304,11 +331,24 @@ async def dseo_webhook(request: Request):
         handler = _process_product_info_task if fn == "product_info" else _process_task
         try:
             outcome = handler(task)
-            processing_results.append(outcome)
         except Exception as e:
             print(f"[DSEO Webhook] Error processing task (function={fn!r}): {e}", file=sys.stderr)
             processing_results.append({"status": "error", "detail": str(e)})
             continue
+
+        processing_results.append(outcome)
+
+        # CustomSKUs created before this price landed were persisted with a
+        # blank MSRP, which also left their widget quote cache cold. Backfill
+        # and re-warm them off-request — see _backfill_msrp_and_warm.
+        if fn != "product_info" and outcome.get("status") == "ok":
+            background_tasks.add_task(
+                _backfill_msrp_and_warm,
+                outcome["master_sku_id"],
+                outcome["locale"],
+                outcome.get("price"),
+                outcome.get("currency"),
+            )
 
         # After a successful shopping task, auto-submit product_info if Product_ID was found
         if fn != "product_info" and outcome.get("status") == "ok" and outcome.get("product_id"):
@@ -328,4 +368,8 @@ async def dseo_webhook(request: Request):
                 file=sys.stderr,
             )
 
-    return JSONResponse(content={"status": "ok", "processed": processing_results}, status_code=200)
+    return JSONResponse(
+        content={"status": "ok", "processed": processing_results},
+        status_code=200,
+        background=background_tasks,
+    )
