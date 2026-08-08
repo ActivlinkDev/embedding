@@ -51,8 +51,29 @@ async def add_security_headers(request: Request, call_next):
 
 
 # -------- Health check --------
-@app.get("/healthz")
+@app.get(
+    "/healthz",
+    tags=["Operations"],
+    summary="Liveness check",
+    response_description="A fixed OK payload.",
+    responses={
+        200: {
+            "description": "The application process is running and serving requests.",
+            "content": {"application/json": {"example": {"status": "ok"}}},
+        }
+    },
+)
 async def healthz():
+    """
+    Confirm the application is up.
+
+    Takes no parameters and needs no authentication — it is the target for platform health
+    checks and uptime monitors.
+
+    **Liveness only.** The response is a constant: it does not check MongoDB, Stripe, OpenAI or
+    any other dependency, so a `200` here means the process is serving requests, not that every
+    downstream service is healthy.
+    """
     return {"status": "ok"}
 
 def _include_router(module_path: str, attr: str = "router") -> None:

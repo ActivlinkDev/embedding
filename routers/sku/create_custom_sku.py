@@ -1,7 +1,7 @@
 # create_custom_sku.py
 
 from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime, timezone
 import os
@@ -11,6 +11,7 @@ from pymongo import MongoClient
 from bson import ObjectId
 from dotenv import load_dotenv
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from .create_master_sku import create_master_sku, MasterSKURequest, _run_dseo_task
 
@@ -169,29 +170,73 @@ customsku_collection = db["CustomSKU"]
 mastersku_collection = db["MasterSKU"]
 
 class CustomLink(BaseModel):
-    Type: str
-    URL: str
+    """An extra link shown alongside the product. Both fields are mandatory."""
+
+    Type: str = Field(..., description="**Mandatory.** What the link is, e.g. `manual`, `spec_sheet`.", examples=["manual"])
+    URL: str = Field(..., description="**Mandatory.** The link target.", examples=["https://example.com/manuals/sms6zci00g.pdf"])
 
 class LocaleDetails(BaseModel):
-    Title: Optional[str] = ""
-    Price: Optional[float] = 0
-    GTL: Optional[int] = 0
-    GTP: Optional[int] = 0
-    Promo_Code: Optional[str] = ""
-    Custom_Links: Optional[List[CustomLink]] = None
+    """Client overrides for one locale. Every field is optional — anything left blank or `0`
+    falls back to the MasterSKU's value for that locale."""
+
+    Title: Optional[str] = Field("", description="Display title. Falls back to the MasterSKU title.", examples=["Bosch Series 6 Dishwasher"])
+    Price: Optional[float] = Field(0, description="The client's selling price (MSRP). Falls back to the MasterSKU price.", examples=[449.99])
+    GTL: Optional[int] = Field(0, description="Guarantee, labour, in months.", examples=[12])
+    GTP: Optional[int] = Field(0, description="Guarantee, parts, in months.", examples=[24])
+    Promo_Code: Optional[str] = Field("", description="Promotion applied for this locale.", examples=["SUMMER25"])
+    Custom_Links: Optional[List[CustomLink]] = Field(None, description="Extra product links to surface with this SKU.")
 
 class CustomSKURequest(BaseModel):
-    ClientKey: str
-    Locale: str
-    SKU: str
-    Source: str
-    GTIN: Optional[str] = ""
-    Make: Optional[str] = ""
-    Model: Optional[str] = ""
-    Category: Optional[str] = ""
-    Locale_Details: Optional[LocaleDetails] = None
-    Global_Promotion: Optional[str] = None
-    add_pricing: Optional[bool] = True
+    """A client catalogue entry to create, or a locale to add to an existing one.
+
+    Mandatory: `ClientKey`, `Locale`, `SKU`, `Source`, **plus** either `GTIN` or both `Make` and
+    `Model` — without one of those the MasterSKU cannot be matched and nothing is created.
+    """
+
+    ClientKey: str = Field(..., description="**Mandatory.** Tenant key the SKU belongs to.", examples=["acme_uk_live"])
+    Locale: str = Field(
+        ...,
+        description="**Mandatory.** Locale being added. Must exist in `Locale_Params`, otherwise `404`.",
+        examples=["en_GB"],
+    )
+    SKU: str = Field(..., description="**Mandatory.** The client's own SKU code.", examples=["BOSCH-DW-4421"])
+    Source: str = Field(..., description="**Mandatory.** Channel this SKU is sold through, e.g. `web`.", examples=["web"])
+    GTIN: Optional[str] = Field(
+        "",
+        description="**Mandatory unless `Make` and `Model` are both given.** Barcode used to find or create the MasterSKU.",
+        examples=["5011773057240"],
+    )
+    Make: Optional[str] = Field("", description="Manufacturer. Required with `Model` when no `GTIN` is supplied.", examples=["Bosch"])
+    Model: Optional[str] = Field("", description="Model designation. Required with `Make` when no `GTIN` is supplied.", examples=["SMS6ZCI00G"])
+    Category: Optional[str] = Field("", description="Category override. Falls back to the MasterSKU's category.", examples=["Dishwasher"])
+    Locale_Details: Optional[LocaleDetails] = Field(None, description="Per-locale overrides. Omit to inherit everything from the MasterSKU.")
+    Global_Promotion: Optional[str] = Field(None, description="Promotion applied across every locale of this SKU.", examples=["LAUNCH10"])
+    add_pricing: Optional[bool] = Field(True, description="Whether cover pricing should be attached to this SKU.", examples=[True])
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "ClientKey": "acme_uk_live",
+                "Locale": "en_GB",
+                "SKU": "BOSCH-DW-4421",
+                "Source": "web",
+                "GTIN": "5011773057240",
+                "Make": "Bosch",
+                "Model": "SMS6ZCI00G",
+                "Category": "Dishwasher",
+                "Locale_Details": {
+                    "Title": "Bosch Series 6 Dishwasher",
+                    "Price": 449.99,
+                    "GTL": 12,
+                    "GTP": 24,
+                    "Promo_Code": "",
+                    "Custom_Links": [{"Type": "manual", "URL": "https://example.com/manuals/sms6zci00g.pdf"}],
+                },
+                "Global_Promotion": None,
+                "add_pricing": True,
+            }
+        }
+    }
 
 
 def ensure_master_with_locale(data, request, background_tasks):
@@ -240,13 +285,61 @@ def _serialize(doc):
     return doc
 
 
-@router.post("/create_custom_sku")
+@router.post(
+    "/create_custom_sku",
+    summary="Create a client SKU, or add a locale to an existing one",
+    response_description="The stored CustomSKU, or a message explaining what happened instead.",
+    responses=secured({
+        200: json_response(
+            "Processed. **Check the response shape** — a new SKU returns the document itself, "
+            "while every other outcome returns a `message` (and sometimes the existing record).",
+            {
+                "_id": "681aa2f1c4b21d0f8c9e0012",
+                "Client": "ACME-UK",
+                "Client_Key": "acme_uk_live",
+                "Sources": ["web"],
+                "Identifiers": {"GTIN": ["5011773057240"], "Make": "Bosch", "Model": "SMS6ZCI00G", "SKU": "BOSCH-DW-4421"},
+                "MasterSKU": "681aa2f1c4b21d0f8c9e0044",
+                "Category": "Dishwasher",
+                "Global_Promotion": None,
+                "Locale_Specific_Data": [
+                    {"locale": "en_GB", "Title": "Bosch Series 6 Dishwasher", "MSRP": 449.99, "Guarantees": {"Parts": "24", "Labour": "12"}}
+                ],
+            },
+        ),
+        400: error(
+            "A mandatory field is blank, or neither `GTIN` nor `Make`+`Model` was supplied.",
+            "Missing mandatory input(s): GTIN or (Make and Model)",
+        ),
+        404: error("The `Locale` is not configured, or the `ClientKey` is unknown.", "Locale en_GB not found."),
+    }),
+)
 def create_custom_sku(
     data: CustomSKURequest,
     request: Request,
     background_tasks: BackgroundTasks,
     _: None = Depends(verify_token),
 ):
+    """
+    Create a CustomSKU for a client, or add a locale to one that already exists.
+
+    A CustomSKU always hangs off a MasterSKU, so the endpoint resolves that first: it looks for a
+    MasterSKU by `GTIN`, else by `Make`+`Model`, and **creates one if none exists** (which may
+    trigger background enrichment). That is why one of those identifiers is mandatory.
+
+    **Four outcomes, all `200` — branch on the response, not the status code:**
+
+    | Situation | Response |
+    | --- | --- |
+    | New SKU created | The CustomSKU document itself, with `_id` |
+    | SKU exists, new locale added | `{"message": "Locale added to existing CustomSKU", "customsku": {…}}` |
+    | SKU already covers this locale | `{"message": "SKU exists already for client and locale", "existing": {…}}` |
+    | MasterSKU still being built | `{"message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."}` — retry shortly |
+
+    Anything omitted from `Locale_Details` is inherited from the MasterSKU's data for that locale,
+    so a minimal call still produces a priced, titled SKU. After a successful write the widget
+    quote cache is warmed in the background, so the first shopper does not pay for a cold cache.
+    """
     # 0. Validate inputs
     missing_fields = validate_mandatory_fields(data)
     if missing_fields:

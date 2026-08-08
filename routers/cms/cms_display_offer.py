@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Query, Depends
 import httpx
 import os
 from pymongo import MongoClient
+from utils.api_docs import error
 from utils.dependencies import verify_token
 from utils.locale import resolve_strapi_locale, LocaleNotSupportedError
 
@@ -25,11 +26,41 @@ def _get_locale_params_collection():
     except Exception:
         return None
 
-@router.get("/cms_display_offer")
+@router.get(
+    "/cms_display_offer",
+    summary="Fetch the offer-page content for a locale",
+    response_description="The CMS display-offer entry for the requested locale.",
+    responses={
+        200: {
+            "description": (
+                "Strapi's response, forwarded unchanged. The shape is defined by the CMS "
+                "content type, not by this API."
+            ),
+            "content": {"application/json": {}},
+        },
+        400: error("The locale has no Strapi equivalent configured.", "Locale 'xx_XX' is not supported"),
+        500: error("Strapi could not be reached.", "..."),
+    },
+)
 async def cms_display_offer(
-    locale: str = Query(..., example="en_GB"),
+    locale: str = Query(
+        ...,
+        description="**Mandatory.** Locale in underscore form (`en_GB`). Mapped to the CMS's hyphenated form automatically.",
+        examples=["en_GB"],
+    ),
     _: None = Depends(verify_token)
 ):
+    """
+    Fetch the localized content for the cover offer page — headings, benefit copy and calls to
+    action shown when cover is presented to a customer.
+
+    `locale` is mandatory and is given in the API's underscore form; the CMS mapping comes from
+    `Locale_Params` where available, otherwise from a built-in table. A locale with no CMS
+    equivalent returns `400`.
+
+    The response is **Strapi's JSON, forwarded unchanged**. Product-specific copy comes from
+    `GET /props_lookup` instead.
+    """
     locale_doc = None
     try:
         col = _get_locale_params_collection()

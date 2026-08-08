@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Any
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from pymongo import MongoClient
 from bson import ObjectId
@@ -33,32 +34,59 @@ registrations_error_log_collection = db["Registrations_Error_Log"]
 EMAIL_REGEX = re.compile(r"(^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$)")
 
 class IdentifiersModel(BaseModel):
-    GTIN: Optional[str] = ""
-    make: Optional[str] = ""
-    model: Optional[str] = ""
-    SKU: Optional[str] = ""
-    code: Optional[str] = ""
-    title: Optional[str] = ""
-    category: Optional[str] = ""
-    gtee_parts: Optional[str] = ""
-    id: Optional[str] = ""
-    gtee_labour: Optional[str] = ""
-    promo: Optional[str] = ""
+    """What kind of product this is. Individually optional, but a device needs **one complete
+    identification route** — a `GTIN` (not `"0"`), or `make` **and** `model`, or a `SKU` —
+    otherwise it is logged as an error instead of registered."""
+
+    GTIN: Optional[str] = Field("", description="Barcode / GTIN-13. `\"0\"` counts as absent.", examples=["5011773057240"])
+    make: Optional[str] = Field("", description="Manufacturer name. Identifies a product only together with `model`.", examples=["Bosch"])
+    model: Optional[str] = Field("", description="Model designation. Identifies a product only together with `make`.", examples=["SMS6ZCI00G"])
+    SKU: Optional[str] = Field("", description="The client's own SKU code, if already in the catalogue.", examples=["BOSCH-DW-4421"])
+    code: Optional[str] = Field("", description="Optional free-form code carried through to the stored registration.", examples=["PROMO-Q3"])
+    title: Optional[str] = Field("", description="Display name. Back-filled from the catalogue when blank.", examples=["Bosch Series 6 Freestanding Dishwasher"])
+    category: Optional[str] = Field("", description="Product category. Back-filled from the catalogue when blank.", examples=["Dishwasher"])
+    gtee_parts: Optional[str] = Field("", description="Manufacturer parts guarantee in months.", examples=["24"])
+    id: Optional[str] = Field("", description="Optional caller-side identifier echoed back unchanged.", examples=["line-1"])
+    gtee_labour: Optional[str] = Field("", description="Manufacturer labour guarantee in months.", examples=["12"])
+    promo: Optional[str] = Field("", description="Promotional guarantee extension from the catalogue record.", examples=["+12 months registration promotion"])
+
 
 class UniqueParametersModel(BaseModel):
-    MAC: Optional[str] = ""
-    serial: Optional[str] = ""
-    imei: Optional[Any] = None
-    purchase_date: Optional[str] = ""
-    price: Optional[float] = 0
-    client_ref: Optional[str] = ""
+    """Facts about the individual unit being registered."""
+
+    MAC: Optional[str] = Field("", description="MAC address, where the device has one.", examples=["A4:83:E7:2B:19:0C"])
+    serial: Optional[str] = Field("", description="Manufacturer serial number.", examples=["SN-8841203"])
+    imei: Optional[Any] = Field(None, description="IMEI for cellular devices.", examples=["356938035643809"])
+    purchase_date: Optional[str] = Field(
+        "",
+        description="Date of purchase, **`YYYY-MM-DD`**. Any other format fails that device only.",
+        examples=["2025-05-01"],
+    )
+    price: Optional[float] = Field(
+        0,
+        description=(
+            "Purchase price in the locale's currency. When omitted or `0`, falls back to the "
+            "CustomSKU `MSRP`, then the MasterSKU `Price`."
+        ),
+        examples=[449.99],
+    )
+    client_ref: Optional[str] = Field("", description="Your own reference for this registration.", examples=["ORD-2026-00918"])
+
 
 class Customer(BaseModel):
-    Opt_SMS: Optional[bool] = None
-    Opt_email: Optional[bool] = None
-    name: Optional[str] = ""
-    email: Optional[str] = ""  # Accept blank or valid email
-    phone: Optional[str] = ""
+    """Optional end-customer details captured alongside the registration. Every field is
+    optional, but `email` — when supplied and non-blank — must be a valid address or the whole
+    request is rejected with `422`."""
+
+    Opt_SMS: Optional[bool] = Field(None, description="Customer consented to SMS contact.", examples=[True])
+    Opt_email: Optional[bool] = Field(None, description="Customer consented to email contact.", examples=[True])
+    name: Optional[str] = Field("", description="Customer's full name.", examples=["Jane Okafor"])
+    email: Optional[str] = Field(
+        "",
+        description="Blank, or a valid email address. Anything else fails validation with `422`.",
+        examples=["jane.okafor@example.com"],
+    )
+    phone: Optional[str] = Field("", description="Contact phone number, ideally in E.164 form.", examples=["+447700900123"])
 
     @field_validator("email")
     def validate_email_or_blank(cls, v):
@@ -69,15 +97,71 @@ class Customer(BaseModel):
         return v
 
 class DeviceModel(BaseModel):
-    Identifiers: IdentifiersModel
-    Unique_Parameters: UniqueParametersModel
+    """One device in the registration. Both sections are mandatory objects."""
+
+    Identifiers: IdentifiersModel = Field(..., description="**Mandatory.** What the product is.")
+    Unique_Parameters: UniqueParametersModel = Field(..., description="**Mandatory.** Which unit this is.")
+
 
 class RegisterRequest(BaseModel):
-    clientkey: str = ""
-    locale: str = ""
-    source: str = ""
-    customer: Optional[Customer] = None
-    Devices: List[DeviceModel]
+    """One registration covering a tenant, a locale, an optional customer, and one or more
+    devices. The three string fields default to `""` in the schema but are **rejected with
+    `400` when left blank** — treat them as mandatory."""
+
+    clientkey: str = Field(
+        "",
+        description=(
+            "**Required in practice.** Tenant key; must match a `ClientKey` record. Blank, "
+            "`null` or the literal `\"string\"` are rejected with `400`."
+        ),
+        examples=["acme_uk_live"],
+    )
+    locale: str = Field(
+        "",
+        description=(
+            "**Required in practice.** Locale code such as `en_GB`; must exist in "
+            "`Locale_Params`. Rejected with `400` when blank or unsupported."
+        ),
+        examples=["en_GB"],
+    )
+    source: str = Field(
+        "",
+        description="**Required in practice.** Origin of the registration, e.g. `web`, `kiosk`.",
+        examples=["web"],
+    )
+    customer: Optional[Customer] = Field(
+        None,
+        description="Optional end-customer details and contact consents.",
+    )
+    Devices: List[DeviceModel] = Field(..., description="**Mandatory.** The devices being registered.")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "clientkey": "acme_uk_live",
+                "locale": "en_GB",
+                "source": "web",
+                "customer": {
+                    "name": "Jane Okafor",
+                    "email": "jane.okafor@example.com",
+                    "phone": "+447700900123",
+                    "Opt_SMS": True,
+                    "Opt_email": True,
+                },
+                "Devices": [
+                    {
+                        "Identifiers": {"GTIN": "5011773057240", "make": "Bosch", "model": "SMS6ZCI00G"},
+                        "Unique_Parameters": {
+                            "serial": "SN-8841203",
+                            "purchase_date": "2025-05-01",
+                            "price": 449.99,
+                            "client_ref": "ORD-2026-00918",
+                        },
+                    }
+                ],
+            }
+        }
+    }
 
 # ---------- Helper Functions ----------
 
@@ -210,8 +294,61 @@ def fallback_value(input_val, *fallbacks):
 
 # ---------- The Endpoint ----------
 
-@router.post("/register")
+@router.post(
+    "/register",
+    summary="Register devices and issue an activation code and QR",
+    response_description="The registration id, its activation code and QR, and a per-device result.",
+    responses=secured({
+        200: json_response(
+            "The registration was processed. `status` is `matched` when at least one device "
+            "resolved to a SKU, `error logged` when none did.",
+            {
+                "status": "matched",
+                "registration_id": "6820f1c9a4b21d0f8c9e4471",
+                "activation_code": "7KQ2FB",
+                "registration_url": "https://www.activlink.io/register?id=6820f1c9a4b21d0f8c9e4471",
+                "registration_qr": "iVBORw0KGgoAAAANSUhEUgAA… (base64 PNG)",
+                "devices": [
+                    {
+                        "device_id": "b6f2a0d4-9a1e-4a5f-9f0e-2c3d4e5f6a7b",
+                        "Identifiers": {"GTIN": "5011773057240", "make": "Bosch", "model": "SMS6ZCI00G"},
+                        "Unique_Parameters": {"serial": "SN-8841203", "price": 449.99},
+                        "customSKU_id": "681aa2f1c4b21d0f8c9e0012",
+                        "masterSKU_id": "681aa2f1c4b21d0f8c9e0044",
+                        "status": "matched",
+                        "registered_at": "2026-08-06T10:14:52.113000Z",
+                    }
+                ],
+            },
+        ),
+        400: error(
+            "`clientkey`, `locale` or `source` was blank or a placeholder, the client is "
+            "unknown, or the locale is unsupported.",
+            "Invalid clientkey.",
+        ),
+    }),
+)
 def register(payload: RegisterRequest, _: None = Depends(verify_token)):
+    """
+    Register devices from an embedded/widget journey and return everything needed to complete
+    activation: a registration id, a short activation code, a landing URL, and a QR image.
+
+    Compared with `POST /device-register`, this endpoint stores **one registration document
+    covering the whole batch** (including the optional customer), and returns activation
+    artefacts at the root rather than per device.
+
+    - Each device is enriched from the CustomSKU/MasterSKU catalogue for the given client and
+      locale; unmatched devices come back with `status: "error logged"`.
+    - `registration_qr` is a **base64-encoded PNG** of `registration_url` — render it directly
+      with `<img src="data:image/png;base64,…">`.
+    - `activation_code` is a random six-character code, identical for every device in the batch.
+    - If **no** device matched, the whole registration is written to `Registrations_Error_Log`
+      instead of `Registrations` and the root `status` is `error logged`. The call still returns
+      `200` with a usable registration id.
+
+    `clientkey`, `locale` and `source` are mandatory in practice; `customer` is optional, but a
+    non-blank `customer.email` must be a valid address.
+    """
     # --- Root mandatory fields validation ---
     validate_mandatory_fields(payload)
 

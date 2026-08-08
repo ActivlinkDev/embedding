@@ -1,7 +1,7 @@
 # master_sku_router.py
 
-from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Depends, Query, Request, BackgroundTasks
+from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 import requests
 import threading
@@ -18,6 +18,7 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 import httpx
 import logging
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from utils.common import embed_query, find_best_match, category_embeddings, device_categories
 
@@ -29,11 +30,32 @@ router = APIRouter(
 )
 
 
-@router.get("/r/{key}")
+@router.get(
+    "/r/{key}",
+    summary="Serve a masked product asset through the API",
+    response_description="The upstream file, streamed back with its original content type.",
+    responses={
+        200: {
+            "description": "The upstream resource, proxied. Content type is whatever the origin "
+                           "returned — commonly `application/pdf` or an image.",
+            "content": {"application/octet-stream": {}},
+        },
+        404: error("No mapping for this key, or the mapping has expired.", "Not found"),
+    },
+)
 async def proxy_masked(key: str):
-    """Proxy endpoint for masked URLs stored in `url_map`.
-    Fetches the upstream resource server-side and streams it back so the
-    browser remains on the masked URL (upstream host is not exposed).
+    """
+    Serve a product asset (manual, product fiche, image) stored behind a masked key.
+
+    MasterSKU documents reference assets by an opaque key rather than the supplier's URL. This
+    endpoint resolves the key from `url_map`, fetches the file server-side and streams it back,
+    so the browser only ever sees an Activlink URL and the upstream host stays private.
+
+    Path parameter `key` is mandatory and is the UUID stored in the MasterSKU document. Mappings
+    may carry an expiry; an expired one is reported as `404`, the same as an unknown key.
+
+    **No authentication is required** — these URLs are handed to end customers. The response is
+    the file itself, not JSON.
     """
     try:
         doc = url_map_collection.find_one({"_id": key})
@@ -105,11 +127,45 @@ def utc_now_iso():
     return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 class MasterSKURequest(BaseModel):
-    Make: str
-    Model: str
-    GTIN: str
-    locale: str
-    Category: Optional[str] = None
+    """The product to create, or add a locale to, in the shared MasterSKU catalogue.
+
+    `Make`, `Model`, `GTIN` and `locale` are all mandatory **fields**, though `GTIN` may be sent
+    as an empty string when the barcode is unknown — matching then falls back to `Make`+`Model`.
+    A non-empty `GTIN` must be a valid barcode or the request is rejected with `400`.
+    """
+
+    Make: str = Field(..., description="**Mandatory.** Manufacturer name.", examples=["Bosch"])
+    Model: str = Field(..., description="**Mandatory.** Model designation.", examples=["SMS6ZCI00G"])
+    GTIN: str = Field(
+        ...,
+        description=(
+            "**Mandatory field**, but may be `\"\"`. When non-empty it must be a valid GTIN — "
+            "it is the primary key for matching and for third-party enrichment."
+        ),
+        examples=["5011773057240"],
+    )
+    locale: str = Field(
+        ...,
+        description="**Mandatory.** Locale to populate. Must exist in `Locale_Params`, else `404`.",
+        examples=["en_GB"],
+    )
+    Category: Optional[str] = Field(
+        None,
+        description="Optional category override. Omit to let the category be inferred during enrichment.",
+        examples=["Dishwasher"],
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "Make": "Bosch",
+                "Model": "SMS6ZCI00G",
+                "GTIN": "5011773057240",
+                "locale": "en_GB",
+                "Category": "Dishwasher",
+            }
+        }
+    }
 
 
 
@@ -452,14 +508,78 @@ def log_failed_match(category_input: str, data: MasterSKURequest, embedding, sim
 
 # --- Main Endpoint ---
 
-@router.post("/create_master_sku")
+@router.post(
+    "/create_master_sku",
+    summary="Create a MasterSKU, or add a locale to an existing one",
+    response_description="The MasterSKU document, wrapped differently depending on which path was taken.",
+    responses=secured({
+        200: json_response(
+            "Processed. **Check `source`** to see what happened: absent means newly created, "
+            "`master` means it already existed, `master-update` means a locale was added.",
+            {
+                "source": "master-update",
+                "updated_locale": "en_GB",
+                "result": {
+                    "_id": "681aa2f1c4b21d0f8c9e0044",
+                    "Make": "Bosch",
+                    "Model": "SMS6ZCI00G",
+                    "GTIN": ["5011773057240"],
+                    "Category": "Dishwasher",
+                    "match_key": "gtin:5011773057240",
+                    "Locale_Specific_Data": [
+                        {
+                            "locale": "en_GB",
+                            "Title": "Bosch Series 6 Freestanding Dishwasher",
+                            "Price": 449.99,
+                            "manual_url": "/sku/r/6f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f",
+                        }
+                    ],
+                },
+            },
+        ),
+        400: error("`GTIN` is non-empty but is not a valid barcode.", "Invalid GTIN format"),
+        404: error("The `locale` is not configured in `Locale_Params`.", "No locale data found for en_GB"),
+        500: error("The MasterSKU could not be written.", "Failed to create MasterSKU"),
+    }),
+)
 def create_master_sku(
     data: MasterSKURequest,
     request: Request,
     background_tasks: BackgroundTasks,
-    add_pricing: Optional[bool] = False,
+    add_pricing: Optional[bool] = Query(
+        False,
+        description=(
+            "Schedule background price enrichment (DataforSEO shopping) for this MasterSKU "
+            "after the response is sent. Off by default."
+        ),
+        examples=[False],
+    ),
     _: None = Depends(verify_token),
 ):
+    """
+    Create a product in the shared MasterSKU catalogue, or add a locale to one that exists.
+
+    A MasterSKU is the platform-wide record every client's CustomSKU points at. You rarely need
+    to call this directly — `POST /sku/create_custom_sku` invokes it automatically when a client
+    SKU has no MasterSKU yet.
+
+    **Matching** is by `GTIN` when one is supplied, otherwise by `Make`+`Model`, via a stored
+    `match_key`. Creation uses an atomic upsert, so two simultaneous calls for the same product
+    yield one document rather than duplicates.
+
+    **Three outcomes, all `200` — branch on `source`:**
+
+    | `source` | Meaning |
+    | --- | --- |
+    | *(absent)* | Newly created. The response **is** the document. |
+    | `master` | Already existed with this locale. Document under `result`. |
+    | `master-update` | Existed; this locale was added. Document under `result`, locale echoed in `updated_locale`. |
+
+    On creation the record is enriched from third-party sources (Icecat, Go-UPC) for titles,
+    images and documents; asset URLs are masked behind `GET /sku/r/{key}`. Set the
+    `add_pricing` query parameter to `true` to also schedule background price enrichment — it
+    runs after the response, so prices appear on the record shortly afterwards, not immediately.
+    """
     # Validate
     if data.GTIN.strip() and not is_valid_gtin(data.GTIN):
         raise HTTPException(status_code=400, detail="Invalid GTIN format")
@@ -698,10 +818,33 @@ def create_master_sku(
     return saved
 
 
-@router.post("/debug_probe")
-async def debug_probe(masterSKUid: str, _: None = Depends(verify_token)):
-    """Schedule a tiny probe task to verify background tasks run on the event loop.
-    Call this endpoint and watch the uvicorn logs for a [bg_probe] entry.
+@router.post(
+    "/debug_probe",
+    summary="Diagnostic: confirm background tasks are running",
+    response_description="Confirmation that the probe task was scheduled.",
+    responses=secured({
+        200: json_response("The probe was scheduled. Watch the logs for the result.", {"scheduled": True}),
+        500: error("The probe task could not be scheduled.", "Failed to schedule probe"),
+    }),
+)
+async def debug_probe(
+    masterSKUid: str = Query(
+        ...,
+        description="**Mandatory.** Any MasterSKU id — used only as a label in the log line.",
+        examples=["681aa2f1c4b21d0f8c9e0044"],
+    ),
+    _: None = Depends(verify_token),
+):
+    """
+    **Operational diagnostic, not a business endpoint.**
+
+    Schedules a trivial background task and returns immediately. Its only purpose is to prove
+    that background work is executing on the event loop: after calling it, look for a
+    `[bg_probe]` line in the application logs. Nothing is read or written in the database, and
+    `masterSKUid` is only echoed into the log message.
+
+    `{"scheduled": true}` means the task was queued, **not** that it ran — the logs are the
+    actual result.
     """
     try:
         logger.info(f"[debug_probe] scheduling probe for masterSKUid={masterSKUid}")

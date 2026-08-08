@@ -3,6 +3,7 @@ from pymongo import MongoClient
 from bson import ObjectId
 import os
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 
 router = APIRouter(tags=["Customers"], prefix="")
@@ -35,11 +36,51 @@ def _serialize_doc(doc: dict) -> dict:
     return _serialize_value(doc)
 
 
-@router.get("/customer/by-id")
-def get_customer_by_id(customer_id: str = Query(..., alias="customer_id"), _=Depends(verify_token)):
-    """Return a customer document by its id (string).
+@router.get(
+    "/customer/by-id",
+    summary="Fetch a customer record",
+    response_description="The customer document, wrapped in `data`, without its transaction log.",
+    responses=secured({
+        200: json_response(
+            "The customer was found.",
+            {
+                "data": {
+                    "_id": "6820f1c9a4b21d0f8c9e9001",
+                    "name": "Jane Okafor",
+                    "telephone": "+447700900123",
+                    "email": "jane.okafor@example.com",
+                    "devices": [
+                        {"deviceId": "6820f1c9a4b21d0f8c9e4471", "status": "contract"},
+                        {"deviceId": "6820f1c9a4b21d0f8c9e4472", "status": "registered"},
+                    ],
+                }
+            },
+        ),
+        400: error("`customer_id` is not a valid 24-character ObjectId.", "Invalid customer_id"),
+        404: error("No customer with this id.", "Customer not found"),
+        500: error("The lookup failed unexpectedly.", "Internal error: ..."),
+    }),
+)
+def get_customer_by_id(
+    customer_id: str = Query(
+        ...,
+        alias="customer_id",
+        description="**Mandatory.** The customer's `_id` (24-character ObjectId).",
+        examples=["6820f1c9a4b21d0f8c9e9001"],
+    ),
+    _=Depends(verify_token),
+):
+    """
+    Fetch a customer record by id.
 
-    Query param: ?customer_id=<hexid>
+    The document is returned as stored, with every nested `ObjectId` converted to a string —
+    **except `transaction_log`, which is always stripped** from the response. Do not rely on this
+    endpoint for payment history; use `GET /customers/{customer_id}/orders`.
+
+    `devices` carries the pairing produced by `POST /pair-customer`: `contract` for devices with
+    cover, `registered` for devices where it was declined.
+
+    `customer_id` is mandatory.
     """
     try:
         try:

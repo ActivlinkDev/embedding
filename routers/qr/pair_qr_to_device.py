@@ -1,8 +1,9 @@
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pymongo.errors import DuplicateKeyError
 from datetime import datetime, timezone
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from routers.qr.generate_qr_collection import qr_collection
 
@@ -10,14 +11,59 @@ router = APIRouter(tags=["QR"])
 
 
 class PairQRRequest(BaseModel):
-    hex_key: str
-    device_id: str
+    """Which code to bind to which device. Both fields are mandatory."""
+
+    hex_key: str = Field(
+        ...,
+        description="**Mandatory.** The code's five-character hex key. Matched case-insensitively.",
+        examples=["3F9A1"],
+    )
+    device_id: str = Field(
+        ...,
+        description="**Mandatory.** The registered device to bind it to.",
+        examples=["6820f1c9a4b21d0f8c9e4471"],
+    )
+
+    model_config = {"json_schema_extra": {"example": {"hex_key": "3F9A1", "device_id": "6820f1c9a4b21d0f8c9e4471"}}}
 
 
-@router.post("/qr/pair")
+@router.post(
+    "/qr/pair",
+    summary="Bind a QR code to a registered device",
+    response_description="The pairing, including when it was made.",
+    responses=secured({
+        200: json_response(
+            "The code is now bound to this device — or already was.",
+            {
+                "hex_key": "3F9A1",
+                "device_id": "6820f1c9a4b21d0f8c9e4471",
+                "paired_at": "2026-08-06T10:20:00+00:00",
+                "status": "paired",
+            },
+        ),
+        404: error("No QR code with this hex key.", "QR code not found"),
+        409: error(
+            "The code is already bound to a different device, or that device is already bound "
+            "to another code. Pairing is one-to-one.",
+            "QR code is already paired to a different device",
+        ),
+    }),
+)
 def pair_qr_to_device(body: PairQRRequest, _: None = Depends(verify_token)):
-    """Pair a QR code to a device registration. Idempotent if already paired
-    to the same device_id; returns 409 if paired to a different device."""
+    """
+    Bind a QR code to a registered device, so scanning it afterwards takes the customer straight
+    to that device.
+
+    **Pairing is one-to-one and permanent.** A code binds to exactly one device and a device to
+    exactly one code; there is no unpair endpoint.
+
+    **Repeating the same pairing is safe** — re-sending the same `hex_key` and `device_id`
+    returns the existing pairing unchanged. Conflicts return `409`: either the code already
+    points at a different device, or that device already has another code (the second case is
+    reported as *"This device is already paired to another QR code"*).
+
+    Both fields are mandatory. On success the code's status becomes `paired`.
+    """
     hex_key = body.hex_key.upper()
     doc = qr_collection.find_one({"hex_key": hex_key})
     if not doc:

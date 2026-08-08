@@ -4,6 +4,7 @@ from pymongo import MongoClient
 import os
 from datetime import datetime
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from .product_assignment import product_assignment, ProductAssignmentRequest
 
@@ -14,8 +15,93 @@ db = client["Activlink"]
 devices_collection = db["Devices"]
 error_log_collection = db["Error_Log_ProductAssignment"]
 
-@router.get("/assign_product_for_device/{device_id}")
+@router.get(
+    "/assign_product_for_device/{device_id}",
+    summary="List the cover products available for a registered device",
+    response_description="The inputs derived from the device and every product/term combination it qualifies for.",
+    responses=secured({
+        200: json_response(
+            "One entry per product and cover term. Each entry is ready to be sent to "
+            "`POST /rate_request` as-is.",
+            {
+                "Inputs": {
+                    "client": "ACME-UK",
+                    "source": "web",
+                    "category": "Dishwasher",
+                    "price": 449.99,
+                    "locale": "en_GB",
+                    "purchase_date": "2025-05-01",
+                    "gtee": 12,
+                    "currency": "GBP",
+                },
+                "Products": [
+                    {
+                        "product_id": "ACME-EW-STD",
+                        "currency": "GBP",
+                        "locale": "en_GB",
+                        "poc": 24,
+                        "category": "Dishwasher",
+                        "age": 15,
+                        "price": 449.99,
+                        "multi_count": 1,
+                        "client": "ACME-UK",
+                        "source": "web",
+                        "mode": "live",
+                    },
+                    {
+                        "product_id": "ACME-EW-STD",
+                        "currency": "GBP",
+                        "locale": "en_GB",
+                        "poc": 36,
+                        "category": "Dishwasher",
+                        "age": 15,
+                        "price": 449.99,
+                        "multi_count": 1,
+                        "client": "ACME-UK",
+                        "source": "web",
+                        "mode": "live",
+                    },
+                ],
+                "DistinctProductIds": ["ACME-EW-STD"],
+            },
+        ),
+        400: error(
+            "`device_id` is not a valid id, or the stored device is missing a field this "
+            "endpoint needs (`client`, `source`, `locale` or `currency`).",
+            "Device 'currency' is missing or blank.",
+        ),
+        404: error(
+            "The device does not exist, or no product matches it. The 404 body carries "
+            "`match_diagnostics` explaining which criteria failed, and the same detail is "
+            "written to `Error_Log_ProductAssignment`.",
+            {
+                "message": "No products found for this device.",
+                "device_id": "6820f1c9a4b21d0f8c9e4471",
+                "original_inputs": {"category": "Dishwasher", "price": 449.99, "locale": "en_GB"},
+                "match_diagnostics": {"category": "matched", "priceBand": "no band covers 449.99"},
+                "assignment_details": [],
+            },
+        ),
+        500: error("The device document is malformed in a way this endpoint cannot recover from.", "Device document missing required fields: ..."),
+    }),
+)
 def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
+    """
+    Work out which cover products a **already-registered** device qualifies for.
+
+    This is the convenience wrapper around `POST /product_assignment`: instead of assembling the
+    assignment inputs yourself, pass a `device_id` and they are read off the stored device —
+    `client`, `source`, `locale`, `currency`, category, price, purchase date, and the longer of
+    the labour/parts guarantee.
+
+    The result is **flattened**: the underlying assignment returns each product with a list of
+    cover terms, and this endpoint expands that into one entry per `product_id` × `poc`
+    (duration in months). Each entry is exactly the shape `POST /rate_request` expects, so the
+    normal flow is *assign → rate → generate payment link*.
+
+    Path parameter `device_id` is mandatory. Defaults applied while reading the device:
+    a missing `purchaseDate` becomes today, and a missing/​unparseable guarantee becomes `0`.
+    """
     # 1. Lookup device by ObjectId
     try:
         obj_id = ObjectId(device_id)

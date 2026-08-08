@@ -6,6 +6,7 @@ from bson import ObjectId
 import os
 from dotenv import load_dotenv
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 
 load_dotenv()
@@ -26,21 +27,62 @@ clientkey_collection = db["ClientKey"]
 
 
 class LocaleDetailsPatch(BaseModel):
-    Title: Optional[str] = None
-    Price: Optional[float] = None
-    GTL: Optional[int] = None
-    GTP: Optional[int] = None
-    Promo_Code: Optional[str] = None
+    """Per-locale fields to change.
+
+    Three states per field, and the difference matters:
+    **omit** it to leave the stored value alone, send a **value** to overwrite it, or send
+    **`null`** to clear it from the document entirely.
+    """
+
+    Title: Optional[str] = Field(None, description="Display title for this locale. `null` clears it.", examples=["Bosch Series 6 Dishwasher"])
+    Price: Optional[float] = Field(None, description="Selling price — stored as `MSRP`. `null` clears it.", examples=[449.99])
+    GTL: Optional[int] = Field(None, description="Guarantee, labour, in months. `null` clears it.", examples=[12])
+    GTP: Optional[int] = Field(None, description="Guarantee, parts, in months. `null` clears it.", examples=[24])
+    Promo_Code: Optional[str] = Field(None, description="Promotion for this locale. `null` clears it.", examples=["SUMMER25"])
 
 
 class UpdateCustomSKURequest(BaseModel):
-    ClientKey: str
-    id: str = Field(..., description="CustomSKU document id")
-    SKU: Optional[str] = None
-    Category: Optional[str] = None
-    Global_Promotion: Optional[str] = None
-    Locale: Optional[str] = None
-    Locale_Details: Optional[LocaleDetailsPatch] = None
+    """A partial update. `ClientKey` and `id` identify the record; **at least one** other field
+    must be present or the request is rejected with `400`."""
+
+    ClientKey: str = Field(
+        ...,
+        description="**Mandatory.** Tenant key; the record must belong to the client it resolves to.",
+        examples=["acme_uk_live"],
+    )
+    id: str = Field(
+        ...,
+        description="**Mandatory.** CustomSKU document id (24-character ObjectId).",
+        examples=["681aa2f1c4b21d0f8c9e0012"],
+    )
+    SKU: Optional[str] = Field(
+        None,
+        description="New SKU code. Must be non-blank and unique for this client, else `400`/`409`.",
+        examples=["BOSCH-DW-4421"],
+    )
+    Category: Optional[str] = Field(None, description="New root category.", examples=["Dishwasher"])
+    Global_Promotion: Optional[str] = Field(None, description="New promotion applied across every locale.", examples=["LAUNCH10"])
+    Locale: Optional[str] = Field(
+        None,
+        description=(
+            "Which locale `Locale_Details` applies to. **Mandatory whenever `Locale_Details` is "
+            "sent**, and the locale must already exist on the record."
+        ),
+        examples=["en_GB"],
+    )
+    Locale_Details: Optional[LocaleDetailsPatch] = Field(None, description="Per-locale fields to change. Requires `Locale`.")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "ClientKey": "acme_uk_live",
+                "id": "681aa2f1c4b21d0f8c9e0012",
+                "Category": "Dishwasher",
+                "Locale": "en_GB",
+                "Locale_Details": {"Price": 429.99, "GTP": 24},
+            }
+        }
+    }
 
 
 def _to_id_str(doc: Optional[dict]) -> Optional[dict]:
@@ -51,8 +93,61 @@ def _to_id_str(doc: Optional[dict]) -> Optional[dict]:
     return doc
 
 
-@router.post("/update_custom_sku")
+@router.post(
+    "/update_custom_sku",
+    summary="Update a CustomSKU's root or per-locale fields",
+    response_description="Confirmation plus the CustomSKU as it now stands.",
+    responses=secured({
+        200: json_response(
+            "The record was updated.",
+            {
+                "message": "CustomSKU updated",
+                "customsku": {
+                    "_id": "681aa2f1c4b21d0f8c9e0012",
+                    "Client": "ACME-UK",
+                    "Identifiers": {"GTIN": ["5011773057240"], "Make": "Bosch", "Model": "SMS6ZCI00G", "SKU": "BOSCH-DW-4421"},
+                    "Category": "Dishwasher",
+                    "MasterSKU": "681aa2f1c4b21d0f8c9e0044",
+                    "Locale_Specific_Data": [
+                        {"locale": "en_GB", "Title": "Bosch Series 6 Dishwasher", "MSRP": 429.99, "Guarantees": {"Parts": 24, "Labour": 12}}
+                    ],
+                },
+            },
+        ),
+        400: error(
+            "Nothing to update, a blank `SKU`, `Locale_Details` without `Locale`, or a "
+            "malformed `id`.",
+            "Locale is required when Locale_Details is provided",
+        ),
+        404: error(
+            "Unknown `ClientKey`, no such record for this client, or the `Locale` is not on the record.",
+            "Locale en_GB not found on CustomSKU",
+        ),
+        409: error("Another CustomSKU of this client already uses that SKU code.", "SKU already exists for this client"),
+        500: error("The update was written but the record could not be re-read.", "Failed to load updated CustomSKU"),
+    }),
+)
 def update_custom_sku(data: UpdateCustomSKURequest, background_tasks: BackgroundTasks, _: None = Depends(verify_token)):
+    """
+    Update an existing CustomSKU — root fields, one locale's details, or both in one call.
+
+    Note this is a **`POST`**, not a `PATCH`, but it behaves as a partial update: only the fields
+    you send are touched. Beyond `ClientKey` and `id`, **at least one updatable field is
+    required**; a request that changes nothing is rejected with `400`.
+
+    **Clearing versus leaving alone.** Inside `Locale_Details`, an omitted field is left as it is,
+    while a field sent explicitly as `null` is removed from the document. That distinction is the
+    only way to delete a stored value.
+
+    **Locale rules.** `Locale_Details` requires `Locale`, and that locale must already exist on
+    the record — this endpoint edits locales, it does not add them. Use
+    `POST /sku/create_custom_sku` with the new locale for that.
+
+    Changing `SKU` is checked for uniqueness within the client and returns `409` on a clash. The
+    record must belong to the client behind `ClientKey`; otherwise `404`, the same answer as a
+    record that does not exist. After a successful write the widget quote cache is refreshed in
+    the background for every affected locale, since price and guarantee changes alter quotes.
+    """
     clientkey_doc = clientkey_collection.find_one({"ClientKey": data.ClientKey})
     if not clientkey_doc or "Client_ID" not in clientkey_doc:
         raise HTTPException(status_code=404, detail="Invalid clientKey")

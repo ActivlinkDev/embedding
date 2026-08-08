@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Query, Depends
 import httpx
 import os
 from pymongo import MongoClient
+from utils.api_docs import error
 from utils.dependencies import verify_token
 from utils.locale import resolve_strapi_locale, LocaleNotSupportedError
 
@@ -17,15 +18,40 @@ client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
 locale_params_collection = db["Locale_Params"]
 
-@router.get("/cms_validate_customer")
+@router.get(
+    "/cms_validate_customer",
+    summary="Fetch the customer-verification page content for a locale",
+    response_description="The CMS validate-customer entry for the requested locale.",
+    responses={
+        200: {
+            "description": (
+                "Strapi's response, forwarded unchanged. The shape is defined by the CMS "
+                "content type, not by this API."
+            ),
+            "content": {"application/json": {}},
+        },
+        400: error("The locale has no Strapi equivalent configured.", "Locale 'xx_XX' is not supported"),
+        500: error("Strapi could not be reached.", "..."),
+    },
+)
 async def cms_validate_customer(
-    locale: str = Query(..., example="en_GB"),
+    locale: str = Query(
+        ...,
+        description="**Mandatory.** Locale in underscore form (`en_GB`). Mapped to the CMS's hyphenated form automatically.",
+        examples=["en_GB"],
+    ),
     _: None = Depends(verify_token)
 ):
-    """Fetch Validate Customer CMS content by locale only.
+    """
+    Fetch the localized content for the customer-verification screens — the copy shown while a
+    customer confirms their identity by phone and one-time code.
 
-    Maps provided FastAPI-style locale (e.g. en_GB) to Strapi locale (en-GB) via Mongo collection.
-    No phone/email filters are applied anymore.
+    **Content only.** This endpoint validates nothing and reads no customer data; the actual
+    checks are `POST /customer/authenticate` and `POST /otp/verify`.
+
+    `locale` is mandatory, in the API's underscore form, and is mapped to the CMS locale via
+    `Locale_Params`. Relations are fully populated. The response is **Strapi's JSON, forwarded
+    unchanged**.
     """
     locale_doc = locale_params_collection.find_one({"locale": locale})
     try:

@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 import re
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 
 load_dotenv()
@@ -94,19 +95,73 @@ def filter_locale_specific_data(result, locale):
     return result
 
 
-@router.get("/lookup_custom_sku_locale")
+@router.get(
+    "/lookup_custom_sku_locale",
+    summary="Look up a CustomSKU and return only the requested locale's data",
+    response_description="Matching CustomSKUs, with `Locale_Specific_Data` reduced to the requested locale.",
+    responses=secured({
+        200: json_response(
+            "At least one CustomSKU matched. Locale data is filtered down to `locale` on both "
+            "the CustomSKU and its attached MasterSKU.",
+            {
+                "matched_by": "GTIN",
+                "count": 1,
+                "results": [
+                    {
+                        "id": "681aa2f1c4b21d0f8c9e0012",
+                        "Client": "ACME-UK",
+                        "Identifiers": {"GTIN": "5011773057240", "Make": "Bosch", "Model": "SMS6ZCI00G", "SKU": "BOSCH-DW-4421"},
+                        "Locale_Specific_Data": [
+                            {"locale": "fr_FR", "Title": "Lave-vaisselle Bosch Série 6", "Category": "Lave-vaisselle", "MSRP": 529.0}
+                        ],
+                        "MasterSKU": "681aa2f1c4b21d0f8c9e0044",
+                        "MasterSKU_Details": {
+                            "_id": "681aa2f1c4b21d0f8c9e0044",
+                            "Make": "Bosch",
+                            "Model": "SMS6ZCI00G",
+                            "Locale_Specific_Data": [{"locale": "fr_FR", "Title": "Lave-vaisselle Bosch Série 6", "Price": 529.0}],
+                        },
+                    }
+                ],
+            },
+        ),
+        400: error("`id` was supplied but is not a valid 24-character ObjectId.", "Invalid ObjectId format"),
+        404: error(
+            "The `clientKey` is unknown, or nothing matched. Misses are recorded in "
+            "`Error_Log_Lookup_Custom_SKU`.",
+            "No matching SKU found. Please try again shortly as we update our records.",
+        ),
+        500: error("The catalogue query failed.", "Database error: ..."),
+    }),
+)
 def lookup_sku_locale(
-    clientKey: str = Query(..., description="Your assigned client key (required)"),
-    locale: str = Query(..., description="Locale inside Locale_Specific_Data"),
-    Make: Optional[str] = Query(None),
-    Model: Optional[str] = Query(None),
-    GTIN: Optional[str] = Query(None),
-    SKU: Optional[str] = Query(None),
-    id: Optional[str] = Query(None),
+    clientKey: str = Query(
+        ...,
+        description="**Mandatory.** Your tenant key. Resolved to a `Client_ID`, which scopes the search.",
+        examples=["acme_uk_live"],
+    ),
+    locale: str = Query(
+        ...,
+        description="**Mandatory.** Both the filter for matching and the only locale returned in the results.",
+        examples=["fr_FR"],
+    ),
+    Make: Optional[str] = Query(None, description="Manufacturer. Only used together with `Model`.", examples=["Bosch"]),
+    Model: Optional[str] = Query(None, description="Model designation. Only used together with `Make`.", examples=["SMS6ZCI00G"]),
+    GTIN: Optional[str] = Query(None, description="Barcode / GTIN. Tried after `id`.", examples=["5011773057240"]),
+    SKU: Optional[str] = Query(None, description="The client's own SKU code. Tried after `GTIN`.", examples=["BOSCH-DW-4421"]),
+    id: Optional[str] = Query(None, description="CustomSKU ObjectId. Tried first when supplied.", examples=["681aa2f1c4b21d0f8c9e0012"]),
     _: None = Depends(verify_token)
 ):
     """
-    GET: Look up a SKU for a client by clientKey and return only locale-matched locale-specific data.
+    The locale-trimmed variant of `GET /sku/lookup_custom_sku`.
+
+    Matching is identical — `clientKey` and `locale` are mandatory, and the identifiers `id`,
+    `GTIN`, `SKU`, then `Make`+`Model` are tried in that order until one hits.
+
+    **The difference is the response.** Each result has its `Locale_Specific_Data` array reduced
+    to just the requested locale, on both the CustomSKU and the attached `MasterSKU_Details`, so
+    a storefront gets one price and one title rather than every market's. Use the unfiltered
+    `lookup_custom_sku` when you need to compare locales.
     """
     # Step 1: Lookup clientKey to get Client_ID and Source
     clientkey_doc = clientkey_collection.find_one({"ClientKey": clientKey})

@@ -4,6 +4,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from pymongo import MongoClient
 from bson import ObjectId
 import os
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 
 router = APIRouter(tags=["Basket"])
@@ -15,24 +16,54 @@ rules_collection = db["BundleDiscountRules"]
 
 
 class RateBasketRequest(BaseModel):
-    basket_id: str = Field(..., description="Basket_Quotes _id as string")
+    """The basket to price."""
+
+    basket_id: str = Field(
+        ...,
+        description="**Mandatory.** The basket's `_id`, as returned by `POST /basket/add`.",
+        examples=["68b2d1f0a4b21d0f8c9e8801"],
+    )
+
+    model_config = {"json_schema_extra": {"example": {"basket_id": "68b2d1f0a4b21d0f8c9e8801"}}}
 
 
 class RuleResult(BaseModel):
-    rule_id: str
-    name: str
-    priority: int
-    ruleType: str
-    discount: int
-    explanation: Optional[str] = None
+    """One discount rule evaluated against the basket."""
+
+    rule_id: str = Field(..., description="Id of the rule that was evaluated.", examples=["68c0a1b2c3d4e5f6a7b8c9d0"])
+    name: str = Field(..., description="Human-readable rule name, suitable for showing a customer.", examples=["Multi-device 10% off"])
+    priority: int = Field(
+        ...,
+        description="Tie-breaker when two rules offer the same discount — the higher priority wins.",
+        examples=[10],
+    )
+    ruleType: str = Field(..., description="The kind of rule, e.g. `percentage`, `fixed`.", examples=["percentage"])
+    discount: int = Field(
+        ...,
+        description="Discount **in minor units** (pence/cents). `0` means the rule did not apply.",
+        examples=[715],
+    )
+    explanation: Optional[str] = Field(
+        None,
+        description="Why the rule did or did not apply.",
+        examples=["2 qualifying devices — 10% off"],
+    )
 
 
 class RateBasketResponse(BaseModel):
-    basket_id: str
-    subtotal: int
-    eligible_rules: List[RuleResult]
-    best: Optional[RuleResult] = None
-    final_total: int
+    """The basket's totals and the discount rules considered. All amounts are in minor units."""
+
+    basket_id: str = Field(..., description="The basket that was priced.", examples=["68b2d1f0a4b21d0f8c9e8801"])
+    subtotal: int = Field(..., description="Sum of every line before discount, in minor units.", examples=[14298])
+    eligible_rules: List[RuleResult] = Field(
+        ...,
+        description="Every active rule evaluated, including those that produced no discount.",
+    )
+    best: Optional[RuleResult] = Field(
+        None,
+        description="The single rule applied. `null` when no rule produced a discount — **rules do not stack**.",
+    )
+    final_total: int = Field(..., description="`subtotal` minus the best discount, never below `0`.", examples=[13583])
 
 
 # ---- helpers ----
@@ -296,8 +327,68 @@ def _evaluate_rule(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> RuleRes
     )
 
 
-@router.post("/basket/rate", response_model=RateBasketResponse)
+@router.post(
+    "/basket/rate",
+    response_model=RateBasketResponse,
+    summary="Price a basket and apply the best discount rule",
+    response_description="Subtotal, every rule considered, the winning rule, and the final total.",
+    responses=secured({
+        200: json_response(
+            "The basket was priced. All amounts are in minor units.",
+            {
+                "basket_id": "68b2d1f0a4b21d0f8c9e8801",
+                "subtotal": 14298,
+                "eligible_rules": [
+                    {
+                        "rule_id": "68c0a1b2c3d4e5f6a7b8c9d0",
+                        "name": "Multi-device 10% off",
+                        "priority": 10,
+                        "ruleType": "percentage",
+                        "discount": 715,
+                        "explanation": "2 qualifying devices — 10% off",
+                    },
+                    {
+                        "rule_id": "68c0a1b2c3d4e5f6a7b8c9d1",
+                        "name": "Three or more devices — £10 off",
+                        "priority": 5,
+                        "ruleType": "fixed",
+                        "discount": 0,
+                        "explanation": "Requires 3 devices, basket has 2",
+                    },
+                ],
+                "best": {
+                    "rule_id": "68c0a1b2c3d4e5f6a7b8c9d0",
+                    "name": "Multi-device 10% off",
+                    "priority": 10,
+                    "ruleType": "percentage",
+                    "discount": 715,
+                    "explanation": "2 qualifying devices — 10% off",
+                },
+                "final_total": 13583,
+            },
+        ),
+        400: error("`basket_id` is not a valid 24-character ObjectId.", "Invalid basket_id; must be a valid ObjectId string"),
+        404: error("No basket with this id.", "Basket not found"),
+    }),
+)
 def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
+    """
+    Price a whole basket and apply the best available discount.
+
+    Every active rule is evaluated against the basket's lines, and **exactly one wins** — the
+    largest discount, with `priority` breaking ties. Discounts do **not** stack, which is why
+    `eligible_rules` shows every rule considered (with `discount: 0` and an `explanation` for the
+    ones that missed) while only `best` is deducted.
+
+    All amounts are in **minor units** — pence or cents — so `14298` means £142.98. `final_total`
+    is floored at `0`.
+
+    Lines missing a `client` or `locale` inherit them from the basket root before rules are
+    matched, so a line added without them still qualifies.
+
+    `POST /basket/add` calls this automatically, so the totals on a basket are usually already
+    current; call it directly after removing a line, since deletes do not re-rate.
+    """
     # Fetch basket
     try:
         bid = ObjectId(payload.basket_id)

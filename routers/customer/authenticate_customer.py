@@ -3,6 +3,7 @@ from pymongo import MongoClient
 from bson import ObjectId
 import os
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 
 router = APIRouter(tags=["Customers"])
@@ -22,22 +23,58 @@ def _digits_only(s: str) -> str:
     return "".join(ch for ch in s if ch.isdigit() or ch == '+')
 
 
-@router.post("/customer/authenticate")
+@router.post(
+    "/customer/authenticate",
+    summary="Verify a customer's phone number and send them an OTP",
+    response_description="Whether the phone matched, and whether a one-time code was sent.",
+    responses=secured({
+        200: json_response(
+            "The check ran. **`authenticated` is in the body, not the status code** — a mismatch "
+            "is still `200`.",
+            {
+                "authenticated": True,
+                "otp_sent": True,
+                "destination_masked": "+44 ***** **0123",
+                "reused": False,
+            },
+        ),
+        400: error("`customer_id` is not a valid 24-character ObjectId.", "Invalid customer_id"),
+        404: error("No customer with this id.", "Customer not found"),
+        500: error("The check failed unexpectedly.", "Internal error: ..."),
+    }),
+)
 def authenticate_customer(
-    customer_id: str = Body(...),
-    phone: str = Body(...),
+    customer_id: str = Body(..., description="**Mandatory.** The customer being authenticated.", examples=["6820f1c9a4b21d0f8c9e9001"]),
+    phone: str = Body(
+        ...,
+        description="**Mandatory.** The phone number to check, ideally in E.164 form. Compared to the stored number after normalisation.",
+        examples=["+447700900123"],
+    ),
     response: Response = None,
     _=Depends(verify_token),
 ):
-    """Authenticate a customer by customer_id (Mongo _id) and phone number.
+    """
+    First step of customer sign-in: check that the caller knows the customer's phone number, and
+    if so send them a one-time code.
 
-    Request body: { "customer_id": "<hexid>", "phone": "+441234..." }
+    The supplied number is compared against the customer's stored `telephone`, `phone` or
+    `mobile` after normalising both to E.164, so `07700 900123` and `+447700900123` match. On
+    success an SMS code is sent and an `otp_fallback` cookie is set; verify it with
+    `POST /otp/verify`, then call `POST /customer/mark-verified`.
 
-    Responses:
-      - { authenticated: true } when phone matches
-      - { authenticated: false, reason: "..." } when not matched or missing
+    **Failure is reported in the body, not the status code.** A mismatch returns `200` with
+    `{"authenticated": false, "reason": "phone mismatch"}` — always branch on `authenticated`,
+    never on the status. `reason` is `no phone on record` when the customer has no number stored.
 
-    Note: this endpoint never returns the full customer document.
+    Other fields when authentication succeeds:
+
+    - `otp_sent` — `false` with `reason: "otp_failed"` means the phone matched but the code could
+      not be sent. The customer is authenticated but cannot proceed; retry.
+    - `reused: true` — a code was requested recently, so the existing one is still valid and no
+      second SMS was sent.
+    - `destination_masked` — the number the code went to, safe to show a user.
+
+    The customer record is **never** returned by this endpoint. Both fields are mandatory.
     """
     try:
         try:

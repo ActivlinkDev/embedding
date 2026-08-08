@@ -20,6 +20,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from routers.sku.propagate_master_price import (
     is_blank,
@@ -38,17 +39,81 @@ clientkey_collection = db["ClientKey"]
 
 
 class BackfillMSRPRequest(BaseModel):
-    ClientKey: str
-    id: Optional[str] = Field(None, description="Single CustomSKU id; omit to sweep the whole client")
-    Locale: Optional[str] = Field(None, description="Restrict to one locale; omit for all")
+    """Which CustomSKUs to repair. Only `ClientKey` is mandatory — the optional fields narrow
+    an otherwise client-wide sweep."""
+
+    ClientKey: str = Field(
+        ...,
+        description="**Mandatory.** Tenant whose CustomSKUs are repaired. Unknown keys return `404`.",
+        examples=["acme_uk_live"],
+    )
+    id: Optional[str] = Field(
+        None,
+        description=(
+            "Single CustomSKU id to repair; omit to sweep the whole client. When set, sibling "
+            "SKUs sharing the same MasterSKU and locale are **not** touched."
+        ),
+        examples=["681aa2f1c4b21d0f8c9e0012"],
+    )
+    Locale: Optional[str] = Field(
+        None,
+        description="Restrict the repair to one locale; omit to cover every locale on the matched SKUs.",
+        examples=["en_GB"],
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {"ClientKey": "acme_uk_live", "id": None, "Locale": "en_GB"}
+        }
+    }
 
 
-@router.post("/backfill_msrp")
+@router.post(
+    "/backfill_msrp",
+    summary="Backfill missing CustomSKU prices from their MasterSKU",
+    response_description="How many SKUs were repaired, which ones, and which are still unpriced.",
+    responses=secured({
+        200: json_response(
+            "The sweep ran. `backfilled: 0` with a populated `unpriced` means the MasterSKUs "
+            "have no price yet — nothing was wrong with the request.",
+            {
+                "status": "ok",
+                "backfilled": 2,
+                "customskus": [
+                    {"customSkuId": "681aa2f1c4b21d0f8c9e0012", "locale": "en_GB"},
+                    {"customSkuId": "681aa2f1c4b21d0f8c9e0013", "locale": "en_GB"},
+                ],
+                "unpriced": [{"masterSkuId": "681aa2f1c4b21d0f8c9e0044", "locale": "fr_FR"}],
+            },
+        ),
+        400: error("`id` is not a valid 24-character ObjectId.", "Invalid CustomSKU id"),
+        404: error("No client is registered under this ClientKey.", "ClientKey acme_uk_live not found."),
+    }),
+)
 def backfill_msrp(
     data: BackfillMSRPRequest,
     background_tasks: BackgroundTasks,
     _: None = Depends(verify_token),
 ):
+    """
+    **Operational repair endpoint.** Copy prices from MasterSKUs onto CustomSKUs whose `MSRP` was
+    left blank, and re-warm the widget quote cache for the ones it fixes.
+
+    This exists for SKUs created *before* their MasterSKU price arrived: they were stored with no
+    MSRP, which also left their widget quotes cold. Prices that land now are propagated
+    automatically by the DataforSEO postback, so this is only needed for SKUs that missed it.
+
+    `ClientKey` is mandatory and scopes the sweep. Narrow it with `id` (one CustomSKU) or
+    `Locale` (one market); omit both to sweep the client's whole catalogue. When `id` is given,
+    sibling SKUs sharing the same MasterSKU and locale are deliberately left alone.
+
+    **Only blank MSRPs are touched** — an existing price is never overwritten, so the call is
+    safe to repeat. A SKU whose MasterSKU also has no price is reported under `unpriced` and left
+    unchanged; that is not an error, it means enrichment has not landed yet. Re-run once it has.
+
+    `backfilled` counts SKU/locale pairs repaired. Cache warming happens in the background after
+    the response, so quotes may take a moment to reflect the new price.
+    """
     client_doc = clientkey_collection.find_one({"ClientKey": data.ClientKey})
     if not client_doc or "Client_ID" not in client_doc:
         raise HTTPException(status_code=404, detail=f"ClientKey {data.ClientKey} not found.")

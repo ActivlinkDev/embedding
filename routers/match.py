@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 import os
 from pymongo import MongoClient
 
+from utils.api_docs import error, json_response, secured
 from utils.common import embed_query, cosine_similarity
 from utils.dependencies import verify_token
 
@@ -12,15 +13,59 @@ router = APIRouter(
 )
 
 class QueryRequest(BaseModel):
-    query: str
+    """Free text to classify into a device category."""
+
+    query: str = Field(
+        ...,
+        description=(
+            "**Mandatory.** Any product description — a title, a marketing blurb, a few "
+            "keywords. It is embedded and compared against the category vectors."
+        ),
+        examples=["Bosch Series 6 freestanding dishwasher, 60cm, stainless steel"],
+    )
     # optional preferred locale, e.g. 'en_GB', 'fr_FR'
-    locale: Optional[str] = None
+    locale: Optional[str] = Field(
+        None,
+        description=(
+            "Optional. Preferred locale for `locale_title`. When the matched category has no "
+            "title in this locale the response falls back to `en_GB`, then to any available "
+            "title. Does not affect which category is matched."
+        ),
+        examples=["fr_FR"],
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "query": "Bosch Series 6 freestanding dishwasher, 60cm, stainless steel",
+                "locale": "en_GB",
+            }
+        }
+    }
 
 class MatchResponse(BaseModel):
-    category: str
-    similarity: float
+    """The single best-matching category."""
+
+    category: str = Field(
+        ...,
+        description="The matched category name. **Empty string when nothing matched.**",
+        examples=["Dishwasher"],
+    )
+    similarity: float = Field(
+        ...,
+        description=(
+            "Vector-search score for the match, or a cosine similarity computed locally when the "
+            "search backend returns no score. `0.0` when nothing matched. There is no minimum "
+            "threshold — always check the value before trusting the category."
+        ),
+        examples=[0.8734],
+    )
     # localized title for the matched category (if found)
-    locale_title: Optional[str] = None
+    locale_title: Optional[str] = Field(
+        None,
+        description="Localized display title for the category, if the record carries one.",
+        examples=["Lave-vaisselle"],
+    )
 
 
 # Mongo configuration (used only for lookup; missing MONGO_URI will be tolerated)
@@ -47,11 +92,39 @@ def _get_mongo_client():
             _mongo_client = None
     return _mongo_client
 
-@router.post("/match", response_model=MatchResponse)
+@router.post(
+    "/match",
+    response_model=MatchResponse,
+    summary="Classify free text into a device category",
+    response_description="The best-matching category, its score, and a localized title.",
+    responses=secured({
+        200: json_response(
+            "A match, or an empty result. Both are `200` — check `category` and `similarity`.",
+            {"category": "Dishwasher", "similarity": 0.8734, "locale_title": "Dishwasher"},
+        ),
+        500: error("The embedding request to OpenAI failed or timed out.", "OpenAI API error"),
+    }),
+)
 def match_category(
     request: QueryRequest,
     _: None = Depends(verify_token)
 ):
+    """
+    Match a free-text product description to a device category using vector search.
+
+    The text is embedded with OpenAI, then compared against the category embeddings held in the
+    `Category` collection via Atlas `$vectorSearch`. Only the single best candidate is returned.
+
+    **No-match is not an error.** If the search backend is unavailable, times out, or returns
+    nothing, the response is still `200` with `{"category": "", "similarity": 0.0}`. Always check
+    `category` before using the result — and treat `similarity` as advisory, since no minimum
+    threshold is enforced here.
+
+    That fallback covers the **search** stage only. Embedding happens first and is not guarded:
+    if the OpenAI request fails or times out, the call returns `500` rather than an empty match.
+
+    `query` is mandatory. `locale` only affects `locale_title`, never the match itself.
+    """
     # Embed the incoming query
     query_embedding = embed_query(request.query)
 

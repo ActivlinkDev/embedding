@@ -9,16 +9,51 @@ from fastapi.responses import RedirectResponse
 from routers.qr.generate_qr_collection import qr_collection, clientkey_collection
 from utils.ip_geolocation import get_client_ip, lookup_country, country_code_to_locale, _mask_ip
 
+from utils.api_docs import error
+
 router = APIRouter(tags=["QR"])
 
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").rstrip("/")
 _HEX_RE = re.compile(r"^[0-9A-F]{5}$")
 
 
-@router.get("/qr/scan/{hex_key}")
+@router.get(
+    "/qr/scan/{hex_key}",
+    summary="Public QR scan target (redirects the customer)",
+    response_description="A 302 redirect to the right frontend page for this code.",
+    responses={
+        302: {"description": "Redirect to the registration or product page, with the code's context in the query string."},
+        404: error(
+            "The key is not five hex characters, or no such code exists. The two cases are "
+            "deliberately indistinguishable.",
+            "QR code not found",
+        ),
+    },
+)
 def scan_qr(hex_key: str, request: Request):
-    """Public endpoint encoded in QR codes. Detects country from IP,
-    records the scan event, and redirects to the appropriate frontend page."""
+    """
+    The URL encoded in every QR code. **Customers' browsers land here — you do not call it.**
+
+    It records the scan, works out where the customer should go, and issues a **302 redirect**.
+    There is no JSON response.
+
+    **No authentication**, by necessity: anyone scanning a printed code reaches it. The key is a
+    five-character hex string, matched case-insensitively; anything else is `404`.
+
+    Each scan appends an event holding the country resolved from the IP (the IP itself is stored
+    masked and never returned), the user agent and a timestamp, increments `scan_count`, and
+    moves the code to `scanned` — or `paired` if a device is already bound.
+
+    **Where it redirects**, in priority order:
+
+    1. Code paired to a device → the device page for that registration
+    2. Code bound to a `custom_sku` → the product page, pre-filled with any stored identifiers
+    3. Stored `make`+`model`, or a `gtin` → the product page, pre-filled
+    4. Otherwise → a generic start page carrying the code
+
+    The locale in the redirect comes from the scanner's country, and the destination host from
+    the client's `redirect_base_url` where configured.
+    """
     hex_key = hex_key.upper()
     if not _HEX_RE.match(hex_key):
         raise HTTPException(status_code=404, detail="QR code not found")

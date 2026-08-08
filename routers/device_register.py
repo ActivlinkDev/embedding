@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Any
+from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from pymongo import MongoClient
 from bson import ObjectId
@@ -18,33 +19,187 @@ mastersku_collection = db["MasterSKU"]
 devices_collection = db["Devices"]
 
 class IdentifiersModel(BaseModel):
-    GTIN: Optional[str] = ""
-    make: Optional[str] = ""
-    model: Optional[str] = ""
-    SKU: Optional[str] = ""
-    title: Optional[str] = ""
-    category: Optional[str] = ""
-    gtee_parts: Optional[str] = ""
-    gtee_labour: Optional[str] = ""
-    promo: Optional[str] = ""
+    """What kind of product this is — used to match the device to a CustomSKU/MasterSKU.
+
+    Every field is optional individually, but **at least one identification route must be
+    complete**: a `GTIN` (not `"0"`), or both `make` and `model`, or a `SKU`. A device that
+    satisfies none of them is returned with `skuStatus: "error"` and is not stored.
+
+    Values left blank are back-filled from the matched catalogue record where one is found, so
+    sending only a GTIN is normal — `title`, `category` and the guarantee fields will be
+    populated from the catalogue.
+    """
+
+    GTIN: Optional[str] = Field(
+        "",
+        description="Barcode / GTIN-13. The strongest identifier. `\"0\"` counts as absent.",
+        examples=["5011773057240"],
+    )
+    make: Optional[str] = Field(
+        "",
+        description="Manufacturer name. Matches a SKU only in combination with `model`.",
+        examples=["Bosch"],
+    )
+    model: Optional[str] = Field(
+        "",
+        description="Manufacturer model designation. Matches a SKU only in combination with `make`.",
+        examples=["SMS6ZCI00G"],
+    )
+    SKU: Optional[str] = Field(
+        "",
+        description="The client's own SKU code, if it is already known to the catalogue.",
+        examples=["BOSCH-DW-4421"],
+    )
+    title: Optional[str] = Field(
+        "",
+        description="Display name. Taken from the matched catalogue record when omitted.",
+        examples=["Bosch Series 6 Freestanding Dishwasher"],
+    )
+    category: Optional[str] = Field(
+        "",
+        description="Product category. Taken from the matched catalogue record when omitted.",
+        examples=["Dishwasher"],
+    )
+    gtee_parts: Optional[str] = Field(
+        "",
+        description="Manufacturer parts guarantee in months. Falls back to the catalogue value.",
+        examples=["24"],
+    )
+    gtee_labour: Optional[str] = Field(
+        "",
+        description="Manufacturer labour guarantee in months. Falls back to the catalogue value.",
+        examples=["12"],
+    )
+    promo: Optional[str] = Field(
+        "",
+        description="Promotional guarantee extension, if the catalogue record carries one.",
+        examples=["+12 months registration promotion"],
+    )
+
 
 class UniqueParametersModel(BaseModel):
-    MAC: Optional[str] = ""
-    serial: Optional[str] = ""
-    imei: Optional[Any] = ""
-    purchase_date: Optional[str] = ""
-    price: Optional[float] = 0
-    client_ref: Optional[str] = ""
+    """Facts about the individual unit — what distinguishes this device from another of the
+    same product. These drive duplicate detection and the price used for rating."""
+
+    MAC: Optional[str] = Field(
+        "",
+        description="MAC address, where the device has one. Checked for duplicates second.",
+        examples=["A4:83:E7:2B:19:0C"],
+    )
+    serial: Optional[str] = Field(
+        "",
+        description=(
+            "Manufacturer serial number. Only detects duplicates in combination with "
+            "`make`+`model` or `GTIN`."
+        ),
+        examples=["SN-8841203"],
+    )
+    imei: Optional[Any] = Field(
+        "",
+        description=(
+            "IMEI for cellular devices. Checked for duplicates first. The literal string "
+            "`\"string\"` is discarded rather than stored."
+        ),
+        examples=["356938035643809"],
+    )
+    purchase_date: Optional[str] = Field(
+        "",
+        description=(
+            "Date of purchase in **`YYYY-MM-DD`** format. Any other format fails that single "
+            "device with `skuStatus: \"error\"` — the rest of the batch still registers."
+        ),
+        examples=["2025-05-01"],
+    )
+    price: Optional[float] = Field(
+        0,
+        description=(
+            "Purchase price in the locale's currency. When omitted or `0`, the price falls back "
+            "to the CustomSKU `MSRP`, then the MasterSKU `Price`, then `0`."
+        ),
+        examples=[449.99],
+    )
+    client_ref: Optional[str] = Field(
+        "",
+        description="Your own reference for this registration (order number, line id, …).",
+        examples=["ORD-2026-00918"],
+    )
+
 
 class DeviceModel(BaseModel):
-    Identifiers: IdentifiersModel
-    Unique_Parameters: UniqueParametersModel
+    """One device to register. Both sections are mandatory, though every field inside them
+    is individually optional."""
+
+    Identifiers: IdentifiersModel = Field(..., description="**Mandatory.** What the product is.")
+    Unique_Parameters: UniqueParametersModel = Field(
+        ..., description="**Mandatory.** Which individual unit this is."
+    )
+
 
 class SimpleRegisterRequest(BaseModel):
-    clientkey: str
-    locale: str
-    source: str
-    Devices: List[DeviceModel]
+    """A batch registration for one tenant and locale."""
+
+    clientkey: str = Field(
+        ...,
+        description=(
+            "**Mandatory.** Tenant key; must match a `ClientKey` record. Blank, `null` or the "
+            "literal `\"string\"` are rejected with `400`, as is a key that does not exist."
+        ),
+        examples=["acme_uk_live"],
+    )
+    locale: str = Field(
+        ...,
+        description=(
+            "**Mandatory.** Locale code such as `en_GB`. Must exist in `Locale_Params` — it "
+            "supplies the currency stored against each registration. Unsupported values are "
+            "rejected with `400`."
+        ),
+        examples=["en_GB"],
+    )
+    source: str = Field(
+        ...,
+        description=(
+            "**Mandatory.** Where the registration came from, recorded on each device, e.g. "
+            "`web`, `pos`, `csv_import`."
+        ),
+        examples=["web"],
+    )
+    Devices: List[DeviceModel] = Field(
+        ...,
+        description="**Mandatory.** One or more devices to register in a single call.",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "clientkey": "acme_uk_live",
+                "locale": "en_GB",
+                "source": "web",
+                "Devices": [
+                    {
+                        "Identifiers": {
+                            "GTIN": "5011773057240",
+                            "make": "Bosch",
+                            "model": "SMS6ZCI00G",
+                            "SKU": "",
+                            "title": "",
+                            "category": "",
+                            "gtee_parts": "",
+                            "gtee_labour": "",
+                            "promo": "",
+                        },
+                        "Unique_Parameters": {
+                            "MAC": "",
+                            "serial": "SN-8841203",
+                            "imei": "",
+                            "purchase_date": "2025-05-01",
+                            "price": 449.99,
+                            "client_ref": "ORD-2026-00918",
+                        },
+                    }
+                ],
+            }
+        }
+    }
 
 def valid_value(val):
     return val is not None and str(val).strip() != "" and str(val).strip().lower() != "string"
@@ -144,8 +299,68 @@ def price_is_missing(val):
         return True
 # ------------------------------------------------------------
 
-@router.post("/device-register")
+@router.post(
+    "/device-register",
+    summary="Register a batch of devices for a client tenant",
+    response_description="One outcome entry per device, in the order submitted.",
+    responses=secured({
+        200: json_response(
+            "The batch was processed. Inspect each entry: a device may be newly registered, "
+            "recognised as a duplicate, or rejected — all three appear here with HTTP 200.",
+            {
+                "inserted": [
+                    {"deviceId": "6820f1c9a4b21d0f8c9e4471", "skuStatus": "matched"},
+                    {
+                        "deviceId": "6820f1c9a4b21d0f8c9e4470",
+                        "skuStatus": "duplicate record found",
+                        "matched_field": "make/model/serial",
+                        "matched_value": "Bosch / SMS6ZCI00G / SN-8841203",
+                    },
+                    {
+                        "skuStatus": "error",
+                        "detail": "Device enrichment did not find a matching CustomSKU or MasterSKU. No document created.",
+                        "Identifiers": {"GTIN": "0000000000000", "make": "", "model": ""},
+                        "Unique_Parameters": {"serial": "SN-0000001", "price": 0},
+                        "registeredAt": "2026-08-06T10:14:52.113000Z",
+                    },
+                ],
+                "count": 3,
+            },
+        ),
+        400: error(
+            "A mandatory top-level field was blank or a placeholder, the `clientkey` is not a "
+            "known client, or the `locale` is not supported.",
+            "Invalid clientkey.",
+        ),
+    }),
+)
 def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_token)):
+    """
+    Register one or more devices against a client tenant, enriching each from the SKU catalogue.
+
+    **Per device the endpoint:**
+
+    1. **Checks for duplicates**, in this order — `imei`, then `MAC`, then `make`+`model`+`serial`,
+       then `GTIN`+`serial`. A hit returns the existing `deviceId` with
+       `skuStatus: "duplicate record found"` plus the `matched_field` that caught it; nothing new
+       is stored.
+    2. **Validates identification** — a usable `GTIN` (not `"0"`), or `make` **and** `model`, or a
+       `SKU`. Failing this returns `skuStatus: "error"` for that device only.
+    3. **Enriches from the catalogue** — resolves a CustomSKU for this client and locale, then its
+       MasterSKU, and back-fills any blank identifier (title, category, guarantees) from them. A
+       device that matches neither is **not stored** and comes back as `skuStatus: "error"`.
+    4. **Resolves the price** — the submitted `price`, else the CustomSKU `MSRP`, else the
+       MasterSKU `Price`, else `0`. Currency always comes from `Locale_Params`, never the caller.
+
+    **Partial success is normal.** The call returns `200` as long as the tenant and locale are
+    valid; individual failures are reported per device inside `inserted`. `count` is the length of
+    that array — the number of devices *processed*, not the number stored. Devices are stored with
+    `registrationStatus: "unassigned"`; assign cover with
+    `GET /assign_product_for_device/{device_id}`.
+
+    A `400` means nothing at all was processed: a blank mandatory field, an unknown `clientkey`,
+    or an unsupported `locale`.
+    """
     validate_mandatory_fields(payload)
 
     # 1. Lookup client document by clientkey (MUST match exactly)
