@@ -55,6 +55,15 @@ def get_product_groups(session: requests.Session) -> list[dict]:
     return _get(session, f"{BASE_URL}/product-groups")
 
 
+def fetch_product(session: requests.Session, ern: str) -> dict | None:
+    """Fetch a single product by EPREL registration number, or None if unknown."""
+    try:
+        return _get(session, f"{BASE_URL}/product/{ern}")
+    except requests.RequestException:
+        logger.info("EPREL has no product for registration number %s", ern)
+        return None
+
+
 def scrape_group(session: requests.Session, url_code: str, manufacturer: str, delay: float = 0.5) -> list[dict]:
     """Page through one product group and return every matching model."""
     hits: list[dict] = []
