@@ -300,8 +300,10 @@ def _synthetic_request() -> Request:
         "method": "POST",
         "path": "/",
         "headers": [],
-        "scheme": "https",
-        "server": ("localhost", 80),
+        # Matches the codebase's localhost fallback, so masked URLs built from
+        # this request look the same as everywhere else when no base URL is set.
+        "scheme": "http",
+        "server": ("localhost", 8000),
         "query_string": b"",
         "root_path": "",
     })

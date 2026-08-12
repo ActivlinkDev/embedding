@@ -45,9 +45,15 @@ db = client[os.getenv("MONGO_DB", "Activlink")]
 products_collection = db["EPREL_Products"]
 jobs_collection = db["EPREL_ImportJobs"]
 category_map_collection = db["EPREL_Category_Map"]
-category_collection = db["Category"]
-locale_collection = db["Locale_Params"]
-client_collection = db["ClientKey"]
+
+# Validation must read the same collections the create flow writes through, so
+# pre-flight checks can never pass against a different database than the one
+# receiving the catalog records. The SKU services own these handles.
+from routers.sku.create_custom_sku import (  # noqa: E402
+    client_collection,
+    locale_collection,
+)
+from routers.sku.create_master_sku import category_collection  # noqa: E402
 
 # Outcome buckets recorded per (record, locale).
 CREATED = "created"
@@ -159,7 +165,10 @@ def import_record(payload: ImportRequest):
     ern = payload.eprelRegistrationNumber.strip()
     doc = products_collection.find_one({"eprelRegistrationNumber": ern})
     if not doc:
-        live = eprel.fetch_product(eprel.make_session(), ern)
+        try:
+            live = eprel.fetch_product(eprel.make_session(), ern)
+        except Exception as exc:  # noqa: BLE001 - an outage is not a missing record
+            raise HTTPException(status_code=502, detail=f"EPREL unreachable: {exc}")
         if not live:
             raise HTTPException(status_code=404, detail=f"EPREL registration number {ern} not found.")
         group = live.get("productGroup") or ""
