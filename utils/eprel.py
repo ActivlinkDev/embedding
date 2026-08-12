@@ -41,7 +41,10 @@ def _get(session: requests.Session, url: str, params: dict | None = None) -> dic
                 return resp.json()
             if resp.status_code in (429, 500, 502, 503, 504):
                 raise requests.RequestException(f"HTTP {resp.status_code}")
+            # Anything else (404, 403, ...) will not change on a retry.
             resp.raise_for_status()
+        except requests.HTTPError:
+            raise
         except requests.RequestException as exc:
             if attempt == MAX_RETRIES:
                 raise
@@ -53,6 +56,22 @@ def _get(session: requests.Session, url: str, params: dict | None = None) -> dic
 
 def get_product_groups(session: requests.Session) -> list[dict]:
     return _get(session, f"{BASE_URL}/product-groups")
+
+
+def fetch_product(session: requests.Session, ern: str) -> dict | None:
+    """Fetch a single product by EPREL registration number.
+
+    Returns None only when EPREL genuinely has no such registration number.
+    Transport failures and server errors propagate, so an upstream outage is
+    never reported to callers as a missing record.
+    """
+    try:
+        return _get(session, f"{BASE_URL}/product/{ern}")
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            logger.info("EPREL has no product for registration number %s", ern)
+            return None
+        raise
 
 
 def scrape_group(session: requests.Session, url_code: str, manufacturer: str, delay: float = 0.5) -> list[dict]:
