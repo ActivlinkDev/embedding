@@ -27,7 +27,7 @@ import os
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from .product_assignment import (
-    product_assignment,
+    assign_products,
     ProductAssignmentRequest,
     calculate_age_in_months,
 )
@@ -223,7 +223,7 @@ def compute_options(payload: WidgetPriceRequest):
 
 def _compute_options_from_assignment(assignment_request, age_in_months):
     """Run assignment + rating from already-resolved inputs. Returns (grouped, bracket, currency)."""
-    assignment_result = product_assignment(assignment_request)
+    assignment_result = assign_products(assignment_request)
     products = assignment_result.get("products") or []
     if not products:
         return [], None, assignment_request.currency
@@ -231,9 +231,8 @@ def _compute_options_from_assignment(assignment_request, age_in_months):
     requests: List[RateReqModel] = []
     for prod in products:
         product_id = prod["productId"]
-        poc = prod.get("POC", {})
-        mode = poc.get("mode")
-        for duration in poc.get("durationMonths", []):
+        mode = prod.get("mode")
+        for duration in prod.get("terms", []):
             requests.append(RateReqModel(
                 product_id=product_id,
                 currency=assignment_request.currency,

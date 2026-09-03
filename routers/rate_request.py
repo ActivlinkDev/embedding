@@ -2,8 +2,10 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from utils.api_docs import error, json_response, secured
+from utils.category_tree import resolve as resolve_category
 from utils.dependencies import verify_token
 from datetime import datetime
+import logging
 import os
 import re
 from typing import List, Optional
@@ -17,6 +19,31 @@ error_log_collection = db["Error_Log_RateRequest"]
 stripe_payment_collection = db["Stripe_Price_ID"]
 quotes_collection = db["Quotes"]
 error_log_stripe_collection = db["Error_Log_Stripe"]
+
+# Rating rows name a category, its group or its sector. The most precise row wins.
+CATEGORY_LEVEL_RANK = {"category": 3, "group": 2, "sector": 1}
+
+
+_indexes_ready = False
+
+
+def _ensure_indexes() -> None:
+    """Index the fields the rating lookup filters on.
+
+    Called from the query path, not at import — see the note in
+    ``product_assignment._ensure_indexes``.
+    """
+    global _indexes_ready
+    if _indexes_ready:
+        return
+    _indexes_ready = True
+    try:
+        ratings.create_index(
+            [("currency", 1), ("products", 1), ("status", 1)],
+            name="rating_lookup",
+        )
+    except Exception:
+        logging.getLogger(__name__).exception("[rating] could not create the lookup index")
 
 # --- Models ---
 
@@ -125,18 +152,53 @@ class RateRequestBatch(BaseModel):
 def normalize(s):
     return re.sub(r'\W+', '', (s or '')).strip().lower()
 
-def find_price_factor(price_factor_list, price):
-    for pf in price_factor_list:
-        if pf["priceLow"] <= price <= pf["priceHigh"]:
-            return pf["factor"]
+# Age, price and multi-device factors are all bands: a list of
+# {min, max, factor} rows covering a range of values. A value outside every band
+# has no factor, which fails the whole rating document rather than pricing the
+# line without that adjustment.
+def find_band(bands, value, low_key="min", high_key="max"):
+    """The factor for the first band containing `value`, or None."""
+    for band in bands or []:
+        low = band.get(low_key)
+        high = band.get(high_key)
+        if low is None or high is None:
+            continue
+        if low <= value <= high:
+            return band.get("factor")
     return None
 
+
+def find_price_factor(price_factor_list, price):
+    return find_band(price_factor_list, price)
+
+
 def find_price_bracket(price_factor_list, price):
-    """Return (priceLow, priceHigh) for the bracket containing `price`, or None."""
-    for pf in price_factor_list:
-        if pf["priceLow"] <= price <= pf["priceHigh"]:
-            return (pf["priceLow"], pf["priceHigh"])
+    """Return (min, max) for the price band containing `price`, or None."""
+    for pf in price_factor_list or []:
+        if pf.get("min") is not None and pf.get("max") is not None:
+            if pf["min"] <= price <= pf["max"]:
+                return (pf["min"], pf["max"])
     return None
+
+
+def find_category_factor(category_factor_list, category):
+    """The factor for a category, matched at the most precise level available.
+
+    Rows carry a `level` of `category`, `group` or `sector`. The device's
+    category is resolved through the taxonomy, then the most specific matching
+    row wins — so a sector row can set a default and a category row override it.
+    """
+    placement = resolve_category(category)
+    best_rank, best_factor = 0, None
+    for row in category_factor_list or []:
+        level = row.get("level")
+        rank = CATEGORY_LEVEL_RANK.get(level)
+        if not rank or rank <= best_rank:
+            continue
+        mine = placement.get(level)
+        if mine and normalize(row.get("value", "")) == normalize(mine):
+            best_rank, best_factor = rank, row.get("factor")
+    return best_factor
 
 def round_price_49_99(value):
     cents = round(value % 1, 2)
@@ -155,25 +217,20 @@ def match_with_reasons(doc, payload):
 
     if doc.get("currency") != payload.currency:
         reasons.append(f"currency '{payload.currency}' not matched")
-    if payload.product_id not in doc.get("productID", []):
-        reasons.append(f"product_id '{payload.product_id}' not in productID")
+    if payload.product_id not in doc.get("products", []):
+        reasons.append(f"product_id '{payload.product_id}' not in products")
     if not any(normalize(lf.get("locale", "")) == normalize(payload.locale) for lf in doc.get("localeFactor", [])):
         reasons.append(f"locale '{payload.locale}' not matched in localeFactor")
     if str(payload.poc) not in doc.get("pocFactor", {}):
         reasons.append(f"poc '{payload.poc}' not found in pocFactor")
-    if not any(normalize(cf.get("device", "")) == normalize(payload.category) for cf in doc.get("categoryFactor", [])):
+    if find_category_factor(doc.get("categoryFactor", []), payload.category) is None:
         reasons.append(f"category '{payload.category}' not matched in categoryFactor")
-    if str(payload.age) not in doc.get("ageFactor", {}):
-        reasons.append(f"age '{payload.age}' not found in ageFactor")
-    price_match = False
-    for pf in doc.get("priceFactor", []):
-        if pf["priceLow"] <= payload.price <= pf["priceHigh"]:
-            price_match = True
-            break
-    if not price_match:
-        reasons.append(f"price '{payload.price}' not in any priceFactor range")
-    if str(payload.multi_count) not in doc.get("multiFactor", {}):
-        reasons.append(f"multi_count '{payload.multi_count}' not found in multiFactor")
+    if find_band(doc.get("ageFactor", []), payload.age, "minMonths", "maxMonths") is None:
+        reasons.append(f"age '{payload.age}' not in any ageFactor band")
+    if find_price_factor(doc.get("priceFactor", []), payload.price) is None:
+        reasons.append(f"price '{payload.price}' not in any priceFactor band")
+    if find_band(doc.get("multiFactor", []), payload.multi_count) is None:
+        reasons.append(f"multi_count '{payload.multi_count}' not in any multiFactor band")
 
     return len(reasons) == 0, reasons
 
@@ -224,7 +281,7 @@ def price_and_group(requests: List[RateRequest], log_errors: bool = True):
     whether to store the result in `Quotes`.
 
     Returns a tuple ``(grouped, price_bracket)`` where ``price_bracket`` is the
-    narrowest ``(priceLow, priceHigh)`` range that contains the request price
+    narrowest ``(min, max)`` price band that contains the request price
     across all successfully-priced options (used for cache keying), or ``None``.
     """
     enriched_results = []
@@ -256,8 +313,18 @@ def price_and_group(requests: List[RateRequest], log_errors: bool = True):
             failure_reasons = []
             matching_doc = None
 
-            # Only filter by product_id and currency initially (so we can gather field errors)
-            for doc in ratings.find({"currency": req.currency, "productID": {"$in": [req.product_id]}}):
+            # Scope to the caller's client and channel, then gather field errors from
+            # whichever of their tables carry this product. `client`, `source` and
+            # `mode` were previously accepted and ignored, so any table could price
+            # any client's assignment.
+            rating_query = {
+                "currency": req.currency,
+                "products": {"$in": [req.product_id]},
+                "status": "active",
+                "who": {"$elemMatch": {"client": req.client, "source": req.source}},
+            }
+            _ensure_indexes()
+            for doc in ratings.find(rating_query):
                 matched, reasons = match_with_reasons(doc, req)
                 if matched:
                     matching_doc = doc
@@ -292,14 +359,10 @@ def price_and_group(requests: List[RateRequest], log_errors: bool = True):
                 None
             )
             poc_factor = matching_doc.get("pocFactor", {}).get(str(req.poc))
-            category_factor = next(
-                (f["factor"] for f in matching_doc.get("categoryFactor", [])
-                 if normalize(f["device"]) == normalize(req.category)),
-                None
-            )
-            age_factor = matching_doc.get("ageFactor", {}).get(str(req.age))
+            category_factor = find_category_factor(matching_doc.get("categoryFactor", []), req.category)
+            age_factor = find_band(matching_doc.get("ageFactor", []), req.age, "minMonths", "maxMonths")
             price_factor = find_price_factor(matching_doc.get("priceFactor", []), req.price)
-            multi_factor = matching_doc.get("multiFactor", {}).get(str(req.multi_count))
+            multi_factor = find_band(matching_doc.get("multiFactor", []), req.multi_count)
 
             rate = round(base_fee * locale_factor * poc_factor * category_factor * age_factor * price_factor * multi_factor, 2)
             rounded_price = round_price_49_99(rate)

@@ -6,7 +6,7 @@ from datetime import datetime
 
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
-from .product_assignment import product_assignment, ProductAssignmentRequest
+from .product_assignment import assign_products, ProductAssignmentRequest
 
 router = APIRouter(tags=["Assignments"])
 
@@ -166,14 +166,14 @@ def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
     )
 
     # 4. Call the assignment logic
-    assignment_result = product_assignment(req_payload)
+    assignment_result = assign_products(req_payload)
 
     # 5. Flatten products into the new array format
     product_list = []
     for prod in assignment_result.get("products", []):
         product_id = prod["productId"]
-        mode = prod["POC"]["mode"]
-        for duration in prod["POC"]["durationMonths"]:
+        mode = prod.get("mode")
+        for duration in prod.get("terms", []):
             product_entry = {
                 "product_id": product_id,
                 "currency": assignment_result["input"]["currency"],
@@ -195,7 +195,7 @@ def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
         error_detail = {
             "message": "No products found for this device.",
             "device_id": device_id,
-            "original_inputs": req_payload.dict(),
+            "original_inputs": req_payload.model_dump(),
             "match_diagnostics": diagnostics,
             "assignment_details": assignment_result.get("details", []),
         }
@@ -210,7 +210,7 @@ def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
     distinct_product_ids = list({prod["product_id"] for prod in product_list})
 
     return {
-        "Inputs": req_payload.dict(),
+        "Inputs": req_payload.model_dump(),
         "Products": product_list,
         "DistinctProductIds": distinct_product_ids
     }
