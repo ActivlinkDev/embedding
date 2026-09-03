@@ -50,6 +50,40 @@ class RuleResult(BaseModel):
     )
 
 
+class NextReward(BaseModel):
+    """The nearest unearned discount — what the customer would get by adding one more line.
+
+    Rules are evaluated against the basket as it stands; this looks one step ahead so a
+    storefront can nudge ("add one more device and save 10%") instead of silently pricing
+    what is already there. `null` when nothing is within reach.
+    """
+
+    rule_id: str = Field(..., description="Id of the rule that would apply.", examples=["68c0a1b2c3d4e5f6a7b8c9d0"])
+    name: str = Field(..., description="Human-readable rule name, suitable for showing a customer.", examples=["Multi-device 10% off"])
+    rule_type: str = Field(..., description="The kind of rule, e.g. `TIERED_PERCENT`.", examples=["TIERED_PERCENT"])
+    items_needed: int = Field(
+        ...,
+        ge=1,
+        description="How many more qualifying lines the basket needs before this rule applies.",
+        examples=[1],
+    )
+    percent_off: Optional[int] = Field(
+        None,
+        description="Percentage that would come off, for `TIERED_PERCENT` rules.",
+        examples=[10],
+    )
+    bundle_size: Optional[int] = Field(
+        None,
+        description="Bundle size that would be reached, for `FIXED_PRICE_BUNDLE` rules.",
+        examples=[3],
+    )
+    bundle_price_pence: Optional[int] = Field(
+        None,
+        description="What that bundle would cost in minor units, for `FIXED_PRICE_BUNDLE` rules.",
+        examples=[9999],
+    )
+
+
 class RateBasketResponse(BaseModel):
     """The basket's totals and the discount rules considered. All amounts are in minor units."""
 
@@ -64,6 +98,13 @@ class RateBasketResponse(BaseModel):
         description="The single rule applied. `null` when no rule produced a discount — **rules do not stack**.",
     )
     final_total: int = Field(..., description="`subtotal` minus the best discount, never below `0`.", examples=[13583])
+    next_reward: Optional[NextReward] = Field(
+        None,
+        description=(
+            "The closest discount the basket has **not** earned yet, so the storefront can show a "
+            "\"add one more and save\" nudge. `null` when no rule is within reach."
+        ),
+    )
 
 
 # ---- helpers ----
@@ -300,6 +341,87 @@ def _apply_fixed_price_bundle(rule: Dict[str, Any], items: List[Dict[str, Any]])
 
     return total_discount, "; ".join(parts)
 
+def _largest_group_count(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> int:
+    """Size of the biggest constraint-group in `items` — the group nearest to qualifying."""
+    constraints = rule.get("constraints", {}) or {}
+    groups: Dict[Tuple, int] = {}
+    for it in items:
+        k = _group_key(it, constraints)
+        groups[k] = groups.get(k, 0) + 1
+    return max(groups.values()) if groups else 0
+
+
+def _next_reward_for_rule(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> Optional[NextReward]:
+    """How close this rule is to applying, from the perspective of its biggest group.
+
+    Returns `None` when the rule already applies at its best tier, when it cannot apply at
+    all, or when the rule type has no notion of "one more item".
+    """
+    matched = [it for it in items if _match_applies_to(rule, it)]
+    count = _largest_group_count(rule, matched)
+    rkind = (rule.get("ruleType") or "").strip().upper()
+    params = rule.get("ruleParams", {}) or {}
+    base = {
+        "rule_id": str(rule.get("_id")),
+        "name": rule.get("name", ""),
+        "rule_type": rule.get("ruleType") or "",
+    }
+
+    if rkind == "TIERED_PERCENT":
+        tiers = sorted(params.get("tiers", []) or [], key=lambda t: _as_int(t.get("minItems", 0), 0))
+        earned = max(
+            [_as_int(t.get("percentOff", 0), 0) for t in tiers if count >= _as_int(t.get("minItems", 0), 0)],
+            default=0,
+        )
+        for t in tiers:
+            need = _as_int(t.get("minItems", 0), 0) - count
+            percent = _as_int(t.get("percentOff", 0), 0)
+            # The first tier out of reach that beats what the basket already earns.
+            if need > 0 and percent > earned:
+                return NextReward(**base, items_needed=need, percent_off=percent)
+        return None
+
+    if rkind == "FIXED_PRICE_BUNDLE":
+        bundles_cfg = params.get("bundles")
+        if isinstance(bundles_cfg, list) and bundles_cfg:
+            tiers = [
+                (_as_int((b or {}).get("bundleSize", 0), 0), _as_int((b or {}).get("fixedPricePence", 0), 0))
+                for b in bundles_cfg
+            ]
+        else:
+            tiers = [(
+                _as_int(params.get("bundleSize", 0), 0),
+                _as_int(params.get("fixedPricePence", 0), 0),
+            )]
+        # Smallest bundle the basket cannot fill yet.
+        candidates = sorted(
+            [(bs, fp) for bs, fp in tiers if bs > 0 and fp > 0 and bs > count],
+            key=lambda t: t[0],
+        )
+        if candidates:
+            bs, fp = candidates[0]
+            return NextReward(**base, items_needed=bs - count, bundle_size=bs, bundle_price_pence=fp)
+        return None
+
+    return None
+
+
+def _best_next_reward(rules: List[Dict[str, Any]], items: List[Dict[str, Any]]) -> Optional[NextReward]:
+    """The most attainable unearned reward: fewest extra lines, then highest rule priority."""
+    found: List[Tuple[int, int, NextReward]] = []
+    for rule in rules:
+        try:
+            nr = _next_reward_for_rule(rule, items)
+        except Exception:
+            nr = None
+        if nr is not None:
+            found.append((nr.items_needed, -_as_int(rule.get("priority", 0), 0), nr))
+    if not found:
+        return None
+    found.sort(key=lambda t: (t[0], t[1]))
+    return found[0][2]
+
+
 def _evaluate_rule(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> RuleResult:
     # Filter items that match appliesTo
     matched = [it for it in items if _match_applies_to(rule, it)]
@@ -365,6 +487,15 @@ def _evaluate_rule(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> RuleRes
                     "explanation": "2 qualifying devices — 10% off",
                 },
                 "final_total": 13583,
+                "next_reward": {
+                    "rule_id": "68c0a1b2c3d4e5f6a7b8c9d1",
+                    "name": "Three or more devices — 15% off",
+                    "rule_type": "TIERED_PERCENT",
+                    "items_needed": 1,
+                    "percent_off": 15,
+                    "bundle_size": None,
+                    "bundle_price_pence": None,
+                },
             },
         ),
         400: error("`basket_id` is not a valid 24-character ObjectId.", "Invalid basket_id; must be a valid ObjectId string"),
@@ -382,6 +513,10 @@ def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
 
     All amounts are in **minor units** — pence or cents — so `14298` means £142.98. `final_total`
     is floored at `0`.
+
+    `next_reward` looks one step ahead: it is the nearest discount the basket has **not** earned,
+    with how many more qualifying lines it needs. Use it to show an "add one more device and save"
+    nudge. It is `null` when no rule is within reach.
 
     Lines missing a `client` or `locale` inherit them from the basket root before rules are
     matched, so a line added without them still qualifies.
@@ -429,6 +564,13 @@ def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
     discount = best.discount if best else 0
     final_total = max(0, subtotal_pence - discount)
 
+    # Look one step ahead so the basket page can nudge ("add one more and save 10%").
+    # Never blocks pricing: a misconfigured rule just means no nudge.
+    try:
+        next_reward = _best_next_reward(rules, items_for_rules)
+    except Exception:
+        next_reward = None
+
     # Determine mode summary (single mode or 'mixed')
     modes = {it.get("mode") for it in items if it.get("mode") is not None}
     mode_value = next(iter(modes)) if len(modes) == 1 else "mixed"
@@ -443,6 +585,7 @@ def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
                     "final_total": int(final_total),
                     "discount": int(discount),
                     "best_rule": best.dict() if best else None,
+                    "next_reward": next_reward.dict() if next_reward else None,
                     "mode": mode_value,
                 }
             }
@@ -457,4 +600,5 @@ def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
         eligible_rules=results,
         best=best,
         final_total=int(final_total),
+        next_reward=next_reward,
     )
