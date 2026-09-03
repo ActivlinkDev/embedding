@@ -137,6 +137,38 @@ class AddToBasketRequest(BaseModel):
     }
 
 
+MIXED_MODE_DETAIL = (
+    "A basket is charged by a single Stripe Checkout Session, which is either one-off "
+    "(`payment`) or recurring (`subscription`) — never both. Check this basket out first, "
+    "then start a new one for the other kind of cover."
+)
+
+
+def assert_no_mode_conflict(existing_items: List[Dict[str, Any]], new_mode: Optional[str]) -> None:
+    """Refuse a line whose billing mode clashes with what the basket already holds.
+
+    Checkout can only send one mode to Stripe, so a mixed basket has no correct
+    outcome — it either bills a monthly plan once or a one-off plan forever.
+    Rejecting it here means the customer finds out while adding cover rather than
+    at the payment step, where they have already committed.
+
+    Lines with no `mode` are ignored: they predate the field and cannot be shown
+    to conflict with anything.
+    """
+    if not new_mode:
+        return
+    existing_modes = {it.get("mode") for it in existing_items if it.get("mode")}
+    conflicting = sorted(existing_modes - {new_mode})
+    if conflicting:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot add a '{new_mode}' line to a basket that already holds "
+                f"{' and '.join(repr(m) for m in conflicting)} cover. " + MIXED_MODE_DETAIL
+            ),
+        )
+
+
 def _serialize_basket_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     """Make Mongo document JSON-serializable (ObjectId -> str, datetime -> iso)."""
     out = dict(doc)
@@ -189,6 +221,11 @@ def _serialize_basket_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
             "product_id is required when add_to_basket=true",
         ),
         404: error("The quote does not exist, or that `product_id` is not in it.", "Product not found in quote responses"),
+        409: error(
+            "The line's billing mode clashes with what the basket already holds. One-off and "
+            "recurring cover cannot share a basket, because checkout sends Stripe a single mode.",
+            "Cannot add a 'subscription' line to a basket that already holds 'payment' cover.",
+        ),
         500: error("The basket could not be written.", "Failed to upsert basket"),
     }),
 )
@@ -209,6 +246,12 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
     it to append to an existing one. Every add re-rates the whole basket, so `subtotal`,
     `discount`, `final_total` and `best_rule` in the response are current — multi-device
     discounts appear as soon as the second line lands.
+
+    **One billing mode per basket.** A purchase line whose `mode` clashes with the lines already
+    in the basket is rejected with `409` — one-off (`payment`) and recurring (`subscription`)
+    cover cannot be bought together, because checkout hands Stripe a single mode for the whole
+    basket. Check the current basket out first, then start a new one for the other kind. Skipped
+    entries are unaffected; nothing is charged for them.
 
     Make and model are resolved in order: what you send, then the quote, then the registered
     device. Each line gets a `line_id`, which is the precise handle for
@@ -340,6 +383,10 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
         if payload.add_to_basket is False:
             update = {"$push": {"skipped_items": skipped_item}}
         else:
+            existing = basket_collection.find_one({"_id": bid}, {"Basket.mode": 1})
+            if not existing:
+                raise HTTPException(status_code=404, detail="Basket not found for provided basket_id")
+            assert_no_mode_conflict(existing.get("Basket") or [], basket_item.get("mode"))
             update = {"$push": {"Basket": basket_item}}
 
         result = basket_collection.find_one_and_update(
