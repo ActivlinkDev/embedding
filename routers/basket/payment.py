@@ -159,6 +159,12 @@ def _collect_product_images(items: list[dict[str, Any]], limit: int = 6) -> List
             "Basket is empty",
         ),
         404: error("No basket with this id.", "Basket not found"),
+        409: error(
+            "The basket holds both one-off and recurring lines. Stripe takes a single mode per "
+            "session, so the two kinds must be checked out separately.",
+            "Basket holds both 'payment' and 'subscription' cover, which cannot be charged in one "
+            "Stripe Checkout Session.",
+        ),
         500: error("Stripe session creation failed.", "Internal error during Stripe session creation: ..."),
     }),
 )
@@ -175,6 +181,11 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
     Currency, locale and Stripe mode are taken from the basket lines, defaulting to `gbp` and
     `payment`. The basket id is passed as `internal_reference` and repeated in the metadata
     alongside client and source, so the webhook can reconcile the payment to the basket.
+
+    **One mode per basket.** A session carries a single mode, so a basket mixing one-off
+    (`payment`) and recurring (`subscription`) lines is rejected with `409` rather than charged
+    under whichever mode happens to win. `POST /basket/add` blocks the mix at source; this is the
+    backstop for baskets built before that rule.
 
     `success_url` and `cancel_url` **should be supplied** — the built-in fallbacks are
     placeholders and will send customers somewhere unhelpful.
@@ -221,7 +232,21 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
     # 3) Currency/locale/mode
     currency = _extract_currency(items)
     locale = _extract_locale(items)
-    mode_value = basket.get("mode") or (items[0].get("mode") if items else "payment")
+    # Stripe takes one mode for the whole session. `POST /basket/add` refuses to build a mixed
+    # basket, but baskets predating that rule still exist, so refuse here too rather than
+    # falling back to `payment` and billing a monthly plan as a single charge.
+    line_modes = {it.get("mode") for it in items if it.get("mode")}
+    if len(line_modes) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Basket holds both {' and '.join(repr(m) for m in sorted(line_modes))} cover, "
+                "which cannot be charged in one Stripe Checkout Session. Remove one kind and "
+                "check the other out separately."
+            ),
+        )
+    # The line modes are the truth; the root `mode` can be stale after a delete.
+    mode_value = next(iter(line_modes), None) or basket.get("mode") or "payment"
     try:
         mode_enum = ModeEnum(mode_value)
     except Exception:

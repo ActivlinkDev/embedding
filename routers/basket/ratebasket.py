@@ -50,6 +50,40 @@ class RuleResult(BaseModel):
     )
 
 
+class NextReward(BaseModel):
+    """The nearest unearned discount — what the customer would get by adding one more line.
+
+    Rules are evaluated against the basket as it stands; this looks one step ahead so a
+    storefront can nudge ("add one more device and save 10%") instead of silently pricing
+    what is already there. `null` when nothing is within reach.
+    """
+
+    rule_id: str = Field(..., description="Id of the rule that would apply.", examples=["68c0a1b2c3d4e5f6a7b8c9d0"])
+    name: str = Field(..., description="Human-readable rule name, suitable for showing a customer.", examples=["Multi-device 10% off"])
+    rule_type: str = Field(..., description="The kind of rule, e.g. `TIERED_PERCENT`.", examples=["TIERED_PERCENT"])
+    items_needed: int = Field(
+        ...,
+        ge=1,
+        description="How many more qualifying lines the basket needs before this rule applies.",
+        examples=[1],
+    )
+    percent_off: Optional[int] = Field(
+        None,
+        description="Percentage that would come off, for `TIERED_PERCENT` rules.",
+        examples=[10],
+    )
+    bundle_size: Optional[int] = Field(
+        None,
+        description="Bundle size that would be reached, for `FIXED_PRICE_BUNDLE` rules.",
+        examples=[3],
+    )
+    bundle_price_pence: Optional[int] = Field(
+        None,
+        description="What that bundle would cost in minor units, for `FIXED_PRICE_BUNDLE` rules.",
+        examples=[9999],
+    )
+
+
 class RateBasketResponse(BaseModel):
     """The basket's totals and the discount rules considered. All amounts are in minor units."""
 
@@ -64,6 +98,13 @@ class RateBasketResponse(BaseModel):
         description="The single rule applied. `null` when no rule produced a discount — **rules do not stack**.",
     )
     final_total: int = Field(..., description="`subtotal` minus the best discount, never below `0`.", examples=[13583])
+    next_reward: Optional[NextReward] = Field(
+        None,
+        description=(
+            "The closest discount the basket has **not** earned yet, so the storefront can show a "
+            "\"add one more and save\" nudge. `null` when no rule is within reach."
+        ),
+    )
 
 
 # ---- helpers ----
@@ -300,6 +341,162 @@ def _apply_fixed_price_bundle(rule: Dict[str, Any], items: List[Dict[str, Any]])
 
     return total_discount, "; ".join(parts)
 
+def _pick_best(results: List[RuleResult]) -> Optional[RuleResult]:
+    """The single winning rule: largest discount, `priority` breaking ties.
+
+    Shared by pricing and by the look-ahead below, so a nudge can never promise a
+    rule that the real selection would not pick.
+    """
+    for r in sorted(results, key=lambda rr: (-rr.discount, -rr.priority)):
+        if r.discount > 0:
+            return r
+    return None
+
+
+def _hypothetical_line(items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A stand-in for the line a customer could add next.
+
+    It is a copy of an existing line, which matters twice over. Constraint groups
+    (same term, same category, same mode) are inherited, so the simulated basket
+    groups the way a real addition would. And billing mode is inherited, so a rule
+    restricted to the mode this basket cannot accept — `POST /basket/add` rejects
+    that mix with 409 — matches nothing and can never be advertised.
+
+    The cheapest line is chosen deliberately. For a fixed-price bundle the discount
+    is `sum(block) - fixedPrice`, so a cheap addition is the case least likely to
+    improve it: if the look-ahead still finds a gain, a dearer addition also earns
+    one. Promising less than the customer gets is the safe direction to be wrong in.
+    """
+    priced = [it for it in items if _price_pence(it) > 0]
+    if priced:
+        return dict(min(priced, key=_price_pence))
+    return dict(items[0]) if items else None
+
+
+def _reward_shape(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The presentational half of a reward: the percentage or bundle to name.
+
+    Whether the reward is real is settled by the simulation; this only describes it.
+    Anything it cannot determine is left unset rather than guessed.
+    """
+    matched = [it for it in items if _match_applies_to(rule, it)]
+    constraints = rule.get("constraints", {}) or {}
+    groups: Dict[Tuple, int] = {}
+    for it in matched:
+        k = _group_key(it, constraints)
+        groups[k] = groups.get(k, 0) + 1
+    count = max(groups.values()) if groups else 0
+
+    rkind = (rule.get("ruleType") or "").strip().upper()
+    params = rule.get("ruleParams", {}) or {}
+
+    if rkind == "TIERED_PERCENT":
+        reached = [
+            _as_int(t.get("percentOff", 0), 0)
+            for t in (params.get("tiers", []) or [])
+            if count >= _as_int(t.get("minItems", 0), 0)
+        ]
+        return {"percent_off": max(reached)} if reached else {}
+
+    if rkind == "FIXED_PRICE_BUNDLE":
+        bundles_cfg = params.get("bundles")
+        if isinstance(bundles_cfg, list) and bundles_cfg:
+            tiers = [
+                (_as_int((b or {}).get("bundleSize", 0), 0), _as_int((b or {}).get("fixedPricePence", 0), 0))
+                for b in bundles_cfg
+            ]
+        else:
+            tiers = [(
+                _as_int(params.get("bundleSize", 0), 0),
+                _as_int(params.get("fixedPricePence", 0), 0),
+            )]
+        # The largest bundle the simulated basket actually fills.
+        filled = [(bs, fp) for bs, fp in tiers if bs > 0 and fp > 0 and bs <= count]
+        if filled:
+            bs, fp = max(filled, key=lambda t: t[0])
+            return {"bundle_size": bs, "bundle_price_pence": fp}
+        return {}
+
+    return {}
+
+
+# How many extra lines to look ahead. Past this a nudge stops reading as an offer
+# and starts reading as a demand.
+MAX_LOOKAHEAD = 3
+
+
+def _price_all(items: List[Dict[str, Any]]) -> int:
+    return sum(_price_pence(it) for it in items)
+
+
+def _safe_evaluate(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> Optional[RuleResult]:
+    """Evaluate a rule, treating a misconfigured one as simply not applying.
+
+    Pricing lets such a rule raise; a nudge is a nicety and must not.
+    """
+    try:
+        return _evaluate_rule(rule, items)
+    except Exception:
+        return None
+
+
+def _best_offer(rules: List[Dict[str, Any]], items: List[Dict[str, Any]]) -> Optional[RuleResult]:
+    return _pick_best([r for r in (_safe_evaluate(rule, items) for rule in rules) if r is not None])
+
+
+def _best_next_reward(
+    rules: List[Dict[str, Any]],
+    items: List[Dict[str, Any]],
+    max_lookahead: int = MAX_LOOKAHEAD,
+) -> Optional[NextReward]:
+    """The nearest addition that would get the customer a better deal than they have.
+
+    Rather than reason about tiers and bundle sizes a second time — which drifts
+    from what `_evaluate_rule` does, and did — this adds hypothetical lines and
+    prices the basket again for real. Whatever the evaluator honours is honoured
+    here too: `minItems` floors, repeat bundles and their caps, group constraints,
+    and the fact that only one rule ever wins.
+
+    What counts as better is the **rate**, not the amount. Under a 10% rule every
+    extra line raises the discount in pounds without improving the offer by a
+    penny, so comparing amounts would let any basket be nudged forever. Comparing
+    discount against subtotal fires only when the terms themselves move — a tier
+    crossed, a bundle completed, a stronger rule taking over — which is the only
+    thing worth telling a customer about. Kept in integers: `d1/s1 > d0/s0` is
+    `d1*s0 > d0*s1` without the rounding.
+    """
+    template = _hypothetical_line(items)
+    if template is None:
+        return None
+
+    current_subtotal = _price_all(items)
+    if current_subtotal <= 0:
+        return None
+    current = _best_offer(rules, items)
+    current_discount = current.discount if current else 0
+
+    for k in range(1, max(1, max_lookahead) + 1):
+        hypothetical = items + [dict(template) for _ in range(k)]
+        candidate = _best_offer(rules, hypothetical)
+        if candidate is None:
+            continue
+        hypothetical_subtotal = _price_all(hypothetical)
+        if hypothetical_subtotal <= 0:
+            continue
+        if candidate.discount * current_subtotal <= current_discount * hypothetical_subtotal:
+            continue
+        rule = next((r for r in rules if str(r.get("_id")) == candidate.rule_id), None)
+        shape = _reward_shape(rule, hypothetical) if rule else {}
+        return NextReward(
+            rule_id=candidate.rule_id,
+            name=candidate.name,
+            rule_type=candidate.ruleType,
+            items_needed=k,
+            **shape,
+        )
+    return None
+
+
 def _evaluate_rule(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> RuleResult:
     # Filter items that match appliesTo
     matched = [it for it in items if _match_applies_to(rule, it)]
@@ -365,6 +562,15 @@ def _evaluate_rule(rule: Dict[str, Any], items: List[Dict[str, Any]]) -> RuleRes
                     "explanation": "2 qualifying devices — 10% off",
                 },
                 "final_total": 13583,
+                "next_reward": {
+                    "rule_id": "68c0a1b2c3d4e5f6a7b8c9d1",
+                    "name": "Three or more devices — 15% off",
+                    "rule_type": "TIERED_PERCENT",
+                    "items_needed": 1,
+                    "percent_off": 15,
+                    "bundle_size": None,
+                    "bundle_price_pence": None,
+                },
             },
         ),
         400: error("`basket_id` is not a valid 24-character ObjectId.", "Invalid basket_id; must be a valid ObjectId string"),
@@ -382,6 +588,10 @@ def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
 
     All amounts are in **minor units** — pence or cents — so `14298` means £142.98. `final_total`
     is floored at `0`.
+
+    `next_reward` looks one step ahead: it is the nearest discount the basket has **not** earned,
+    with how many more qualifying lines it needs. Use it to show an "add one more device and save"
+    nudge. It is `null` when no rule is within reach.
 
     Lines missing a `client` or `locale` inherit them from the basket root before rules are
     matched, so a line added without them still qualifies.
@@ -420,14 +630,17 @@ def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
     results = [_evaluate_rule(r, items_for_rules) for r in rules]
 
     # Choose best rule by discount then priority (higher priority wins if same discount)
-    best: Optional[RuleResult] = None
-    for r in sorted(results, key=lambda rr: (-rr.discount, -rr.priority)):
-        if r.discount > 0:
-            best = r
-            break
+    best: Optional[RuleResult] = _pick_best(results)
 
     discount = best.discount if best else 0
     final_total = max(0, subtotal_pence - discount)
+
+    # Look one step ahead so the basket page can nudge ("add one more and save 10%").
+    # Never blocks pricing: a misconfigured rule just means no nudge.
+    try:
+        next_reward = _best_next_reward(rules, items_for_rules)
+    except Exception:
+        next_reward = None
 
     # Determine mode summary (single mode or 'mixed')
     modes = {it.get("mode") for it in items if it.get("mode") is not None}
@@ -443,6 +656,7 @@ def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
                     "final_total": int(final_total),
                     "discount": int(discount),
                     "best_rule": best.dict() if best else None,
+                    "next_reward": next_reward.dict() if next_reward else None,
                     "mode": mode_value,
                 }
             }
@@ -457,4 +671,5 @@ def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
         eligible_rules=results,
         best=best,
         final_total=int(final_total),
+        next_reward=next_reward,
     )
