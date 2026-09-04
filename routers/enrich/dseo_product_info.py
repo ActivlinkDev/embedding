@@ -38,7 +38,7 @@ def _auth_header() -> str:
 async def submit_dseo_product_info_task(masterSKUid: str, locale: str) -> dict:
     """
     Submit a DataforSEO merchant/google/product_info task for the given MasterSKU locale.
-    Requires Product_ID to already be present in Locale_Specific_Data (populated by the
+    Requires productId to already be present in the locale market data (populated by the
     shopping task webhook). Raises ValueError for config/validation errors.
     """
     if not DSEO_WEBHOOK_BASE_URL:
@@ -53,12 +53,9 @@ async def submit_dseo_product_info_task(masterSKUid: str, locale: str) -> dict:
     if not ms_doc:
         raise ValueError(f"MasterSKU '{masterSKUid}' not found")
 
-    # Find Product_ID in the locale-specific data entry
-    product_id = None
-    for entry in ms_doc.get("Locale_Specific_Data") or []:
-        if entry.get("locale") == locale:
-            product_id = entry.get("Product_ID")
-            break
+    product_id = (
+        ((ms_doc.get("locales") or {}).get(locale) or {}).get("market") or {}
+    ).get("productId")
 
     if not product_id:
         raise ValueError(

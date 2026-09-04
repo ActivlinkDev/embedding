@@ -26,6 +26,7 @@ import os
 
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
+from routers.sku.catalog_dependencies import catalog
 from .product_assignment import (
     assign_products,
     ProductAssignmentRequest,
@@ -66,7 +67,7 @@ class WidgetPriceRequest(BaseModel):
     )
     price: float = Field(
         ...,
-        description="**Mandatory field**, but `0` is allowed and falls back to the SKU's `MSRP` for that locale. Send the actual basket price when you have it — it changes the premium.",
+        description="**Mandatory field**, but `0` is allowed and falls back to the resolved catalogue price. Send the actual basket price when you have it — it changes the premium.",
         examples=[449.99],
     )
     locale: str = Field(..., description="**Mandatory.** Locale of the storefront, e.g. `en_GB`.", examples=["en_GB"])
@@ -142,13 +143,6 @@ def _to_float(val, default=0.0):
         return default
 
 
-def _lsd_for_locale(customsku_doc, locale):
-    for entry in customsku_doc.get("Locale_Specific_Data", []) or []:
-        if entry.get("locale") == locale:
-            return entry
-    return {}
-
-
 def resolve_widget_inputs(payload: WidgetPriceRequest):
     """Resolve a widget request into a ProductAssignmentRequest + context.
 
@@ -168,19 +162,20 @@ def resolve_widget_inputs(payload: WidgetPriceRequest):
 
     customsku_doc = customsku_collection.find_one({
         "_id": sku_object_id,
-        "Client": client_id,
-        "Locale_Specific_Data.locale": payload.locale,
+        "clientId": client_id,
+        "enabledLocales": payload.locale,
     })
     if not customsku_doc:
         raise HTTPException(status_code=404, detail="CustomSKU not found for client/locale")
 
-    lsd = _lsd_for_locale(customsku_doc, payload.locale)
-
-    # Category — from the CustomSKU root (mirrors the registration/assignment flow)
-    category = (customsku_doc.get("Category") or lsd.get("Locale_Matched_Category") or "").strip()
+    resolved = catalog.resolve_custom(customsku_doc, payload.locale)
+    if not resolved:
+        raise HTTPException(status_code=404, detail="MasterSKU not found")
+    product = resolved["product"]
+    category = str(product.get("category") or "").strip()
 
     # Currency — explicit > locale-specific > Locale_Params
-    currency = (payload.currency or lsd.get("Currency") or "").strip().upper()
+    currency = (payload.currency or product.get("currency") or "").strip().upper()
     if not currency:
         locale_doc = locale_params_collection.find_one({"locale": payload.locale}) or {}
         currency = (locale_doc.get("currency") or "").strip().upper()
@@ -189,11 +184,10 @@ def resolve_widget_inputs(payload: WidgetPriceRequest):
     if payload.gtee is not None:
         gtee = _to_int(payload.gtee)
     else:
-        guarantees = lsd.get("Guarantees", {}) or {}
-        gtee = _to_int(guarantees.get("Labour")) or _to_int(guarantees.get("Parts"))
+        guarantee = product.get("guarantee", {}) or {}
+        gtee = _to_int(guarantee.get("labourMonths")) or _to_int(guarantee.get("partsMonths"))
 
-    # Price — request value, fall back to MSRP
-    price = payload.price or _to_float(lsd.get("MSRP"))
+    price = payload.price or _to_float(product.get("price"))
 
     # Purchase date — request value, else today (new purchase)
     purchase_date = (payload.purchaseDate or "").strip() or datetime.utcnow().strftime("%Y-%m-%d")
@@ -212,7 +206,7 @@ def resolve_widget_inputs(payload: WidgetPriceRequest):
         age_in_months = calculate_age_in_months(purchase_date)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid purchaseDate; expected YYYY-MM-DD")
-    return assignment_request, age_in_months, client_doc, customsku_doc, lsd
+    return assignment_request, age_in_months, client_doc, customsku_doc, product
 
 
 def compute_options(payload: WidgetPriceRequest):
@@ -383,8 +377,8 @@ def widget_price(payload: WidgetPriceRequest, request: Request, _: None = Depend
     Price the cover options to show in the storefront widget. **Read-only — no quote is stored.**
 
     Everything the pricing needs is resolved from the catalogue rather than a registered device:
-    the CustomSKU supplies the category and, when `price`, `currency` or `gtee` are omitted, the
-    MSRP, currency and guarantee for that locale. `purchaseDate` defaults to today, so the device
+    the catalogue resolver supplies category and, when `price`, `currency` or `gtee` are omitted,
+    the effective inherited/overridden values. `purchaseDate` defaults to today, so the device
     is treated as new.
 
     Results come from a **cache** keyed on the SKU, locale, price band, age, guarantee and
@@ -502,21 +496,23 @@ def widget_quote_refresh(payload: WidgetPriceRequest, _: None = Depends(verify_t
 # ---------- Warm-on-write (importable) ----------
 
 def warm_widget_cache(client_key: str, custom_sku_id: str, locale: str, price: Optional[float] = None):
-    """Precompute and cache the widget quote for a CustomSKU at MSRP.
+    """Precompute and cache the widget quote at its resolved catalogue price.
 
     Safe to call from a background task on CustomSKU create/update. Never raises —
     failures are logged and swallowed so they can't break the SKU write.
     """
     try:
+        # Invalidate first so clearing a price override cannot leave quotes
+        # generated from the previous effective catalogue value.
+        _cache_invalidate(custom_sku_id, locale)
         if price is None:
             sku = customsku_collection.find_one({"_id": ObjectId(custom_sku_id)})
-            lsd = _lsd_for_locale(sku, locale) if sku else {}
-            price = float(lsd.get("MSRP") or 0)
+            resolved = catalog.resolve_custom(sku, locale) if sku else None
+            price = float(((resolved or {}).get("product") or {}).get("price") or 0)
         if not price:
-            # No MSRP yet — typically a SKU created before its MasterSKU price
-            # landed. propagate_master_price re-warms it once enrichment fills
-            # the price in; log so a cold cache is traceable to the cause.
-            print(f"[WIDGET-CACHE] skipped {custom_sku_id} / {locale}: no MSRP")
+            # No effective price yet — typically enrichment is still pending.
+            # The enrichment webhook re-warms it once the master price lands.
+            print(f"[WIDGET-CACHE] skipped {custom_sku_id} / {locale}: no resolved price")
             return
         payload = WidgetPriceRequest(
             clientKey=client_key, customSkuId=custom_sku_id, price=price, locale=locale
@@ -524,10 +520,6 @@ def warm_widget_cache(client_key: str, custom_sku_id: str, locale: str, price: O
         assignment_request, age_in_months, _client_doc, _sku, _lsd = resolve_widget_inputs(payload)
         grouped, bracket, currency = _compute_options_from_assignment(assignment_request, age_in_months)
 
-        # Always drop existing cache rows for this SKU/locale: even when
-        # recomputation yields no options (category/MSRP/guarantees changed
-        # such that nothing matches), stale rows must not keep being served.
-        _cache_invalidate(custom_sku_id, locale)
         if grouped:
             _cache_write(
                 custom_sku_id, locale, age_in_months, assignment_request.price,

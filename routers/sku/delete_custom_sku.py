@@ -85,7 +85,7 @@ def delete_custom_sku(data: DeleteCustomSKURequest, _: None = Depends(verify_tok
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid id")
 
-    result = customsku_collection.delete_one({"_id": doc_id, "Client": client_id})
+    result = customsku_collection.delete_one({"_id": doc_id, "clientId": client_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="CustomSKU not found for client")
 

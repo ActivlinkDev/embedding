@@ -3,8 +3,8 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Any
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
+from routers.sku.catalog_dependencies import catalog
 from pymongo import MongoClient
-from bson import ObjectId
 import os
 from datetime import datetime
 
@@ -14,8 +14,6 @@ client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
 clients_collection = db["ClientKey"]
 locale_params_collection = db["Locale_Params"]
-customsku_collection = db["CustomSKU"]
-mastersku_collection = db["MasterSKU"]
 devices_collection = db["Devices"]
 
 class IdentifiersModel(BaseModel):
@@ -114,7 +112,7 @@ class UniqueParametersModel(BaseModel):
         0,
         description=(
             "Purchase price in the locale's currency. When omitted or `0`, the price falls back "
-            "to the CustomSKU `MSRP`, then the MasterSKU `Price`, then `0`."
+            "to the resolved tenant override or MasterSKU reference price, then `0`."
         ),
         examples=[449.99],
     )
@@ -225,58 +223,6 @@ def validate_mandatory_fields(payload):
             detail=f"Missing or invalid required field(s): {', '.join(missing_fields)}"
         )
 
-def lookup_customsku(ids, client_id, locale):
-    customsku_doc = None
-    # Try by SKU
-    if valid_value(ids.SKU):
-        customsku_doc = customsku_collection.find_one({
-            "Identifiers.SKU": ids.SKU,
-            "Client": client_id,
-            "Locale_Specific_Data.locale": locale
-        })
-    # Try by GTIN (GTIN is an array in your data, so use $in)
-    if not customsku_doc and valid_value(ids.GTIN):
-        customsku_doc = customsku_collection.find_one({
-            "Identifiers.GTIN": { "$in": [ids.GTIN] },
-            "Client": client_id,
-            "Locale_Specific_Data.locale": locale
-        })
-    # Fallback to make and model
-    if not customsku_doc and valid_value(ids.make) and valid_value(ids.model):
-        customsku_doc = customsku_collection.find_one({
-            "Identifiers.Make": ids.make,
-            "Identifiers.Model": ids.model,
-            "Client": client_id,
-            "Locale_Specific_Data.locale": locale
-        })
-    return customsku_doc
-
-def lookup_mastersku(customsku_doc, locale):
-    if not customsku_doc or "MasterSKU" not in customsku_doc:
-        return None
-    try:
-        master_id = customsku_doc["MasterSKU"]
-        if isinstance(master_id, str):
-            master_id = ObjectId(master_id)
-        mastersku_doc = mastersku_collection.find_one({
-            "_id": master_id,
-            "Locale_Specific_Data.locale": locale
-        })
-        if not mastersku_doc:
-            mastersku_doc = mastersku_collection.find_one({
-                "_id": master_id
-            })
-        return mastersku_doc
-    except Exception:
-        return None
-
-def extract_locale_specific_data(doc, locale):
-    if not doc or "Locale_Specific_Data" not in doc:
-        return None
-    lsd = doc["Locale_Specific_Data"]
-    entry = next((item for item in lsd if item.get("locale") == locale), None)
-    return entry
-
 def get_first_non_blank(*args):
     for val in args:
         if val is None:
@@ -349,8 +295,8 @@ def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_tok
     3. **Enriches from the catalogue** — resolves a CustomSKU for this client and locale, then its
        MasterSKU, and back-fills any blank identifier (title, category, guarantees) from them. A
        device that matches neither is **not stored** and comes back as `skuStatus: "error"`.
-    4. **Resolves the price** — the submitted `price`, else the CustomSKU `MSRP`, else the
-       MasterSKU `Price`, else `0`. Currency always comes from `Locale_Params`, never the caller.
+    4. **Resolves the price** — the submitted `price`, else the catalogue resolver's effective
+       price, else `0`. Currency always comes from `Locale_Params`, never the caller.
 
     **Partial success is normal.** The call returns `200` as long as the tenant and locale are
     valid; individual failures are reported per device inside `inserted`. `count` is the length of
@@ -460,68 +406,59 @@ def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_tok
             })
             continue
 
-        # --- Use Client_ID from ClientKey for lookups ---
-        customsku_doc = lookup_customsku(ids, client_id, payload.locale)
-        customsku_id = str(customsku_doc["_id"]) if customsku_doc else None
-        lsd_custom = extract_locale_specific_data(customsku_doc, payload.locale) if customsku_doc else None
-
-        mastersku_doc = lookup_mastersku(customsku_doc, payload.locale)
-        mastersku_id = str(mastersku_doc["_id"]) if mastersku_doc and "_id" in mastersku_doc else None
-        lsd_master = extract_locale_specific_data(mastersku_doc, payload.locale) if mastersku_doc else None
+        try:
+            resolved, _ = catalog.resolve_lookup(
+                client_key=payload.clientkey,
+                locale=payload.locale,
+                sku=ids.SKU if valid_value(ids.SKU) else None,
+                gtin=ids.GTIN if valid_value(ids.GTIN) else None,
+                make=ids.make if valid_value(ids.make) else None,
+                model=ids.model if valid_value(ids.model) else None,
+            )
+        except (LookupError, ValueError):
+            resolved = None
+        product = (resolved or {}).get("product") or {}
+        guarantee = product.get("guarantee") or {}
+        customsku_id = (resolved or {}).get("customSkuId")
+        mastersku_id = (resolved or {}).get("masterSkuId")
 
         identifiers = {
             "GTIN": get_first_non_blank(
                 ids.GTIN,
-                customsku_doc.get("Identifiers", {}).get("GTIN") if customsku_doc else None,
-                mastersku_doc.get("GTIN") if mastersku_doc else None
+                product.get("gtins"),
             ),
             "make": get_first_non_blank(
                 ids.make,
-                customsku_doc.get("Identifiers", {}).get("Make") if customsku_doc else None,
-                lsd_custom.get("Make") if lsd_custom else None,
-                mastersku_doc.get("Make") if mastersku_doc else None,
-                lsd_master.get("Make") if lsd_master else None
+                product.get("make"),
             ),
             "model": get_first_non_blank(
                 ids.model,
-                customsku_doc.get("Identifiers", {}).get("Model") if customsku_doc else None,
-                lsd_custom.get("Model") if lsd_custom else None,
-                mastersku_doc.get("Model") if mastersku_doc else None,
-                lsd_master.get("Model") if lsd_master else None
+                product.get("model"),
             ),
             "SKU": get_first_non_blank(
                 ids.SKU,
-                customsku_doc.get("Identifiers", {}).get("SKU") if customsku_doc else None,
-                lsd_custom.get("SKU") if lsd_custom else None,
-                mastersku_doc.get("Productname") if mastersku_doc else None,
-                lsd_master.get("SKU") if lsd_master else None
+                product.get("sku"),
             ),
             "title": get_first_non_blank(
                 ids.title,
-                lsd_custom.get("Title") if lsd_custom else None,
-                customsku_doc.get("Title") if customsku_doc else None,
-                mastersku_doc.get("Title") if mastersku_doc else None,
-                lsd_master.get("Title") if lsd_master else None
+                product.get("title"),
             ),
             "category": get_first_non_blank(
                 ids.category,
-                lsd_custom.get("Category") if lsd_custom else None,
-                customsku_doc.get("Category") if customsku_doc else None,
-                mastersku_doc.get("Category") if mastersku_doc else None,
-                lsd_master.get("Category") if lsd_master else None,
-                mastersku_doc.get("Matched_Category") if mastersku_doc else None
+                product.get("category"),
             ),
             "gteeParts": get_first_non_blank(
                 ids.gtee_parts,
-                lsd_custom.get("Guarantees", {}).get("Parts") if lsd_custom and lsd_custom.get("Guarantees") else None
+                guarantee.get("partsMonths"),
             ),
             "gteeLabour": get_first_non_blank(
                 ids.gtee_labour,
-                lsd_custom.get("Guarantees", {}).get("Labour") if lsd_custom and lsd_custom.get("Guarantees") else None
+                guarantee.get("labourMonths"),
             ),
             "promo": get_first_non_blank(
                 ids.promo,
-                lsd_custom.get("Guarantees", {}).get("Promotion") if lsd_custom and lsd_custom.get("Guarantees") else None
+                product.get("localePromotion"),
+                product.get("globalPromotion"),
             )
         }
 
@@ -533,13 +470,7 @@ def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_tok
 
         # ---- PRICE FALLBACK LOGIC ----
         if price_is_missing(unique.price):
-            price = None
-            if lsd_custom and not price_is_missing(lsd_custom.get("MSRP")):
-                price = float(lsd_custom.get("MSRP"))
-            elif lsd_master and not price_is_missing(lsd_master.get("Price")):
-                price = float(lsd_master.get("Price"))
-            else:
-                price = 0
+            price = 0 if price_is_missing(product.get("price")) else float(product["price"])
         else:
             price = float(unique.price)
         # -----------------------------
@@ -552,7 +483,7 @@ def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_tok
             "registrationStatus": "unassigned"
         }
 
-        matched_status = "matched" if (customsku_doc or mastersku_doc) else "no match"
+        matched_status = "matched" if resolved else "no match"
 
         if matched_status != "matched":
             inserted.append({

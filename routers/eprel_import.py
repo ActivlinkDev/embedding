@@ -49,7 +49,7 @@ category_map_collection = db["EPREL_Category_Map"]
 # Validation must read the same collections the create flow writes through, so
 # pre-flight checks can never pass against a different database than the one
 # receiving the catalog records. The SKU services own these handles.
-from routers.sku.create_custom_sku import (  # noqa: E402
+from routers.sku.catalog_dependencies import (  # noqa: E402
     client_collection,
     locale_collection,
 )
@@ -115,11 +115,9 @@ def _run_background_tasks_inline(background_tasks: BackgroundTasks) -> None:
 def _classify(result: dict) -> tuple[str, str | None]:
     """Map a create_custom_sku_service return value onto an outcome bucket."""
     message = result.get("message")
-    if not message:
+    if not message or message == "CustomSKU created":
         return CREATED, None
-    if message.startswith("SKU exists already"):
-        return ALREADY_EXISTS, None
-    if message.startswith("Locale added"):
+    if message == "CustomSKU updated":
         return LOCALE_ADDED, None
     return FAILED, message
 
@@ -141,7 +139,7 @@ def _import_one(doc: dict, client_key: str, locales: list[str], category: str,
             if reason:
                 entry["reason"] = reason
             else:
-                entry["customsku"] = result.get("customsku") or result.get("existing") or result
+                entry["customsku"] = result.get("customSku") or result
             results.append(entry)
         except HTTPException as exc:
             results.append({"locale": locale, "outcome": FAILED, "reason": str(exc.detail)})
