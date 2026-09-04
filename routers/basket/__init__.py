@@ -144,21 +144,28 @@ MIXED_MODE_DETAIL = (
 )
 
 
-def assert_no_mode_conflict(existing_items: List[Dict[str, Any]], new_mode: Optional[str]) -> None:
-    """Refuse a line whose billing mode clashes with what the basket already holds.
+def conflicting_modes(existing_items: List[Dict[str, Any]], new_mode: Optional[str]) -> List[str]:
+    """Modes already in the basket that `new_mode` cannot sit beside.
 
     Checkout can only send one mode to Stripe, so a mixed basket has no correct
     outcome — it either bills a monthly plan once or a one-off plan forever.
-    Rejecting it here means the customer finds out while adding cover rather than
-    at the payment step, where they have already committed.
 
     Lines with no `mode` are ignored: they predate the field and cannot be shown
     to conflict with anything.
     """
     if not new_mode:
-        return
-    existing_modes = {it.get("mode") for it in existing_items if it.get("mode")}
-    conflicting = sorted(existing_modes - {new_mode})
+        return []
+    return sorted({it.get("mode") for it in existing_items if it.get("mode")} - {new_mode})
+
+
+def assert_no_mode_conflict(existing_items: List[Dict[str, Any]], new_mode: Optional[str]) -> None:
+    """Raise the 409 if `new_mode` clashes with what the basket already holds.
+
+    Read-then-write, so this cannot stand alone against two concurrent adds — the
+    append carries `mode_guard_filter` for that. Its job is the message: naming
+    both kinds of cover, and what to do instead.
+    """
+    conflicting = conflicting_modes(existing_items, new_mode)
     if conflicting:
         raise HTTPException(
             status_code=409,
@@ -167,6 +174,26 @@ def assert_no_mode_conflict(existing_items: List[Dict[str, Any]], new_mode: Opti
                 f"{' and '.join(repr(m) for m in conflicting)} cover. " + MIXED_MODE_DETAIL
             ),
         )
+
+
+def mode_guard_filter(new_mode: Optional[str]) -> Dict[str, Any]:
+    """Query clause admitting only baskets `new_mode` may legally join.
+
+    Checking and then appending in two steps loses to a race: two opposite-mode
+    adds can both read a single-mode basket, both pass the check, and both push —
+    creating exactly the mixed basket this refuses. Folding the condition into the
+    update's own filter makes Mongo decide, so at most one of them lands.
+
+    Reads as: no line exists whose mode is set and is something other than
+    `new_mode`. A line with no mode, or a null one, is not a conflict.
+    """
+    if not new_mode:
+        return {}
+    return {
+        "Basket": {
+            "$not": {"$elemMatch": {"mode": {"$exists": True, "$nin": [None, new_mode]}}}
+        }
+    }
 
 
 def _serialize_basket_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -380,22 +407,37 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
             raise HTTPException(status_code=400, detail="Invalid basket_id; must be a valid ObjectId string")
 
         update: Dict[str, Any]
+        criteria: Dict[str, Any] = {"_id": bid}
+        new_mode: Optional[str] = None
         if payload.add_to_basket is False:
             update = {"$push": {"skipped_items": skipped_item}}
         else:
-            existing = basket_collection.find_one({"_id": bid}, {"Basket.mode": 1})
-            if not existing:
-                raise HTTPException(status_code=404, detail="Basket not found for provided basket_id")
-            assert_no_mode_conflict(existing.get("Basket") or [], basket_item.get("mode"))
+            # The mode guard rides on the update's own filter, so the check and the
+            # append are one operation and two concurrent opposite-mode adds cannot
+            # both win.
+            new_mode = basket_item.get("mode")
+            criteria = {**criteria, **mode_guard_filter(new_mode)}
             update = {"$push": {"Basket": basket_item}}
 
         result = basket_collection.find_one_and_update(
-            {"_id": bid},
+            criteria,
             update,
             return_document=ReturnDocument.AFTER,
         )
         if not result:
-            raise HTTPException(status_code=404, detail="Basket not found for provided basket_id")
+            # Nothing matched: either there is no such basket, or the guard rejected
+            # it. Re-read by id alone to say which, and to name the offending modes.
+            existing = basket_collection.find_one({"_id": bid}, {"Basket.mode": 1})
+            if not existing:
+                raise HTTPException(status_code=404, detail="Basket not found for provided basket_id")
+            # Raises the 409 naming both kinds of cover when the guard is what refused.
+            assert_no_mode_conflict(existing.get("Basket") or [], new_mode)
+            # The basket exists and no longer conflicts — a concurrent write changed
+            # it between the update and this read. Nothing was appended either way.
+            raise HTTPException(
+                status_code=409,
+                detail="Basket changed while the line was being added; please retry.",
+            )
         # Re-rate only if item was added to Basket (not when skipping)
         if payload.add_to_basket is not False:
             try:
