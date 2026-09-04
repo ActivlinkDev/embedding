@@ -125,16 +125,21 @@ def build_locale_data(
     return d
 
 def build_existing_query(client_name, data):
+    """Find a client's existing CustomSKU for this product.
+
+    Matching is by client plus identifiers only. Source is deliberately not part
+    of the key: a client's catalog holds one document per product regardless of
+    which integration created it, and a new Source is recorded on the existing
+    document instead of producing a duplicate.
+    """
     sku_cond = {
         "Client": client_name,
         "Identifiers.SKU": data.SKU,
-        "Sources": {"$in": [data.Source]}
     }
     gtin_cond = (
         {
             "Client": client_name,
             "Identifiers.GTIN": {"$in": [data.GTIN]},
-            "Sources": {"$in": [data.Source]}
         }
         if data.GTIN and data.GTIN.strip() else None
     )
@@ -143,7 +148,6 @@ def build_existing_query(client_name, data):
             "Client": client_name,
             "Identifiers.Make": {"$regex": f"^{re.escape(data.Make)}$", "$options": "i"},
             "Identifiers.Model": {"$regex": f"^{re.escape(data.Model)}$", "$options": "i"},
-            "Sources": {"$in": [data.Source]}
         }
         if data.Make and data.Model else None
     )
@@ -285,6 +289,125 @@ def _serialize(doc):
     return doc
 
 
+def _synthetic_request() -> Request:
+    """Minimal Request for callers that have no HTTP request of their own.
+
+    Only ever read for its base_url, and only when FASTAPI_BASE_URL /
+    PUBLIC_BACKEND_URL are unset, so a placeholder host is sufficient.
+    """
+    return Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/",
+        "headers": [],
+        # Matches the codebase's localhost fallback, so masked URLs built from
+        # this request look the same as everywhere else when no base URL is set.
+        "scheme": "http",
+        "server": ("localhost", 8000),
+        "query_string": b"",
+        "root_path": "",
+    })
+
+
+def create_custom_sku_service(
+    data: CustomSKURequest,
+    background_tasks: BackgroundTasks,
+    request: Optional[Request] = None,
+) -> dict:
+    """Create a CustomSKU, or add a locale to one that already exists.
+
+    The implementation behind POST /sku/create_custom_sku, callable directly by
+    importers and reprocessors that have no incoming HTTP request. Raises the
+    same HTTPExceptions as the endpoint, so callers can let them propagate.
+    """
+    if request is None:
+        request = _synthetic_request()
+    # 0. Validate inputs
+    missing_fields = validate_mandatory_fields(data)
+    if missing_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing mandatory input(s): {', '.join(missing_fields)}"
+        )
+
+    # 1. Lookup locale
+    locale_info = locale_collection.find_one({"locale": data.Locale})
+    if not locale_info:
+        raise HTTPException(status_code=404, detail=f"Locale {data.Locale} not found.")
+
+    # 2. Lookup client
+    client_info = client_collection.find_one({"ClientKey": data.ClientKey})
+    if not client_info:
+        raise HTTPException(status_code=404, detail=f"ClientKey {data.ClientKey} not found.")
+    client_name = client_info.get("Client_ID", "")
+
+    # 3. Check for an existing CustomSKU (by SKU, GTIN, or Make+Model)
+    existing = customsku_collection.find_one(build_existing_query(client_name, data))
+
+    if existing:
+        # Record this integration as a source of the product. The document is
+        # shared across sources, so provenance accumulates rather than forking.
+        customsku_collection.update_one(
+            {"_id": existing["_id"]},
+            {"$addToSet": {"Sources": data.Source}},
+        )
+
+        # 3a. Already has this locale — nothing to do.
+        if locale_exists(existing.get("Locale_Specific_Data", []), data.Locale):
+            return {
+                "message": "SKU exists already for client and locale",
+                "existing": _serialize(customsku_collection.find_one({"_id": existing["_id"]})),
+            }
+
+        # 3b. Ensure the MasterSKU carries this locale, then append it to the CustomSKU.
+        master = ensure_master_with_locale(data, request, background_tasks)
+        master_locale = find_locale_data(master.get("Locale_Specific_Data", []), data.Locale) if master else {}
+        if not master_locale:
+            return {"message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."}
+
+        locale_details = data.Locale_Details or LocaleDetails()
+        locale_data = build_locale_data(data, locale_details, locale_info, client_info, mastersku_locale=master_locale)
+        customsku_collection.update_one(
+            {"_id": existing["_id"]},
+            {"$push": {"Locale_Specific_Data": locale_data}},
+        )
+        # Warm the embeddable-widget quote cache for the newly added locale.
+        from routers.widget_quote import warm_widget_cache
+        background_tasks.add_task(warm_widget_cache, data.ClientKey, str(existing["_id"]), data.Locale)
+        persisted = customsku_collection.find_one({"_id": existing["_id"]})
+        return {"message": "Locale added to existing CustomSKU", "customsku": _serialize(persisted)}
+
+    # 4. No existing CustomSKU — ensure the MasterSKU exists, then create the CustomSKU.
+    master = ensure_master_with_locale(data, request, background_tasks)
+    if master is None:
+        return {"message": "No GTIN or Make/Model supplied for MasterSKU matching, unable to proceed."}
+
+    master_locale = find_locale_data(master.get("Locale_Specific_Data", []), data.Locale)
+    if not master_locale:
+        return {"message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."}
+
+    locale_details = data.Locale_Details or LocaleDetails()
+    locale_data = build_locale_data(data, locale_details, locale_info, client_info, mastersku_locale=master_locale)
+    category_root = data.Category if data.Category not in (None, "") else master.get("Category", "")
+
+    doc = {
+        "Client": client_name,
+        "Client_Key": data.ClientKey,
+        "Sources": [data.Source],
+        "Identifiers": build_identifiers(master, data.SKU),
+        "MasterSKU": str(master["_id"]),
+        "Category": category_root,
+        "Global_Promotion": data.Global_Promotion if data.Global_Promotion is not None else None,
+        "Locale_Specific_Data": [locale_data],
+    }
+    result = customsku_collection.insert_one(doc)
+    # Warm the embeddable-widget quote cache so the first shopper is fast too.
+    from routers.widget_quote import warm_widget_cache
+    background_tasks.add_task(warm_widget_cache, data.ClientKey, str(result.inserted_id), data.Locale)
+    persisted = customsku_collection.find_one({"_id": result.inserted_id})
+    return _serialize(persisted)
+
+
 @router.post(
     "/create_custom_sku",
     summary="Create a client SKU, or add a locale to an existing one",
@@ -340,80 +463,4 @@ def create_custom_sku(
     so a minimal call still produces a priced, titled SKU. After a successful write the widget
     quote cache is warmed in the background, so the first shopper does not pay for a cold cache.
     """
-    # 0. Validate inputs
-    missing_fields = validate_mandatory_fields(data)
-    if missing_fields:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Missing mandatory input(s): {', '.join(missing_fields)}"
-        )
-
-    # 1. Lookup locale
-    locale_info = locale_collection.find_one({"locale": data.Locale})
-    if not locale_info:
-        raise HTTPException(status_code=404, detail=f"Locale {data.Locale} not found.")
-
-    # 2. Lookup client
-    client_info = client_collection.find_one({"ClientKey": data.ClientKey})
-    if not client_info:
-        raise HTTPException(status_code=404, detail=f"ClientKey {data.ClientKey} not found.")
-    client_name = client_info.get("Client_ID", "")
-
-    # 3. Check for an existing CustomSKU (by SKU, GTIN, or Make+Model)
-    existing = customsku_collection.find_one(build_existing_query(client_name, data))
-
-    if existing:
-        # 3a. Already has this locale — nothing to do.
-        if locale_exists(existing.get("Locale_Specific_Data", []), data.Locale):
-            return {
-                "message": "SKU exists already for client and locale",
-                "existing": _serialize(existing),
-            }
-
-        # 3b. Ensure the MasterSKU carries this locale, then append it to the CustomSKU.
-        master = ensure_master_with_locale(data, request, background_tasks)
-        master_locale = find_locale_data(master.get("Locale_Specific_Data", []), data.Locale) if master else {}
-        if not master_locale:
-            return {"message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."}
-
-        locale_details = data.Locale_Details or LocaleDetails()
-        locale_data = build_locale_data(data, locale_details, locale_info, client_info, mastersku_locale=master_locale)
-        customsku_collection.update_one(
-            {"_id": existing["_id"]},
-            {"$push": {"Locale_Specific_Data": locale_data}},
-        )
-        # Warm the embeddable-widget quote cache for the newly added locale.
-        from routers.widget_quote import warm_widget_cache
-        background_tasks.add_task(warm_widget_cache, data.ClientKey, str(existing["_id"]), data.Locale)
-        persisted = customsku_collection.find_one({"_id": existing["_id"]})
-        return {"message": "Locale added to existing CustomSKU", "customsku": _serialize(persisted)}
-
-    # 4. No existing CustomSKU — ensure the MasterSKU exists, then create the CustomSKU.
-    master = ensure_master_with_locale(data, request, background_tasks)
-    if master is None:
-        return {"message": "No GTIN or Make/Model supplied for MasterSKU matching, unable to proceed."}
-
-    master_locale = find_locale_data(master.get("Locale_Specific_Data", []), data.Locale)
-    if not master_locale:
-        return {"message": "Master SKU creation is taking longer than expected. Please try again in a few seconds."}
-
-    locale_details = data.Locale_Details or LocaleDetails()
-    locale_data = build_locale_data(data, locale_details, locale_info, client_info, mastersku_locale=master_locale)
-    category_root = data.Category if data.Category not in (None, "") else master.get("Category", "")
-
-    doc = {
-        "Client": client_name,
-        "Client_Key": data.ClientKey,
-        "Sources": [data.Source],
-        "Identifiers": build_identifiers(master, data.SKU),
-        "MasterSKU": str(master["_id"]),
-        "Category": category_root,
-        "Global_Promotion": data.Global_Promotion if data.Global_Promotion is not None else None,
-        "Locale_Specific_Data": [locale_data],
-    }
-    result = customsku_collection.insert_one(doc)
-    # Warm the embeddable-widget quote cache so the first shopper is fast too.
-    from routers.widget_quote import warm_widget_cache
-    background_tasks.add_task(warm_widget_cache, data.ClientKey, str(result.inserted_id), data.Locale)
-    persisted = customsku_collection.find_one({"_id": result.inserted_id})
-    return _serialize(persisted)
+    return create_custom_sku_service(data, background_tasks, request=request)
