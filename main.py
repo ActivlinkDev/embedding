@@ -47,7 +47,6 @@ def ensure_catalog_indexes() -> None:
     database["url_map"].create_index(
         "expires_at",
         expireAfterSeconds=0,
-        name="ttl_url_map_expiry",
     )
 
 @app.middleware("http")
