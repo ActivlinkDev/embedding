@@ -48,7 +48,8 @@ def lookup_icecat(
 
     The response is **Icecat's JSON, unmodified** — this endpoint is a pass-through, so treat the
     body as Icecat's contract rather than this API's. Nothing is stored; use
-    `POST /sku/create_master_sku` to persist enrichment.
+    `POST /sku/create_custom_sku` to persist enrichment — it creates or updates the
+    underlying MasterSKU from the same Icecat data as a side effect.
     """
     if not gtin and not (brand and productcode):
         raise HTTPException(

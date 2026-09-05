@@ -123,9 +123,7 @@ ROUTERS = {
     "update_custom_sku": "routers.sku.update_custom_sku",
     "get_custom_sku": "routers.sku.get_custom_sku",
     "delete_custom_sku": "routers.sku.delete_custom_sku",
-    "lookup_master_sku": "routers.sku.lookup_master_sku",
-    "lookup_master_sku_all": "routers.sku.lookup_master_sku_all",
-    "create_master_sku": "routers.sku.create_master_sku",
+    "masked_asset_proxy": "routers.sku.masked_asset_proxy",
     "quick_search": "routers.sku.quick_search",
 
     # enrich
