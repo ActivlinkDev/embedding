@@ -118,6 +118,120 @@ def _canonical_category(category_input: str, explicit_category: Optional[str]) -
     return "" if matched == "Unknown" else matched
 
 
+def _icecat_value(*candidates: Any) -> str:
+    """First non-empty Icecat field value.
+
+    Icecat returns some fields as a bare string and others as a localised
+    ``{"Value": ..., "Language": ...}`` object, sometimes both for the same key
+    across products, so every read has to tolerate either shape.
+    """
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            candidate = candidate.get("Value")
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _icecat_localised(language: str, *candidates: Any) -> str:
+    """First non-empty candidate, preferring one tagged with the requested language.
+
+    Icecat returns localised copy as ``{"Value": ..., "Language": "FR"}`` and silently
+    falls back to another language when it holds none for the one requested, so a
+    language-tagged value that does not match is only used when nothing better exists.
+    """
+    wanted = str(language or "").strip().upper()
+    if wanted:
+        for candidate in candidates:
+            tag = candidate.get("Language") if isinstance(candidate, dict) else None
+            if str(tag or "").strip().upper() not in ("", wanted):
+                continue  # Icecat fell back to another language for this field
+            text = _icecat_value(candidate)
+            if text:
+                return text
+    return _icecat_value(*candidates)
+
+
+def _icecat_description(icecat_general: dict) -> str:
+    """Prose description for the product card.
+
+    ``LongSummaryDescription`` reads as sentences; ``ShortSummaryDescription`` is a
+    comma-separated spec dump. Prefer the former and fall back to the latter.
+    """
+    summary = icecat_general.get("SummaryDescription")
+    if not isinstance(summary, dict):
+        return ""
+    return _icecat_value(
+        summary.get("LongSummaryDescription"),
+        summary.get("ShortSummaryDescription"),
+    )
+
+
+def _icecat_features(icecat_general: dict, language: str = "") -> list:
+    """Bullet points, preferring Icecat's supplier-authored list over its generated one.
+
+    Each block is language-tagged, so a block in the requested language wins over one
+    Icecat fell back to, even if the fallback comes from the preferred source.
+    """
+    blocks = []
+    for key in ("BulletPoints", "GeneratedBulletPoints"):
+        block = icecat_general.get(key)
+        if not isinstance(block, dict):
+            continue
+        values = block.get("Values")
+        if not isinstance(values, list):
+            continue
+        bullets = [text for text in (_icecat_value(value) for value in values) if text]
+        if bullets:
+            blocks.append((str(block.get("Language") or "").strip().upper(), bullets))
+    if not blocks:
+        return []
+    wanted = str(language or "").strip().upper()
+    if wanted:
+        for block_language, bullets in blocks:
+            if block_language in ("", wanted):
+                return bullets
+    return blocks[0][1]
+
+
+def _icecat_specifications(icecat: dict) -> dict:
+    """Flatten FeaturesGroups into the {name: value} shape the product card renders.
+
+    ``PresentationValue`` carries the unit ('147.3 cm (58")', '130 W'), so it is
+    preferred over the raw value. Later groups do not overwrite earlier ones —
+    Icecat orders groups by relevance and can repeat a feature name across them.
+    """
+    specs: dict[str, str] = {}
+    for group in icecat.get("FeaturesGroups") or []:
+        if not isinstance(group, dict):
+            continue
+        for feature in group.get("Features") or []:
+            if not isinstance(feature, dict):
+                continue
+            name = _icecat_value((feature.get("Feature") or {}).get("Name"))
+            value = _icecat_value(
+                feature.get("PresentationValue"),
+                feature.get("LocalValue"),
+                feature.get("Value"),
+            )
+            if name and value and name not in specs:
+                specs[name] = value
+    return specs
+
+
+def _icecat_gallery(icecat: dict) -> list:
+    """Display-sized gallery images, largest-useful first, de-duplicated."""
+    gallery: list[str] = []
+    for entry in icecat.get("Gallery") or []:
+        if not isinstance(entry, dict):
+            continue
+        url = _icecat_value(entry.get("Pic500x500"), entry.get("Pic"))
+        if url and url not in gallery:
+            gallery.append(url)
+    return gallery
+
+
 def _extract_product_data(data: MasterSKURequest) -> dict:
     icecat = _icecat(data.GTIN.strip(), data.Make.strip(), data.Model.strip(), data.locale)
     upc = _go_upc(data.GTIN.strip()) if not icecat else {}
@@ -127,16 +241,37 @@ def _extract_product_data(data: MasterSKURequest) -> dict:
     brand = general.get("Brand") or general.get("BrandName") or upc_product.get("brand")
     if isinstance(brand, dict):
         brand = brand.get("Value") or brand.get("Name")
-    name_info = general.get("ProductNameInfo") or {}
-    product_int_name = name_info.get("ProductIntName") if isinstance(name_info, dict) else None
-    if isinstance(product_int_name, dict):
-        product_int_name = product_int_name.get("Value")
-    product_name = general.get("ProductName") or product_int_name or general.get("ProductCode")
-    if isinstance(product_name, dict):
-        product_name = product_name.get("Value")
-    title = general.get("Title") or upc_product.get("name")
-    if isinstance(title, dict):
-        title = title.get("Value")
+    name_info = general.get("ProductNameInfo") if isinstance(general.get("ProductNameInfo"), dict) else {}
+    # Icecat separates the manufacturer part number ("58A6Q", shown as "Product code") from
+    # the long marketing name ("58\" A6QTUK 4K Ultra HD Smart TV with Freely"). Only the part
+    # number belongs in identifiers.model: it builds the DataforSEO search keyword and is the
+    # string matched against merchant listing titles when the results come back. Using the
+    # marketing name as the model makes every shopping enrichment miss.
+    product_code = _icecat_value(
+        general.get("BrandPartCode"),
+        name_info.get("BrandPartCode"),
+        general.get("ProductCode"),
+        name_info.get("ProductIntName"),
+    )
+    # The locale drives the Icecat lookup language, and the resulting copy lands in this
+    # SKU's locale-specific block — so pick the language-tagged variants over the
+    # international ones. The part number above stays language-independent.
+    language = str(data.locale or "")[:2]
+    title_info = general.get("TitleInfo") if isinstance(general.get("TitleInfo"), dict) else {}
+    product_name = _icecat_localised(
+        language,
+        name_info.get("ProductLocalName"),
+        general.get("ProductName"),
+    )
+    title = _icecat_localised(
+        language,
+        title_info.get("BrandLocalTitle"),
+        title_info.get("GeneratedLocalTitle"),
+        general.get("Title"),
+        name_info.get("ProductLocalName"),
+        general.get("ProductName"),
+        title_info.get("GeneratedIntTitle"),
+    ) or _icecat_value(upc_product.get("name"))
     raw_category = general.get("Category") or {}
     category = raw_category.get("Name") if isinstance(raw_category, dict) else raw_category
     if isinstance(category, dict):
@@ -149,9 +284,18 @@ def _extract_product_data(data: MasterSKURequest) -> dict:
     )
     category = _canonical_category(category_text, data.Category)
 
-    icecat_image = icecat.get("Image") or {}
-    high_pic = icecat_image.get("HighPic") if isinstance(icecat_image, dict) else None
-    image_url = general.get("CoverPicture") or high_pic or upc_product.get("imageUrl")
+    icecat_image = icecat.get("Image") if isinstance(icecat.get("Image"), dict) else {}
+    high_pic = _icecat_value(icecat_image.get("HighPic"))
+    # HighPic is the print-resolution original (3072px / ~2.7 MB for this TV) and the card
+    # renders it at 160px. Pic500x500 is the same shot at display size, so prefer it and
+    # keep the original alongside for anything that needs to zoom.
+    cover = general.get("CoverPicture")
+    if isinstance(cover, dict):
+        cover = cover.get("Pic") or cover.get("Value")
+    image_url = (
+        _icecat_value(cover, icecat_image.get("Pic500x500"), high_pic)
+        or upc_product.get("imageUrl")
+    )
     if isinstance(image_url, dict):
         image_url = image_url.get("Pic") or image_url.get("Value")
 
@@ -166,12 +310,19 @@ def _extract_product_data(data: MasterSKURequest) -> dict:
     media = icecat.get("Multimedia") if isinstance(icecat.get("Multimedia"), list) else []
     return {
         "make": str(data.Make or brand or "").strip(),
-        "model": str(data.Model or product_name or "").strip(),
+        "model": str(data.Model or product_code or product_name or "").strip(),
         "gtins": gtins,
         "title": str(title or "").strip(),
         "category": str(category or "").strip(),
         "imageUrl": image_url,
+        "highResImage": high_pic,
+        "gallery": _icecat_gallery(icecat),
         "media": media,
+        "description": _icecat_description(general),
+        "features": _icecat_features(general, language),
+        "specifications": _icecat_specifications(icecat),
+        "icecatId": _icecat_value(general.get("IcecatId")),
+        "releaseDate": _icecat_value(general.get("ReleaseDate")),
     }
 
 
@@ -190,8 +341,14 @@ def _assets(product: dict, base_url: str) -> dict:
     assets: dict[str, Any] = {}
     if product.get("imageUrl"):
         assets["primaryImage"] = product["imageUrl"]
+    if product.get("highResImage") and product["highResImage"] != product.get("imageUrl"):
+        assets["highResImage"] = product["highResImage"]
+    if product.get("gallery"):
+        assets["gallery"] = list(product["gallery"])
     documents = []
-    for item in product.get("media") or []:
+    # Only the documents need base_url — they are served back through the masking proxy.
+    # Images are absolute Icecat URLs, so they must survive a missing base_url.
+    for item in (product.get("media") or []) if base_url else []:
         if not isinstance(item, dict) or not item.get("URL"):
             continue
         documents.append({
@@ -272,8 +429,14 @@ def create_master_sku_service(
             "currency": locale_info.get("currency", ""),
             "merchant": None,
         },
-        "assets": _assets(product, base_url) if base_url else {},
-        "specifications": {},
+        "assets": _assets(product, base_url),
+        # Icecat already carries the copy the product card renders. Populating it here
+        # means a SKU is presentable immediately, rather than only after the DataforSEO
+        # round-trip — which may match nothing, or never run at all when add_pricing
+        # is false.
+        "description": product.get("description") or "",
+        "features": list(product.get("features") or []),
+        "specifications": dict(product.get("specifications") or {}),
         "enrichment": {"status": "pending" if add_pricing else "not_requested"},
         "createdAt": now,
         "updatedAt": now,
@@ -290,7 +453,11 @@ def create_master_sku_service(
         },
         "category": product["category"],
         "imageUrl": product.get("imageUrl"),
-        "provenance": {"createdFrom": "catalog-api"},
+        "provenance": {
+            "createdFrom": "catalog-api",
+            **({"icecatId": product["icecatId"]} if product.get("icecatId") else {}),
+            **({"releaseDate": product["releaseDate"]} if product.get("releaseDate") else {}),
+        },
         "createdAt": now,
     }
     master_filter = {"_id": existing["_id"]} if existing else {"matchKey": key}

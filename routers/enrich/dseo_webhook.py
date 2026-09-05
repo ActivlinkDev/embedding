@@ -250,19 +250,25 @@ def _process_product_info_task(task: dict) -> dict:
     }
 
     now = utc_now()
-    mastersku_collection.update_one(
-        {"_id": ms_id},
-        {"$set": {
-            f"locales.{locale}.description": extra_product_info.get("description"),
-            f"locales.{locale}.features": extra_product_info.get("features"),
-            f"locales.{locale}.specifications": specs_dict,
-            f"locales.{locale}.assets.gallery": extra_product_info.get("images") or [],
-            f"locales.{locale}.market.sellers": sellers,
-            f"locales.{locale}.enrichment.productInfoAt": now,
-            f"locales.{locale}.updatedAt": now,
-            "updatedAt": now,
-        }},
-    )
+    prefix = f"locales.{locale}"
+    update = {
+        f"{prefix}.market.sellers": sellers,
+        f"{prefix}.enrichment.productInfoAt": now,
+        f"{prefix}.updatedAt": now,
+        "updatedAt": now,
+    }
+    # These four are populated from Icecat at creation. DataforSEO frequently returns a
+    # product_info element with some of them missing, so only overwrite what it actually
+    # carries — an unconditional $set would blank good catalogue copy.
+    for path, value in (
+        (f"{prefix}.description", extra_product_info.get("description")),
+        (f"{prefix}.features", extra_product_info.get("features")),
+        (f"{prefix}.specifications", specs_dict),
+        (f"{prefix}.assets.gallery", extra_product_info.get("images")),
+    ):
+        if value:
+            update[path] = value
+    mastersku_collection.update_one({"_id": ms_id}, {"$set": update})
 
     print(
         f"[DSEO Webhook] Stored extra_product_info for MasterSKU {master_sku_id} locale={locale} "
