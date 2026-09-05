@@ -118,11 +118,22 @@ def _process_task(task: dict) -> dict:
 
     # Build the canonical locale market update.
     rating_obj = item.get("product_rating") or {}
+    if not isinstance(rating_obj, dict):
+        rating_obj = {}
     image_list = item.get("product_images") or []
+    if not isinstance(image_list, list):
+        image_list = []
 
     now = utc_now()
     prefix = f"locales.{locale}"
     locale_update = {
+        f"{prefix}.enrichment.source": "DataforSEO",
+        f"{prefix}.enrichment.status": "found",
+        f"{prefix}.enrichment.updatedAt": now,
+        f"{prefix}.updatedAt": now,
+        "updatedAt": now,
+    }
+    optional_values = {
         f"{prefix}.title": item.get("title"),
         f"{prefix}.market.googleId": item.get("gid"),
         f"{prefix}.market.merchant": item.get("seller"),
@@ -132,13 +143,13 @@ def _process_task(task: dict) -> dict:
         f"{prefix}.market.reviews": rating_obj.get("votes_count"),
         f"{prefix}.market.shoppingUrl": item.get("shopping_url"),
         f"{prefix}.market.productId": item.get("product_id"),
-        f"{prefix}.enrichment.source": "DataforSEO",
-        f"{prefix}.enrichment.status": "found",
-        f"{prefix}.enrichment.updatedAt": now,
-        f"{prefix}.updatedAt": now,
-        "updatedAt": now,
     }
-    if image_list:
+    locale_update.update({
+        path: value
+        for path, value in optional_values.items()
+        if value is not None and (not isinstance(value, str) or value.strip())
+    })
+    if image_list and image_list[0]:
         locale_update[f"{prefix}.assets.primaryImage"] = image_list[0]
     mastersku_collection.update_one({"_id": ms_id}, {"$set": locale_update})
 

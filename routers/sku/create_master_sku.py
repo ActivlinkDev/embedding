@@ -15,8 +15,10 @@ import httpx
 from pydantic import BaseModel, Field
 from pymongo import ReturnDocument
 import requests
+from starlette.background import BackgroundTask
 
 from services.catalog import SCHEMA_VERSION, master_match_key, normalize_text, serialize, utc_now
+from utils.category_tree import resolve as resolve_category
 from utils.dependencies import verify_token
 from .catalog_dependencies import catalog, database, master_collection, locale_collection
 
@@ -75,6 +77,47 @@ def _go_upc(gtin: str) -> dict:
         return {}
 
 
+def compute_category_embedding(category_input: str):
+    """Map enrichment text to the canonical Category taxonomy."""
+    try:
+        from utils.common import (
+            category_embeddings,
+            device_categories,
+            embed_query,
+            find_best_match,
+            mongo_vector_search,
+        )
+
+        embedding = embed_query(category_input)
+        matched_category, similarity = mongo_vector_search(embedding)
+        if not matched_category:
+            matched_category, similarity = find_best_match(
+                embedding, category_embeddings, device_categories
+            )
+    except Exception:
+        logger.exception("Category classification failed for input=%r", category_input)
+        return "Unknown", None, 0.0, []
+
+    final_category = (
+        matched_category
+        if matched_category and float(similarity or 0.0) >= 0.42
+        else "Unknown"
+    )
+    return final_category, matched_category, float(similarity or 0.0), embedding
+
+
+def _canonical_category(category_input: str, explicit_category: Optional[str]) -> str:
+    if explicit_category and explicit_category.strip():
+        return resolve_category(explicit_category)["category"] or explicit_category.strip()
+    if not category_input.strip():
+        return ""
+    exact = resolve_category(category_input)
+    if exact.get("group") or exact.get("sector"):
+        return exact["category"] or ""
+    matched, _, _, _ = compute_category_embedding(category_input)
+    return "" if matched == "Unknown" else matched
+
+
 def _extract_product_data(data: MasterSKURequest) -> dict:
     icecat = _icecat(data.GTIN.strip(), data.Make.strip(), data.Model.strip(), data.locale)
     upc = _go_upc(data.GTIN.strip()) if not icecat else {}
@@ -84,7 +127,11 @@ def _extract_product_data(data: MasterSKURequest) -> dict:
     brand = general.get("Brand") or general.get("BrandName") or upc_product.get("brand")
     if isinstance(brand, dict):
         brand = brand.get("Value") or brand.get("Name")
-    product_name = general.get("ProductName") or general.get("ProductCode")
+    name_info = general.get("ProductNameInfo") or {}
+    product_int_name = name_info.get("ProductIntName") if isinstance(name_info, dict) else None
+    if isinstance(product_int_name, dict):
+        product_int_name = product_int_name.get("Value")
+    product_name = general.get("ProductName") or product_int_name or general.get("ProductCode")
     if isinstance(product_name, dict):
         product_name = product_name.get("Value")
     title = general.get("Title") or upc_product.get("name")
@@ -94,9 +141,17 @@ def _extract_product_data(data: MasterSKURequest) -> dict:
     category = raw_category.get("Name") if isinstance(raw_category, dict) else raw_category
     if isinstance(category, dict):
         category = category.get("Value") or category.get("Name")
-    category = data.Category or category or upc_product.get("category") or ""
+    source_category = category or upc_product.get("category") or ""
+    category_text = " ".join(
+        str(value).strip()
+        for value in (source_category, upc_product.get("name"))
+        if value and str(value).strip()
+    )
+    category = _canonical_category(category_text, data.Category)
 
-    image_url = general.get("CoverPicture") or upc_product.get("imageUrl")
+    icecat_image = icecat.get("Image") or {}
+    high_pic = icecat_image.get("HighPic") if isinstance(icecat_image, dict) else None
+    image_url = general.get("CoverPicture") or high_pic or upc_product.get("imageUrl")
     if isinstance(image_url, dict):
         image_url = image_url.get("Pic") or image_url.get("Value")
 
@@ -147,6 +202,11 @@ def _assets(product: dict, base_url: str) -> dict:
     if documents:
         assets["documents"] = documents
     return assets
+
+
+async def _close_upstream(response: httpx.Response, client: httpx.AsyncClient) -> None:
+    await response.aclose()
+    await client.aclose()
 
 
 async def _run_dseo_task(locale: str, masterSKUid: str):
@@ -282,18 +342,23 @@ async def proxy_masked(key: str):
         if comparable < datetime.now(timezone.utc):
             raise HTTPException(status_code=404, detail="Not found")
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(doc["url"], follow_redirects=True)
-            headers = {
-                name: value for name, value in response.headers.items()
-                if name.lower() not in {"connection", "transfer-encoding", "content-encoding"}
-            }
-            body = await response.aread()
+        client = httpx.AsyncClient(timeout=30.0)
+        try:
+            upstream_request = client.build_request("GET", doc["url"])
+            response = await client.send(upstream_request, stream=True, follow_redirects=True)
+        except Exception:
+            await client.aclose()
+            raise
+        headers = {
+            name: value for name, value in response.headers.items()
+            if name.lower() not in {"connection", "transfer-encoding"}
+        }
         return StreamingResponse(
-            iter([body]),
+            response.aiter_raw(),
             status_code=response.status_code,
             headers=headers,
             media_type=response.headers.get("content-type"),
+            background=BackgroundTask(_close_upstream, response, client),
         )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {exc}")

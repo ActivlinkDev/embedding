@@ -143,7 +143,9 @@ def create_custom_sku_service(
         "skuNormalized": normalize_sku(sku),
     })
     master = None
-    if existing and isinstance(existing.get("masterSkuId"), ObjectId):
+    if data.masterSkuId:
+        master = _master_for_request(data, background_tasks, request)
+    elif existing and isinstance(existing.get("masterSkuId"), ObjectId):
         master = master_collection.find_one({"_id": existing["masterSkuId"]})
         if master and data.Locale not in (master.get("locales") or {}):
             master = None

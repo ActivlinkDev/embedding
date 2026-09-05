@@ -135,6 +135,11 @@ def main() -> int:
             [("clientId", 1), ("enabledLocales", 1)],
             name="client_locales",
         )
+        db["url_map"].create_index(
+            "expires_at",
+            expireAfterSeconds=0,
+            name="ttl_url_map_expiry",
+        )
 
         after = {
             "MasterSKU": masters.count_documents({}),

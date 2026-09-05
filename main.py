@@ -38,6 +38,18 @@ app = FastAPI(
     openapi_url="/openapi.json" if docs_enabled else None,
 )
 
+
+@app.on_event("startup")
+def ensure_catalog_indexes() -> None:
+    from routers.sku.catalog_dependencies import catalog, database
+
+    catalog.ensure_indexes()
+    database["url_map"].create_index(
+        "expires_at",
+        expireAfterSeconds=0,
+        name="ttl_url_map_expiry",
+    )
+
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
