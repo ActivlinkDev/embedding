@@ -38,6 +38,18 @@ app = FastAPI(
     openapi_url="/openapi.json" if docs_enabled else None,
 )
 
+
+@app.on_event("startup")
+def ensure_catalog_indexes() -> None:
+    from routers.sku.catalog_dependencies import catalog, database
+
+    catalog.ensure_indexes()
+    database["url_map"].create_index(
+        "expires_at",
+        expireAfterSeconds=0,
+        name="ttl_url_map_expiry",
+    )
+
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
@@ -108,12 +120,9 @@ ROUTERS = {
     "client_lookup": "routers.client_lookup",
     "lookup_locale_params": "routers.lookup_locale_params",
     "lookup_custom_sku": "routers.sku.lookup_custom_sku",
-    "lookup_custom_sku_all": "routers.sku.lookup_custom_sku_all",
-    "lookup_custom_sku_locale": "routers.sku.lookup_custom_sku_locale",
     "create_custom_sku": "routers.sku.create_custom_sku",
     "update_custom_sku": "routers.sku.update_custom_sku",
     "get_custom_sku": "routers.sku.get_custom_sku",
-    "backfill_msrp": "routers.sku.backfill_msrp",
     "delete_custom_sku": "routers.sku.delete_custom_sku",
     "lookup_master_sku": "routers.sku.lookup_master_sku",
     "lookup_master_sku_all": "routers.sku.lookup_master_sku_all",

@@ -13,7 +13,7 @@ from pymongo import MongoClient
 from bson import ObjectId
 from dotenv import load_dotenv
 
-from routers.sku.propagate_master_price import propagate_master_price
+from services.catalog import utc_now
 
 load_dotenv()
 
@@ -25,6 +25,8 @@ mongo_client = MongoClient(os.getenv("MONGO_URI"))
 db = mongo_client["Activlink"]
 dseo_results_collection = db["DSEO_Results"]
 mastersku_collection = db["MasterSKU"]
+customsku_collection = db["CustomSKU"]
+clientkey_collection = db["ClientKey"]
 locale_collection = db["Locale_Params"]
 
 # Item types that wrap child items rather than carry pricing directly.
@@ -78,7 +80,7 @@ def _process_task(task: dict) -> dict:
     """
     Extract the best-matching shopping item from a single DataforSEO task,
     resolve the locale, and upsert the relevant fields into MasterSKU
-    Locale_Specific_Data.  Returns a status dict for logging.
+    locale map. Returns a status dict for logging.
     """
     task_data = task.get("data") or {}
     master_sku_id = task_data.get("tag")
@@ -102,7 +104,7 @@ def _process_task(task: dict) -> dict:
     if not ms_doc:
         return {"status": "error", "reason": f"MasterSKU {master_sku_id} not found"}
 
-    model = (ms_doc.get("Model") or "").strip()
+    model = ((ms_doc.get("identifiers") or {}).get("model") or "").strip()
 
     # Dig into result items
     results = task.get("result") or []
@@ -114,36 +116,42 @@ def _process_task(task: dict) -> dict:
     if not item:
         return {"status": "no_match", "master_sku_id": master_sku_id, "locale": locale, "model": model}
 
-    # Build the locale-specific update payload — field names match scale_lookup.py convention
+    # Build the canonical locale market update.
     rating_obj = item.get("product_rating") or {}
+    if not isinstance(rating_obj, dict):
+        rating_obj = {}
     image_list = item.get("product_images") or []
+    if not isinstance(image_list, list):
+        image_list = []
 
+    now = utc_now()
+    prefix = f"locales.{locale}"
     locale_update = {
-        "SERP_Title": item.get("title"),
-        "Google_ID": item.get("gid"),
-        "Merchant": item.get("seller"),
-        "Currency": item.get("currency"),
-        "Price": item.get("price"),
-        "Rating": rating_obj.get("value"),
-        "Reviews": rating_obj.get("votes_count"),
-        "Shopping_URL": item.get("shopping_url"),
-        "Image": image_list[0] if image_list else None,
-        "Product_ID": item.get("product_id"),
-        "source": "DataforSEO",
-        "serp_status": "found",
-        "created_at": _utc_now_iso(),
+        f"{prefix}.enrichment.source": "DataforSEO",
+        f"{prefix}.enrichment.status": "found",
+        f"{prefix}.enrichment.updatedAt": now,
+        f"{prefix}.updatedAt": now,
+        "updatedAt": now,
     }
-
-    # Upsert into Locale_Specific_Data array — same two-step pattern as scale_lookup.py
-    result = mastersku_collection.update_one(
-        {"_id": ms_id, "Locale_Specific_Data.locale": locale},
-        {"$set": {f"Locale_Specific_Data.$.{k}": v for k, v in locale_update.items()}},
-    )
-    if result.matched_count == 0:
-        mastersku_collection.update_one(
-            {"_id": ms_id},
-            {"$push": {"Locale_Specific_Data": {"locale": locale, **locale_update}}},
-        )
+    optional_values = {
+        f"{prefix}.title": item.get("title"),
+        f"{prefix}.market.googleId": item.get("gid"),
+        f"{prefix}.market.merchant": item.get("seller"),
+        f"{prefix}.market.currency": item.get("currency"),
+        f"{prefix}.market.referencePrice": item.get("price"),
+        f"{prefix}.market.rating": rating_obj.get("value"),
+        f"{prefix}.market.reviews": rating_obj.get("votes_count"),
+        f"{prefix}.market.shoppingUrl": item.get("shopping_url"),
+        f"{prefix}.market.productId": item.get("product_id"),
+    }
+    locale_update.update({
+        path: value
+        for path, value in optional_values.items()
+        if value is not None and (not isinstance(value, str) or value.strip())
+    })
+    if image_list and image_list[0]:
+        locale_update[f"{prefix}.assets.primaryImage"] = image_list[0]
+    mastersku_collection.update_one({"_id": ms_id}, {"$set": locale_update})
 
     print(
         f"[DSEO Webhook] Updated MasterSKU {master_sku_id} locale={locale} "
@@ -161,34 +169,29 @@ def _process_task(task: dict) -> dict:
     }
 
 
-def _backfill_msrp_and_warm(master_sku_id, locale, price, currency):
-    """Fill blank CustomSKU MSRPs from a freshly-enriched master price, then
-    re-warm the widget quote cache for each SKU that changed.
-
-    Scheduled as a background task rather than run inline: it scans and updates
-    an unbounded number of CustomSKUs and then runs the full assignment + rating
-    path per SKU. All of that is blocking, and the postback handler is an
-    ``async def`` sharing a single Uvicorn worker's event loop with every other
-    request. As a sync function, Starlette runs this in a threadpool.
-
-    Never raises — both halves swallow their own errors.
-    """
-    targets = propagate_master_price(master_sku_id, locale, price, currency)
-    if not targets:
+def _warm_inherited_skus(master_sku_id, locale):
+    """Rebuild quote caches for SKUs inheriting this master's locale price."""
+    try:
+        master_id = ObjectId(master_sku_id)
+    except Exception:
         return
-    # Imported lazily so a failure in the pricing import chain can't stop this
-    # router from loading.
     from routers.widget_quote import warm_widget_cache
-
-    for client_key, custom_sku_id, warm_locale in targets:
-        warm_widget_cache(client_key, custom_sku_id, warm_locale)
+    query = {
+        "masterSkuId": master_id,
+        "enabledLocales": locale,
+        f"overrides.locales.{locale}.price": {"$exists": False},
+    }
+    for custom in customsku_collection.find(query, {"clientId": 1}):
+        client = clientkey_collection.find_one({"Client_ID": custom.get("clientId")}, {"ClientKey": 1})
+        if client and client.get("ClientKey"):
+            warm_widget_cache(client["ClientKey"], str(custom["_id"]), locale)
 
 
 def _process_product_info_task(task: dict) -> dict:
     """
     Handle a product_info postback: extract the product_info_element from
     result[0].items[0] and upsert it as an `extra_product_info` object into
-    the matching MasterSKU Locale_Specific_Data entry.
+    the matching MasterSKU locale entry.
     """
     task_data = task.get("data") or {}
     master_sku_id = task_data.get("tag")
@@ -246,15 +249,20 @@ def _process_product_info_task(task: dict) -> dict:
         "retrieved_at": _utc_now_iso(),
     }
 
-    result = mastersku_collection.update_one(
-        {"_id": ms_id, "Locale_Specific_Data.locale": locale},
-        {"$set": {"Locale_Specific_Data.$.extra_product_info": extra_product_info}},
+    now = utc_now()
+    mastersku_collection.update_one(
+        {"_id": ms_id},
+        {"$set": {
+            f"locales.{locale}.description": extra_product_info.get("description"),
+            f"locales.{locale}.features": extra_product_info.get("features"),
+            f"locales.{locale}.specifications": specs_dict,
+            f"locales.{locale}.assets.gallery": extra_product_info.get("images") or [],
+            f"locales.{locale}.market.sellers": sellers,
+            f"locales.{locale}.enrichment.productInfoAt": now,
+            f"locales.{locale}.updatedAt": now,
+            "updatedAt": now,
+        }},
     )
-    if result.matched_count == 0:
-        mastersku_collection.update_one(
-            {"_id": ms_id},
-            {"$push": {"Locale_Specific_Data": {"locale": locale, "extra_product_info": extra_product_info}}},
-        )
 
     print(
         f"[DSEO Webhook] Stored extra_product_info for MasterSKU {master_sku_id} locale={locale} "
@@ -375,16 +383,13 @@ async def dseo_webhook(request: Request, background_tasks: BackgroundTasks):
 
         processing_results.append(outcome)
 
-        # CustomSKUs created before this price landed were persisted with a
-        # blank MSRP, which also left their widget quote cache cold. Backfill
-        # and re-warm them off-request — see _backfill_msrp_and_warm.
+        # CustomSKUs inherit master pricing at read time. Rebuild only their
+        # derived quote caches; no catalogue data is copied.
         if fn != "product_info" and outcome.get("status") == "ok":
             background_tasks.add_task(
-                _backfill_msrp_and_warm,
+                _warm_inherited_skus,
                 outcome["master_sku_id"],
                 outcome["locale"],
-                outcome.get("price"),
-                outcome.get("currency"),
             )
 
         # After a successful shopping task, auto-submit product_info if Product_ID was found

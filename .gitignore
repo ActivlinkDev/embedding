@@ -3,3 +3,4 @@
 __pycache__/
 .env
 mailboxes.json
+.claude/settings.local.json

@@ -101,7 +101,7 @@ def generate_device_qr(
             raise HTTPException(status_code=400, detail="custom_sku must be a valid MongoDB ObjectId")
         # Fix 3: validate SKU belongs to the requesting client
         client_id = client_doc.get("Client_ID")
-        if not customsku_collection.find_one({"_id": sku_oid, "Client": client_id}):
+        if not customsku_collection.find_one({"_id": sku_oid, "clientId": client_id}):
             raise HTTPException(status_code=400, detail="custom_sku not found for this client")
 
     hex_key = _unique_hex_key(used_in_batch=set())

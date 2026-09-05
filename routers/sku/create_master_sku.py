@@ -1,856 +1,374 @@
-# master_sku_router.py
+"""Create and enrich canonical v2 MasterSKU documents."""
 
-from fastapi import APIRouter, HTTPException, Depends, Query, Request, BackgroundTasks
-from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any
-import requests
-import threading
+from __future__ import annotations
+
 import asyncio
-import os
-from datetime import datetime, timezone, timedelta
-from uuid import uuid4
-from pymongo import MongoClient
-from pymongo import ReturnDocument, errors
-from bson import ObjectId
-import re
-from dotenv import load_dotenv
-from fastapi.responses import RedirectResponse, StreamingResponse
-import httpx
+from datetime import datetime, timedelta, timezone
 import logging
+import os
+from typing import Any, Optional
+from uuid import uuid4
 
-from utils.api_docs import error, json_response, secured
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+import httpx
+from pydantic import BaseModel, Field
+from pymongo import ReturnDocument
+import requests
+from starlette.background import BackgroundTask
+
+from services.catalog import SCHEMA_VERSION, master_match_key, normalize_text, serialize, utc_now
+from utils.category_tree import resolve as resolve_category
 from utils.dependencies import verify_token
-from utils.common import embed_query, find_best_match, category_embeddings, device_categories
-
-load_dotenv()
-
-router = APIRouter(
-    prefix="/sku",
-    tags=["Catalog"]
-)
+from .catalog_dependencies import catalog, database, master_collection, locale_collection
 
 
-@router.get(
-    "/r/{key}",
-    summary="Serve a masked product asset through the API",
-    response_description="The upstream file, streamed back with its original content type.",
-    responses={
-        200: {
-            "description": "The upstream resource, proxied. Content type is whatever the origin "
-                           "returned — commonly `application/pdf` or an image.",
-            "content": {"application/octet-stream": {}},
-        },
-        404: error("No mapping for this key, or the mapping has expired.", "Not found"),
-    },
-)
-async def proxy_masked(key: str):
-    """
-    Serve a product asset (manual, product fiche, image) stored behind a masked key.
-
-    MasterSKU documents reference assets by an opaque key rather than the supplier's URL. This
-    endpoint resolves the key from `url_map`, fetches the file server-side and streams it back,
-    so the browser only ever sees an Activlink URL and the upstream host stays private.
-
-    Path parameter `key` is mandatory and is the UUID stored in the MasterSKU document. Mappings
-    may carry an expiry; an expired one is reported as `404`, the same as an unknown key.
-
-    **No authentication is required** — these URLs are handed to end customers. The response is
-    the file itself, not JSON.
-    """
-    try:
-        doc = url_map_collection.find_one({"_id": key})
-    except Exception:
-        doc = None
-    if not doc:
-        raise HTTPException(status_code=404, detail="Not found")
-
-    # Optional expiry check
-    expires_at = doc.get("expires_at")
-    if expires_at and isinstance(expires_at, datetime) and expires_at < datetime.utcnow():
-        raise HTTPException(status_code=404, detail="Not found")
-
-    url = doc.get("url")
-    if not url:
-        raise HTTPException(status_code=404, detail="Not found")
-
-    # Stream the upstream response back to the client
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            upstream = await client.get(url, follow_redirects=True)
-
-            # Filter hop-by-hop headers
-            hop_by_hop = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade", "content-encoding"}
-            headers = {k: v for k, v in upstream.headers.items() if k.lower() not in hop_by_hop}
-
-            media_type = upstream.headers.get("content-type")
-            return StreamingResponse(upstream.aiter_bytes(), status_code=upstream.status_code, headers=headers, media_type=media_type)
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {str(e)}")
-
-client = MongoClient(os.getenv("MONGO_URI"))
-db = client["Activlink"]
-
-locale_collection = db["Locale_Params"]
-master_collection = db["MasterSKU"]
-failed_matches_collection = db["Failed_Matches"]
-url_map_collection = db["url_map"]
-category_collection = db["Category"]
-
-# module logger
+router = APIRouter(prefix="/sku", tags=["Catalog"])
 logger = logging.getLogger(__name__)
-# If root logging isn't configured, default to INFO so we still see messages during dev.
-if not logging.getLogger().handlers:
-    logging.basicConfig(level=logging.INFO)
-logger.setLevel(logging.INFO)
-logger.propagate = True
-
-# Ensure a uniqueness guard to reduce duplicate MasterSKU creation.
-# Use a computed `match_key` (prefers GTIN when present, otherwise normalized make|model).
-try:
-    master_collection.create_index("match_key", unique=True, sparse=True)
-except Exception:
-    # If index creation fails (permissions, etc.) continue — DB-level dedupe unavailable.
-    pass
-
-# Ensure TTL index on url_map.expires_at if present (best-effort)
-try:
-    url_map_collection.create_index("expires_at", expireAfterSeconds=0)
-except Exception:
-    pass
+category_collection = database["Category"]
+url_map_collection = database["url_map"]
 
 ICECAT_USERNAME = os.getenv("ICECAT_USER")
 GO_UPC_API_KEY = os.getenv("GO_UPC_TOKEN")
 
 
-def utc_now_iso():
-    """Returns the current UTC time in ISO 8601 format with 'Z' suffix and milliseconds."""
-    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
 class MasterSKURequest(BaseModel):
-    """The product to create, or add a locale to, in the shared MasterSKU catalogue.
+    Make: str = Field("")
+    Model: str = Field("")
+    GTIN: str = Field("")
+    locale: str
+    Category: Optional[str] = None
 
-    `Make`, `Model`, `GTIN` and `locale` are all mandatory **fields**, though `GTIN` may be sent
-    as an empty string when the barcode is unknown — matching then falls back to `Make`+`Model`.
-    A non-empty `GTIN` must be a valid barcode or the request is rejected with `400`.
-    """
 
-    Make: str = Field(..., description="**Mandatory.** Manufacturer name.", examples=["Bosch"])
-    Model: str = Field(..., description="**Mandatory.** Model designation.", examples=["SMS6ZCI00G"])
-    GTIN: str = Field(
-        ...,
-        description=(
-            "**Mandatory field**, but may be `\"\"`. When non-empty it must be a valid GTIN — "
-            "it is the primary key for matching and for third-party enrichment."
-        ),
-        examples=["5011773057240"],
-    )
-    locale: str = Field(
-        ...,
-        description="**Mandatory.** Locale to populate. Must exist in `Locale_Params`, else `404`.",
-        examples=["en_GB"],
-    )
-    Category: Optional[str] = Field(
-        None,
-        description="Optional category override. Omit to let the category be inferred during enrichment.",
-        examples=["Dishwasher"],
-    )
+def is_valid_gtin(gtin: str) -> bool:
+    return gtin.isdigit() and len(gtin) in {8, 12, 13, 14}
 
-    model_config = {
-        "json_schema_extra": {
-            "example": {
-                "Make": "Bosch",
-                "Model": "SMS6ZCI00G",
-                "GTIN": "5011773057240",
-                "locale": "en_GB",
-                "Category": "Dishwasher",
-            }
-        }
+
+def _icecat(gtin: str, make: str, model: str, locale: str) -> dict:
+    if not ICECAT_USERNAME:
+        return {}
+    params = {"username": ICECAT_USERNAME, "lang": locale[:2]}
+    if gtin:
+        params["GTIN"] = gtin
+    elif make and model:
+        params.update({"brand": make, "productcode": model})
+    else:
+        return {}
+    try:
+        response = requests.get("https://live.icecat.biz/api/", params=params, timeout=20)
+        return response.json().get("data", {}) if response.ok else {}
+    except Exception:
+        logger.exception("Icecat lookup failed")
+        return {}
+
+
+def _go_upc(gtin: str) -> dict:
+    if not gtin or not GO_UPC_API_KEY:
+        return {}
+    try:
+        response = requests.get(
+            f"https://go-upc.com/api/v1/code/{gtin}",
+            headers={"Authorization": f"Bearer {GO_UPC_API_KEY}"},
+            timeout=20,
+        )
+        return response.json() if response.ok else {}
+    except Exception:
+        logger.exception("Go-UPC lookup failed")
+        return {}
+
+
+def compute_category_embedding(category_input: str):
+    """Map enrichment text to the canonical Category taxonomy."""
+    try:
+        from utils.common import (
+            category_embeddings,
+            device_categories,
+            embed_query,
+            find_best_match,
+            mongo_vector_search,
+        )
+
+        embedding = embed_query(category_input)
+        matched_category, similarity = mongo_vector_search(embedding)
+        if not matched_category:
+            matched_category, similarity = find_best_match(
+                embedding, category_embeddings, device_categories
+            )
+    except Exception:
+        logger.exception("Category classification failed for input=%r", category_input)
+        return "Unknown", None, 0.0, []
+
+    final_category = (
+        matched_category
+        if matched_category and float(similarity or 0.0) >= 0.42
+        else "Unknown"
+    )
+    return final_category, matched_category, float(similarity or 0.0), embedding
+
+
+def _canonical_category(category_input: str, explicit_category: Optional[str]) -> str:
+    if explicit_category and explicit_category.strip():
+        return resolve_category(explicit_category)["category"] or explicit_category.strip()
+    if not category_input.strip():
+        return ""
+    exact = resolve_category(category_input)
+    if exact.get("group") or exact.get("sector"):
+        return exact["category"] or ""
+    matched, _, _, _ = compute_category_embedding(category_input)
+    return "" if matched == "Unknown" else matched
+
+
+def _extract_product_data(data: MasterSKURequest) -> dict:
+    icecat = _icecat(data.GTIN.strip(), data.Make.strip(), data.Model.strip(), data.locale)
+    upc = _go_upc(data.GTIN.strip()) if not icecat else {}
+    general = icecat.get("GeneralInfo") or {}
+    upc_product = upc.get("product") or {}
+
+    brand = general.get("Brand") or general.get("BrandName") or upc_product.get("brand")
+    if isinstance(brand, dict):
+        brand = brand.get("Value") or brand.get("Name")
+    name_info = general.get("ProductNameInfo") or {}
+    product_int_name = name_info.get("ProductIntName") if isinstance(name_info, dict) else None
+    if isinstance(product_int_name, dict):
+        product_int_name = product_int_name.get("Value")
+    product_name = general.get("ProductName") or product_int_name or general.get("ProductCode")
+    if isinstance(product_name, dict):
+        product_name = product_name.get("Value")
+    title = general.get("Title") or upc_product.get("name")
+    if isinstance(title, dict):
+        title = title.get("Value")
+    raw_category = general.get("Category") or {}
+    category = raw_category.get("Name") if isinstance(raw_category, dict) else raw_category
+    if isinstance(category, dict):
+        category = category.get("Value") or category.get("Name")
+    source_category = category or upc_product.get("category") or ""
+    category_text = " ".join(
+        str(value).strip()
+        for value in (source_category, upc_product.get("name"))
+        if value and str(value).strip()
+    )
+    category = _canonical_category(category_text, data.Category)
+
+    icecat_image = icecat.get("Image") or {}
+    high_pic = icecat_image.get("HighPic") if isinstance(icecat_image, dict) else None
+    image_url = general.get("CoverPicture") or high_pic or upc_product.get("imageUrl")
+    if isinstance(image_url, dict):
+        image_url = image_url.get("Pic") or image_url.get("Value")
+
+    gtins = [data.GTIN.strip()] if data.GTIN.strip() else []
+    icecat_gtins = general.get("GTIN")
+    if isinstance(icecat_gtins, list):
+        for item in icecat_gtins:
+            value = item.get("Value") if isinstance(item, dict) else item
+            if value and str(value) not in gtins:
+                gtins.append(str(value))
+
+    media = icecat.get("Multimedia") if isinstance(icecat.get("Multimedia"), list) else []
+    return {
+        "make": str(data.Make or brand or "").strip(),
+        "model": str(data.Model or product_name or "").strip(),
+        "gtins": gtins,
+        "title": str(title or "").strip(),
+        "category": str(category or "").strip(),
+        "imageUrl": image_url,
+        "media": media,
     }
 
 
+def _masked_url(url: str, base_url: str) -> str:
+    key = str(uuid4())
+    url_map_collection.insert_one({
+        "_id": key,
+        "url": url,
+        "created_at": utc_now(),
+        "expires_at": utc_now() + timedelta(days=365),
+    })
+    return f"{base_url.rstrip('/')}/sku/r/{key}"
 
-# --- Background DataforSEO Task ---
-try:
-    from routers.enrich.dseo_shopping import submit_dseo_shopping_task
-except Exception:
-    from enrich.dseo_shopping import submit_dseo_shopping_task
+
+def _assets(product: dict, base_url: str) -> dict:
+    assets: dict[str, Any] = {}
+    if product.get("imageUrl"):
+        assets["primaryImage"] = product["imageUrl"]
+    documents = []
+    for item in product.get("media") or []:
+        if not isinstance(item, dict) or not item.get("URL"):
+            continue
+        documents.append({
+            "label": str(item.get("Type") or item.get("Description") or "document"),
+            "url": _masked_url(str(item["URL"]), base_url),
+            "contentType": item.get("ContentType"),
+        })
+    if documents:
+        assets["documents"] = documents
+    return assets
+
+
+async def _close_upstream(response: httpx.Response, client: httpx.AsyncClient) -> None:
+    await response.aclose()
+    await client.aclose()
+
 
 async def _run_dseo_task(locale: str, masterSKUid: str):
     try:
-        logger.info(f"[bg_dseo] starting DataforSEO task masterSKUid={masterSKUid} locale={locale}")
+        from routers.enrich.dseo_shopping import submit_dseo_shopping_task
         await submit_dseo_shopping_task(masterSKUid=masterSKUid, locale=locale)
-        logger.info(f"[bg_dseo] DataforSEO task submitted masterSKUid={masterSKUid}")
     except Exception:
-        logger.exception(f"[bg_dseo] error submitting DataforSEO task masterSKUid={masterSKUid}")
+        logger.exception("Failed to schedule MasterSKU market enrichment")
 
-async def _probe_log(masterSKUid):
-    try:
-        await asyncio.sleep(0.1)
-        logger.info(f"[bg_probe] probe executed for masterSKUid={masterSKUid}")
-    except Exception:
-        logger.exception("[bg_probe] probe error")
 
-def is_valid_gtin(gtin: str) -> bool:
-    """Checks if GTIN is valid."""
-    return gtin.isdigit() and len(gtin) in {8, 12, 13, 14}
+def create_master_sku_service(
+    data: MasterSKURequest,
+    background_tasks: BackgroundTasks,
+    request: Optional[Request] = None,
+    add_pricing: bool = True,
+) -> dict:
+    gtin = data.GTIN.strip()
+    if gtin and not is_valid_gtin(gtin):
+        raise HTTPException(status_code=400, detail="Invalid GTIN format")
+    if not gtin and not (data.Make.strip() and data.Model.strip()):
+        raise HTTPException(status_code=400, detail="Provide GTIN or Make and Model")
 
-def fetch_locale_info(locale: str) -> Optional[Dict[str, Any]]:
-    """Get locale info from database."""
-    return locale_collection.find_one({"locale": locale}, {"_id": 0, "google_domain": 1, "hl": 1, "gl": 1, "currency": 1})
+    locale_info = locale_collection.find_one({"locale": data.locale})
+    if not locale_info:
+        raise HTTPException(status_code=404, detail=f"Locale {data.locale} not found")
 
-def fetch_icecat_by_gtin(gtin: str, locale: str) -> Optional[Dict]:
-    """Try to get Icecat info by GTIN."""
-    try:
-        url = f"https://live.icecat.biz/api/?username={ICECAT_USERNAME}&lang={locale[:2]}&GTIN={gtin}"
-        res = requests.get(url)
-        if res.status_code == 200:
-            return res.json().get("data", {})
-    except Exception as e:
-        logger.exception("[ICECAT GTIN error] %s", e)
-    return None
+    existing, matched_by = catalog.find_master(
+        gtin=gtin or None,
+        make=data.Make or None,
+        model=data.Model or None,
+    )
+    if existing and data.locale in (existing.get("locales") or {}):
+        if add_pricing:
+            background_tasks.add_task(_run_dseo_task, data.locale, str(existing["_id"]))
+        return {"source": "master", "matchedBy": matched_by, "masterSku": serialize(existing)}
 
-def fetch_icecat_by_make_model(make: str, model: str, locale: str) -> Optional[Dict]:
-    """Try to get Icecat info by Make+Model."""
-    try:
-        url = f"https://live.icecat.biz/api/?username={ICECAT_USERNAME}&lang={locale[:2]}&brand={make}&productcode={model}"
-        res = requests.get(url)
-        if res.status_code == 200:
-            return res.json().get("data", {})
-    except Exception as e:
-        logger.exception("[ICECAT fallback error] %s", e)
-    return None
-
-def fetch_upc(gtin: str) -> Optional[Dict]:
-    """Get product info from Go-UPC."""
-    try:
-        headers = {"Authorization": f"Bearer {GO_UPC_API_KEY}"}
-        res = requests.get(f"https://go-upc.com/api/v1/code/{gtin}", headers=headers)
-        if res.status_code == 200:
-            return res.json()
-    except Exception as e:
-        logger.exception("[Go-UPC error] %s", e)
-    return None
-
-def extract_make_model_from_title(title: str, data: MasterSKURequest):
-    """Use OpenAI to extract Make and Model if missing."""
-    if data.Make.strip() and data.Model.strip():
-        return
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        logger.debug("[extract_make_model] OPENAI_API_KEY not set — skipping AI extraction")
-        return
-    try:
-        import json, re
-        from openai import OpenAI
-        openai_client = OpenAI(api_key=api_key)
-        scoring_model = os.getenv("OPENAI_SCORING_MODEL", "gpt-4o-mini")
-        prompt = (
-            f"Extract the brand (Make) and model number/name from this product title: '{title}'. "
-            "Return only a JSON object with keys 'Make' and 'Model', no markdown, no explanation."
+    product = _extract_product_data(data)
+    if existing:
+        existing_identifiers = existing.get("identifiers") or {}
+        product["make"] = product["make"] or existing_identifiers.get("make") or ""
+        product["model"] = product["model"] or existing_identifiers.get("model") or ""
+        product["gtins"] = product["gtins"] or list(existing_identifiers.get("gtins") or [])
+        product["category"] = product["category"] or existing.get("category") or ""
+        product["imageUrl"] = product["imageUrl"] or existing.get("imageUrl")
+    if not product["make"] or not product["model"]:
+        raise HTTPException(
+            status_code=422,
+            detail="Product make and model could not be resolved; provide both values",
         )
-        response = openai_client.chat.completions.create(
-            model=scoring_model,
-            messages=[{"role": "user", "content": prompt}],
+    if not product["category"]:
+        raise HTTPException(
+            status_code=422,
+            detail="Product category could not be resolved; provide Category",
         )
-        raw = response.choices[0].message.content or ""
-        # Strip markdown code fences if present
-        raw = re.sub(r"^```[a-z]*\s*", "", raw.strip(), flags=re.IGNORECASE)
-        raw = re.sub(r"\s*```$", "", raw.strip())
-        parsed = json.loads(raw)
-        if not data.Make.strip():
-            data.Make = parsed.get("Make", "").strip()
-        if not data.Model.strip():
-            data.Model = parsed.get("Model", "").strip()
-        logger.info("[extract_make_model] AI extracted Make=%r Model=%r from title=%r", data.Make, data.Model, title)
-    except Exception as e:
-        logger.warning("[extract_make_model] AI extraction failed: %s", e)
-
-def extract_multimedia_urls(icecat_data: dict) -> dict:
-    """
-    Extracts 'manual_url' and 'product_fiche_url' from Icecat Multimedia list, if present.
-    """
-    multimedia = icecat_data.get("Multimedia") if icecat_data else None
-    manual_url = None
-    product_fiche_url = None
-
-    if isinstance(multimedia, list):
-        for item in multimedia:
-            # Match both on "Type" and Description for robustness
-            type_val = (item.get("Type") or "").lower()
-            desc_val = (item.get("Description") or "").lower()
-            url = item.get("URL")
-            if not url:
-                continue
-
-            if "manual" in type_val or "manual" in desc_val:
-                manual_url = url
-            elif "fiche" in type_val or "fiche" in desc_val:
-                product_fiche_url = url
-
+    base_url = str(request.base_url).rstrip("/") if request else os.getenv("FASTAPI_BASE_URL", "")
+    key = master_match_key(product["make"], product["model"], product["gtins"])
+    now = utc_now()
+    locale_block = {
+        "title": product["title"] or f"{product['make']} {product['model']}".strip(),
+        "category": product["category"],
+        "market": {
+            "referencePrice": None,
+            "currency": locale_info.get("currency", ""),
+            "merchant": None,
+        },
+        "assets": _assets(product, base_url) if base_url else {},
+        "specifications": {},
+        "enrichment": {"status": "pending" if add_pricing else "not_requested"},
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    set_on_insert = {
+        "schemaVersion": SCHEMA_VERSION,
+        "matchKey": key,
+        "identifiers": {
+            "make": product["make"],
+            "makeNormalized": normalize_text(product["make"]),
+            "model": product["model"],
+            "modelNormalized": normalize_text(product["model"]),
+            "gtins": product["gtins"],
+        },
+        "category": product["category"],
+        "imageUrl": product.get("imageUrl"),
+        "provenance": {"createdFrom": "catalog-api"},
+        "createdAt": now,
+    }
+    master_filter = {"_id": existing["_id"]} if existing else {"matchKey": key}
+    saved = master_collection.find_one_and_update(
+        master_filter,
+        {
+            "$setOnInsert": set_on_insert,
+            "$set": {f"locales.{data.locale}": locale_block, "updatedAt": now},
+        },
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    if saved and product["gtins"]:
+        master_collection.update_one(
+            {"_id": saved["_id"]},
+            {"$addToSet": {"identifiers.gtins": {"$each": product["gtins"]}}},
+        )
+        saved = master_collection.find_one({"_id": saved["_id"]})
+    if not saved:
+        raise HTTPException(status_code=500, detail="Failed to create MasterSKU")
+    if add_pricing:
+        background_tasks.add_task(_run_dseo_task, data.locale, str(saved["_id"]))
     return {
-        "manual_url": manual_url,
-        "product_fiche_url": product_fiche_url
+        "source": "master-update" if existing else "master-create",
+        "matchedBy": matched_by,
+        "masterSku": serialize(saved),
     }
 
 
-def mask_and_store_url(url: str, base_url: str = None, ttl_seconds: int = None) -> str:
-    """
-    Create a mapping record in `url_map` and return a masked internal path.
-    The mapping document has _id set to a UUID string and stores the original URL.
-    Returns path like "/sku/r/<uuid>" which can be used in MasterSKU documents.
-    """
-    try:
-        key = str(uuid4())
-        doc = {"_id": key, "url": url, "created_at": datetime.utcnow()}
-        if ttl_seconds and isinstance(ttl_seconds, int):
-            doc["expires_at"] = datetime.utcnow() + timedelta(seconds=ttl_seconds)
-        url_map_collection.insert_one(doc)
-        # Use provided base_url, then configured env, then fallback to localhost:8000
-        base = (base_url and str(base_url).strip()) or os.getenv("FASTAPI_BASE_URL") or os.getenv("PUBLIC_BACKEND_URL") or "http://localhost:8000"
-        return base.rstrip('/') + f"/sku/r/{key}"
-    except Exception:
-        # On any failure, fall back to storing the original url (safer than dropping it)
-        return url
-
-
-def _mask_extra_urls(extra: dict, base_url: str = None) -> dict:
-    """Replace any Icecat manual/product_fiche URLs in `extra` with masked paths."""
-    if not extra or not isinstance(extra, dict):
-        return extra
-    out = dict(extra)
-    try:
-        for k in ("manual_url", "product_fiche_url"):
-            if out.get(k):
-                try:
-                    out[k] = mask_and_store_url(out[k], base_url=base_url)
-                except Exception:
-                    # leave original if masking fails
-                    pass
-    except Exception:
-        return extra
-    return out
-
-
-def get_existing_sku(data: MasterSKURequest) -> Optional[Dict]:
-    """Find existing SKU by GTIN or Make+Model."""
-    existing = None
-    if data.GTIN.strip():
-        existing = master_collection.find_one({"GTIN": {"$in": [data.GTIN]}})
-    if not existing and data.Make.strip() and data.Model.strip():
-        existing = master_collection.find_one({
-            "Make": {"$regex": f"^{data.Make}$", "$options": "i"},
-            "Model": {"$regex": data.Model, "$options": "i"}
-        })
-    return existing
-
-def update_existing_sku(existing: Dict, data: MasterSKURequest, locale_block: Dict):
-    """Update SKU with new locale-specific data and GTIN."""
-    master_collection.update_one(
-        {"_id": existing["_id"]},
-        {"$addToSet": {"GTIN": data.GTIN}}
-    )
-    master_collection.update_one(
-        {"_id": existing["_id"]},
-        {"$pull": {"Locale_Specific_Data": {"locale": data.locale}}}
-    )
-    master_collection.update_one(
-        {"_id": existing["_id"]},
-        {"$addToSet": {"Locale_Specific_Data": locale_block}}
-    )
-    existing.setdefault("Locale_Specific_Data", []).append(locale_block)
-    return existing
-
-def get_upc_category_text(upc_data: Optional[Dict]) -> Optional[str]:
-    """Build the best available category text from a Go-UPC product payload.
-
-    Prefer `categoryPath` (the structured taxonomy breadcrumb, e.g. ["Home &
-    Garden", "Major Appliances", "Dishwashers"]) over the flat `category` field:
-    `category` can be sourced from however a given barcode happened to be listed
-    (e.g. a manuals-aggregator site tagging a product as "Product Manuals"
-    instead of its actual product type), so it's not always trustworthy on its
-    own, whereas `categoryPath` reflects real taxonomy when present.
-    """
-    if not upc_data:
-        return None
-    product = upc_data.get("product", {})
-    category_path = product.get("categoryPath")
-    if isinstance(category_path, list) and category_path:
-        return " > ".join(str(p) for p in category_path if p)
-    return product.get("category") or None
-
-def get_category_for_embedding(data: MasterSKURequest, icecat_data: Optional[Dict], upc_data: Optional[Dict]) -> str:
-    """Determine final category text for embedding/matching/root, from all sources."""
-    upc_category_text = get_upc_category_text(upc_data)
-    upc_product = upc_data.get("product", {}) if upc_data else {}
-    upc_name = upc_product.get("name")
-    upc_description = upc_product.get("description")
-    # Combine category text with the product name rather than trusting category
-    # alone — Go-UPC's category can be misleading (e.g. "Product Manuals" for a
-    # product whose name clearly says "Microwave Oven"), so folding the name in
-    # keeps that signal available to the embedding match instead of discarding it.
-    upc_text = " ".join(p for p in (upc_category_text, upc_name) if p) or upc_description or None
-    return (
-        data.Category
-        or (icecat_data.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value") if icecat_data else None)
-        or upc_text
-        or "Unknown"
-    )
-
-def choose_locale_category(icecat_data, upc_data, data):
-    # 1. Try Icecat
-    if icecat_data:
-        cat = icecat_data.get("GeneralInfo", {}).get("Category", {}).get("Name", {}).get("Value")
-        if cat: return cat
-    # 2. Try UPC (flat category, then taxonomy breadcrumb)
-    upc_category_text = get_upc_category_text(upc_data)
-    if upc_category_text: return upc_category_text
-    # 3. Try API input
-    if data.Category and data.Category.strip():
-        return data.Category.strip()
-    # 4. Default to Unknown
-    return "Unknown"
-
-def get_image_and_brand(icecat_data: Optional[Dict], upc_data: Optional[Dict], data: MasterSKURequest):
-    """Extract image and brand information."""
-    image_url, brand_logo = None, None
-    if icecat_data:
-        info = icecat_data.get("GeneralInfo", {})
-        image_url = icecat_data.get("Image", {}).get("HighPic")
-        brand_logo = info.get("BrandLogo") or info.get("BrandInfo", {}).get("BrandLogo")
-        brand = info.get("Brand")
-        if isinstance(brand, dict):
-            data.Make = brand.get("Value", data.Make)
-        elif isinstance(brand, str):
-            data.Make = brand or data.Make
-        name_info = info.get("ProductNameInfo", {}).get("ProductIntName")
-        if isinstance(name_info, dict):
-            data.Model = name_info.get("Value", data.Model)
-        elif isinstance(name_info, str):
-            data.Model = name_info or data.Model
-    elif upc_data:
-        image_url = upc_data.get("product", {}).get("imageUrl")
-    return image_url, brand_logo
-
-def get_gtin_from_icecat(icecat_data: Optional[Dict], default_gtin: str):
-    """Get GTINs from Icecat data, fallback to provided."""
-    if isinstance(icecat_data, dict):
-        general_info = icecat_data.get("GeneralInfo", {})
-        gtin_data = general_info.get("GTIN")
-        if isinstance(gtin_data, list):
-            return gtin_data
-    return [default_gtin]
-
-def compute_category_embedding(category_input: str):
-    try:
-        embedding = embed_query(category_input)
-    except Exception:
-        logger.exception("[compute_category_embedding] embed_query failed for input=%r", category_input)
-        return "Unknown", None, 0.0, []
-
-    # First try MongoDB vector search (same approach as routers.match)
-    try:
-        from utils.common import mongo_vector_search
-        matched_category, similarity = mongo_vector_search(embedding)
-    except Exception:
-        matched_category, similarity = None, 0.0
-
-    # If MongoDB vector search didn't return a match, fall back to in-memory lookup
-    if not matched_category:
-        matched_category, similarity = find_best_match(embedding, category_embeddings, device_categories)
-
-    final_category = matched_category if matched_category and similarity >= 0.42 else "Unknown"
-    return final_category, matched_category, similarity, embedding
-
-
-def resolve_locale_title_for_category(category_name: str, locale: str):
-    """Lookup the Category collection and return the localized title for the given locale.
-    Preference order: requested locale -> en_GB -> any available title -> None
-    """
-    if not category_name:
-        return None
-    try:
-        doc = category_collection.find_one({"category": category_name})
-        if not doc:
-            return None
-        lt_list = doc.get("locale_title")
-        if not isinstance(lt_list, list):
-            return None
-        titles = {lt.get("locale"): lt.get("title") for lt in lt_list if lt.get("locale") and lt.get("title")}
-        if not titles:
-            return None
-        if locale and locale in titles:
-            return titles[locale]
-        if "en_GB" in titles:
-            return titles["en_GB"]
-        # return any available title
-        return next(iter(titles.values()))
-    except Exception:
-        return None
-
-def log_failed_match(category_input: str, data: MasterSKURequest, embedding, similarity: float):
-    failed_doc = {
-        "category_input": category_input,
-        "Make": data.Make,
-        "Model": data.Model,
-        "GTIN": data.GTIN,
-        "locale": data.locale,
-        "embedding": embedding.tolist() if hasattr(embedding, 'tolist') else embedding,
-        "similarity": similarity,
-        "created_at": utc_now_iso(),
-        "input_payload": data.dict()
-    }
-    failed_matches_collection.insert_one(failed_doc)
-
-
-# Note: background job persistence and admin endpoints removed in favor of
-# lightweight native asyncio.create_task scheduling. This keeps the router
-# minimal and avoids cross-module import-time issues.
-
-# --- Main Endpoint ---
-
-@router.post(
-    "/create_master_sku",
-    summary="Create a MasterSKU, or add a locale to an existing one",
-    response_description="The MasterSKU document, wrapped differently depending on which path was taken.",
-    responses=secured({
-        200: json_response(
-            "Processed. **Check `source`** to see what happened: absent means newly created, "
-            "`master` means it already existed, `master-update` means a locale was added.",
-            {
-                "source": "master-update",
-                "updated_locale": "en_GB",
-                "result": {
-                    "_id": "681aa2f1c4b21d0f8c9e0044",
-                    "Make": "Bosch",
-                    "Model": "SMS6ZCI00G",
-                    "GTIN": ["5011773057240"],
-                    "Category": "Dishwasher",
-                    "match_key": "gtin:5011773057240",
-                    "Locale_Specific_Data": [
-                        {
-                            "locale": "en_GB",
-                            "Title": "Bosch Series 6 Freestanding Dishwasher",
-                            "Price": 449.99,
-                            "manual_url": "/sku/r/6f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f",
-                        }
-                    ],
-                },
-            },
-        ),
-        400: error("`GTIN` is non-empty but is not a valid barcode.", "Invalid GTIN format"),
-        404: error("The `locale` is not configured in `Locale_Params`.", "No locale data found for en_GB"),
-        500: error("The MasterSKU could not be written.", "Failed to create MasterSKU"),
-    }),
-)
+@router.post("/create_master_sku")
 def create_master_sku(
     data: MasterSKURequest,
     request: Request,
     background_tasks: BackgroundTasks,
-    add_pricing: Optional[bool] = Query(
-        False,
-        description=(
-            "Schedule background price enrichment (DataforSEO shopping) for this MasterSKU "
-            "after the response is sent. Off by default."
-        ),
-        examples=[False],
-    ),
+    add_pricing: bool = Query(True),
     _: None = Depends(verify_token),
 ):
-    """
-    Create a product in the shared MasterSKU catalogue, or add a locale to one that exists.
+    return create_master_sku_service(data, background_tasks, request, add_pricing)
 
-    A MasterSKU is the platform-wide record every client's CustomSKU points at. You rarely need
-    to call this directly — `POST /sku/create_custom_sku` invokes it automatically when a client
-    SKU has no MasterSKU yet.
 
-    **Matching** is by `GTIN` when one is supplied, otherwise by `Make`+`Model`, via a stored
-    `match_key`. Creation uses an atomic upsert, so two simultaneous calls for the same product
-    yield one document rather than duplicates.
-
-    **Three outcomes, all `200` — branch on `source`:**
-
-    | `source` | Meaning |
-    | --- | --- |
-    | *(absent)* | Newly created. The response **is** the document. |
-    | `master` | Already existed with this locale. Document under `result`. |
-    | `master-update` | Existed; this locale was added. Document under `result`, locale echoed in `updated_locale`. |
-
-    On creation the record is enriched from third-party sources (Icecat, Go-UPC) for titles,
-    images and documents; asset URLs are masked behind `GET /sku/r/{key}`. Set the
-    `add_pricing` query parameter to `true` to also schedule background price enrichment — it
-    runs after the response, so prices appear on the record shortly afterwards, not immediately.
-    """
-    # Validate
-    if data.GTIN.strip() and not is_valid_gtin(data.GTIN):
-        raise HTTPException(status_code=400, detail="Invalid GTIN format")
-
-    if not fetch_locale_info(data.locale):
-        raise HTTPException(status_code=404, detail=f"No locale data found for {data.locale}")
-
-    existing = get_existing_sku(data)
-
-    if existing:
-        # Update with new locale data if not already present
-        for entry in existing.get("Locale_Specific_Data", []):
-            if entry.get("locale") == data.locale:
-                existing["_id"] = str(existing["_id"])
-                return {
-                    "source": "master",
-                    "matched_by": "GTIN or Make+Model",
-                    "result": existing
-                }
-
-        # Fetch localized Icecat info if possible
-        localized_title = f"{data.Make} {data.Model}"
-        icecat_data_locale = fetch_icecat_by_gtin(data.GTIN, data.locale)
-        if icecat_data_locale:
-            localized_title = icecat_data_locale.get("GeneralInfo", {}).get("Title") or localized_title
-
-        # New logic for locale-specific category
-        upc_data_locale = fetch_upc(data.GTIN)
-        locale_category_for_block = choose_locale_category(icecat_data_locale, upc_data_locale, data)
-
-        extra = extract_multimedia_urls(icecat_data_locale) if icecat_data_locale else {}
-        # Compute base for masked links: prefer env, else derive from incoming request
-        base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
-        # Mask any Icecat URLs so we don't persist raw upstream links
-        extra = _mask_extra_urls(extra, base_url=base_for_mask)
-        locale_info = fetch_locale_info(data.locale) or {}
-        currency_code = locale_info.get("currency")
-        locale_block = {
-            "locale": data.locale,
-            "Category": locale_category_for_block,
-            "Input_Title": localized_title,
-            "SERP_Title": None,
-            "Google_ID": None,
-            "Merchant": None,
-            "Currency": currency_code,
-            "Price": None,
-            "created_at": utc_now_iso()
-        }
-        if extra:
-            locale_block.update(extra)
-
-        # Populate Locale_Matched_Category for this locale_block using existing doc's matched category if available
-        try:
-            matched_cat = None
-            similarity_val = None
-            # prefer an explicit matched category stored on the existing master doc
-            if isinstance(existing, dict):
-                matched_cat = existing.get("Matched_Category") or existing.get("Category")
-                similarity_val = existing.get("Match_Similarity")
-            if matched_cat:
-                locale_title = resolve_locale_title_for_category(matched_cat, data.locale)
-                # store only the localized title string
-                locale_block["Locale_Matched_Category"] = locale_title
-            else:
-                locale_block["Locale_Matched_Category"] = None
-        except Exception:
-            try:
-                locale_block["Locale_Matched_Category"] = None
-            except Exception:
-                pass
-
-        # Ensure existing doc has a match_key so future upserts can find it atomically.
-        try:
-            if data.GTIN and data.GTIN.strip():
-                mk = f"gtin:{data.GTIN.strip()}"
-            else:
-                mk = f"mm:{(data.Make or '').strip().lower()}|{(data.Model or '').strip().lower()}"
-            master_collection.update_one({"_id": existing["_id"]}, {"$set": {"match_key": mk}})
-            existing["match_key"] = mk
-        except Exception:
-            # best-effort only
-            pass
-
-        updated = update_existing_sku(existing, data, locale_block)
-        updated["_id"] = str(updated["_id"])
-        # schedule background DataforSEO task (runs after the response is sent)
-        if add_pricing:
-            try:
-                background_tasks.add_task(_run_dseo_task, data.locale, str(updated["_id"]))
-            except Exception:
-                logger.exception("Failed to schedule DataforSEO task (existing update)")
-
-        return {
-            "source": "master-update",
-            "updated_locale": data.locale,
-            "result": updated
-        }
-
-    # No existing match: Gather info from APIs
-    icecat_data = fetch_icecat_by_gtin(data.GTIN, data.locale)
-    title = f"{data.Make} {data.Model}"
-    upc_data = None
-
-    if icecat_data:
-        title = icecat_data.get("GeneralInfo", {}).get("Title") or title
-    else:
-        icecat_data = fetch_icecat_by_make_model(data.Make, data.Model, data.locale)
-        if icecat_data:
-            title = icecat_data.get("GeneralInfo", {}).get("Title") or title
-
-    if not icecat_data:
-        upc_data = fetch_upc(data.GTIN)
-        if upc_data:
-            upc_product = upc_data.get("product", {})
-            title = upc_product.get("name") or title
-            # Use UPC brand as Make when not already supplied
-            if not data.Make.strip():
-                data.Make = (upc_product.get("brand") or "").strip()
-            # Derive Model by stripping the brand from the title; AI extraction refines this if available
-            if not data.Model.strip():
-                candidate = title.replace(data.Make, "").strip(" -–") if data.Make else title
-                data.Model = candidate or title
-            extract_make_model_from_title(title, data)
-
-    # --- ROOT-LEVEL CATEGORY LOGIC FOR EMBEDDING ---
-    category_input = get_category_for_embedding(data, icecat_data, upc_data)
-    final_category, matched_category, similarity, embedding = compute_category_embedding(category_input)
-
-    if final_category == "Unknown":
-        # Log failed match
-        log_failed_match(category_input, data, embedding, similarity)
-        # If user did not provide any category, error
-        if not (data.Category and data.Category.strip()):
-            raise HTTPException(status_code=422, detail="No category could be matched, please provide input")
-
-    gtin_from_icecat = get_gtin_from_icecat(icecat_data, data.GTIN)
-    image_url, brand_logo = get_image_and_brand(icecat_data, upc_data, data)
-
-    # --- PER-LOCALE CATEGORY LOGIC ---
-    locale_category_for_block = choose_locale_category(icecat_data, upc_data, data)
-    extra = extract_multimedia_urls(icecat_data) if icecat_data else {}
-    base_for_mask = os.getenv("FASTAPI_BASE_URL") or str(request.base_url).rstrip('/')
-    # Mask any Icecat URLs so we don't persist raw upstream links
-    extra = _mask_extra_urls(extra, base_url=base_for_mask)
-    locale_info = fetch_locale_info(data.locale) or {}
-    currency_code = locale_info.get("currency")
-    locale_block = {
-        "locale": data.locale,
-        "Category": locale_category_for_block,
-        "Input_Title": title,
-        "SERP_Title": None,
-        "Google_ID": None,
-        "Merchant": None,
-        "Currency": currency_code,
-        "Price": None,
-        "created_at": utc_now_iso()
-    }
-    if extra:
-        locale_block.update(extra)
-
-    # Populate Locale_Matched_Category for the newly created master (use matched_category + similarity)
+@router.get("/r/{key}")
+async def proxy_masked(key: str):
+    doc = url_map_collection.find_one({"_id": key})
+    if not doc or not doc.get("url"):
+        raise HTTPException(status_code=404, detail="Not found")
+    expires_at = doc.get("expires_at")
+    if isinstance(expires_at, datetime):
+        comparable = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+        if comparable < datetime.now(timezone.utc):
+            raise HTTPException(status_code=404, detail="Not found")
     try:
-        # matched_category and similarity are computed above in the embedding section
-        mcat = matched_category if 'matched_category' in locals() else None
-        msim = similarity if 'similarity' in locals() else None
-        if mcat:
-            locale_title = resolve_locale_title_for_category(mcat, data.locale)
-            # store only the localized title string
-            locale_block["Locale_Matched_Category"] = locale_title
-        else:
-            locale_block["Locale_Matched_Category"] = None
-    except Exception:
+        client = httpx.AsyncClient(timeout=30.0)
         try:
-            locale_block["Locale_Matched_Category"] = None
+            upstream_request = client.build_request("GET", doc["url"])
+            response = await client.send(upstream_request, stream=True, follow_redirects=True)
         except Exception:
-            pass
-
-    now_iso = utc_now_iso()
-    doc = {
-        "created_at": now_iso,
-        "Make": data.Make,
-        "Model": data.Model,
-        "Productname": data.Model,
-        "GTIN": gtin_from_icecat,
-        "Category": final_category,  # <--- for embeddings/matching
-        "Matched_Category": matched_category,
-        "Match_Similarity": similarity,
-        "Title": title,
-        "Image_URL": image_url,
-        "brand_logo": brand_logo,
-        "Source": "CAT" if icecat_data else ("UPC" if upc_data else "INPUT"),
-        "Locale_Specific_Data": [locale_block],
-    }
-
-    # Compute a stable match_key for this product (prefer GTIN when available)
-    if data.GTIN and data.GTIN.strip():
-        match_key = f"gtin:{data.GTIN.strip()}"
-    else:
-        match_key = f"mm:{(data.Make or '').strip().lower()}|{(data.Model or '').strip().lower()}"
-    doc["match_key"] = match_key
-
-    # Use an atomic upsert to avoid race-condition duplicate inserts.
-    saved = None
-    try:
-        update = {
-            "$setOnInsert": doc,
-            # Ensure GTIN array contains any gtins we discovered
-            "$addToSet": {"GTIN": {"$each": gtin_from_icecat}, "Locale_Specific_Data": locale_block},
+            await client.aclose()
+            raise
+        headers = {
+            name: value for name, value in response.headers.items()
+            if name.lower() not in {"connection", "transfer-encoding"}
         }
-        saved = master_collection.find_one_and_update(
-            {"match_key": match_key}, update, upsert=True, return_document=ReturnDocument.AFTER
+        return StreamingResponse(
+            response.aiter_raw(),
+            status_code=response.status_code,
+            headers=headers,
+            media_type=response.headers.get("content-type"),
+            background=BackgroundTask(_close_upstream, response, client),
         )
-    except errors.DuplicateKeyError:
-        # Rare race: another process created the doc between our check and upsert. Fetch the existing doc.
-        saved = master_collection.find_one({"match_key": match_key})
-    except Exception as e:
-        # As a fallback, attempt a plain insert (so we don't fail hard for unexpected DB errors)
-        try:
-            result = master_collection.insert_one(doc)
-            doc["_id"] = result.inserted_id
-            saved = doc
-        except Exception:
-            raise HTTPException(status_code=500, detail=f"Failed to create MasterSKU: {str(e)}")
-
-    if not saved:
-        raise HTTPException(status_code=500, detail="Failed to create MasterSKU")
-
-    saved["_id"] = str(saved["_id"])
-    # schedule background DataforSEO task for the created/found MasterSKU (runs after response)
-    if add_pricing:
-        try:
-            background_tasks.add_task(_run_dseo_task, data.locale, saved["_id"])
-        except Exception:
-            logger.exception("Failed to schedule DataforSEO task (create path)")
-
-    return saved
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {exc}")
 
 
-@router.post(
-    "/debug_probe",
-    summary="Diagnostic: confirm background tasks are running",
-    response_description="Confirmation that the probe task was scheduled.",
-    responses=secured({
-        200: json_response("The probe was scheduled. Watch the logs for the result.", {"scheduled": True}),
-        500: error("The probe task could not be scheduled.", "Failed to schedule probe"),
-    }),
-)
-async def debug_probe(
-    masterSKUid: str = Query(
-        ...,
-        description="**Mandatory.** Any MasterSKU id — used only as a label in the log line.",
-        examples=["681aa2f1c4b21d0f8c9e0044"],
-    ),
+@router.get("/test-background")
+async def test_background(
+    masterSKUid: str = Query(...),
+    locale: str = Query("en_GB"),
     _: None = Depends(verify_token),
 ):
-    """
-    **Operational diagnostic, not a business endpoint.**
-
-    Schedules a trivial background task and returns immediately. Its only purpose is to prove
-    that background work is executing on the event loop: after calling it, look for a
-    `[bg_probe]` line in the application logs. Nothing is read or written in the database, and
-    `masterSKUid` is only echoed into the log message.
-
-    `{"scheduled": true}` means the task was queued, **not** that it ran — the logs are the
-    actual result.
-    """
-    try:
-        logger.info(f"[debug_probe] scheduling probe for masterSKUid={masterSKUid}")
-        t = asyncio.create_task(_probe_log(masterSKUid))
-        logger.info(f"[debug_probe] scheduled probe task={t}")
-        return {"scheduled": True}
-    except Exception:
-        logger.exception("[debug_probe] failed to schedule probe")
-        raise HTTPException(status_code=500, detail="Failed to schedule probe")
+    asyncio.create_task(_run_dseo_task(locale, masterSKUid))
+    return {"status": "scheduled"}

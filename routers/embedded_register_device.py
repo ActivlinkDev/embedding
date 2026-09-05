@@ -3,8 +3,8 @@ from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Any
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
+from routers.sku.catalog_dependencies import catalog
 from pymongo import MongoClient
-from bson import ObjectId
 import os
 from datetime import datetime
 import random
@@ -24,8 +24,6 @@ client = MongoClient(os.getenv("MONGO_URI"))
 db = client["Activlink"]
 clients_collection = db["ClientKey"]
 locale_params_collection = db["Locale_Params"]
-customsku_collection = db["CustomSKU"]
-mastersku_collection = db["MasterSKU"]
 registrations_collection = db["Registrations"]
 registrations_error_log_collection = db["Registrations_Error_Log"]
 
@@ -66,7 +64,7 @@ class UniqueParametersModel(BaseModel):
         0,
         description=(
             "Purchase price in the locale's currency. When omitted or `0`, falls back to the "
-            "CustomSKU `MSRP`, then the MasterSKU `Price`."
+            "resolved tenant override, then the MasterSKU reference price."
         ),
         examples=[449.99],
     )
@@ -178,26 +176,6 @@ def generate_qr_code(url):
     img_str = base64.b64encode(buffer.getvalue()).decode()
     return img_str
 
-def prepare_doc_for_embed(doc):
-    """Convert MongoDB _id to string for embedding in responses."""
-    if not doc:
-        return None
-    new_doc = dict(doc)
-    if '_id' in new_doc:
-        new_doc['_id'] = str(new_doc['_id'])
-    if 'Identifiers' in new_doc and isinstance(new_doc['Identifiers'], dict):
-        if '_id' in new_doc['Identifiers']:
-            new_doc['Identifiers']['_id'] = str(new_doc['Identifiers']['_id'])
-    return new_doc
-
-def extract_locale_specific_data(doc, locale):
-    """Return the first Locale_Specific_Data dict matching the locale."""
-    if not doc or "Locale_Specific_Data" not in doc:
-        return None
-    lsd = doc["Locale_Specific_Data"]
-    entry = next((item for item in lsd if item.get("locale") == locale), None)
-    return entry
-
 def valid_value(val):
     """Return True if the value is non-empty, not 'string', not None."""
     return val is not None and str(val).strip() != "" and str(val).strip().lower() != "string"
@@ -224,59 +202,6 @@ def validate_mandatory_fields(payload):
             status_code=400,
             detail=f"Missing or invalid required field(s): {', '.join(missing_fields)}"
         )
-
-def lookup_customsku(ids, client_id, locale):
-    """
-    Try to find a matching CustomSKU document for this device's identifiers.
-    Follows priority: id -> SKU -> GTIN.
-    Only returns the document if Locale_Specific_Data matches the locale.
-    """
-    customsku_doc = None
-    # 1. By id
-    if valid_value(ids.id):
-        try:
-            object_id = ObjectId(ids.id)
-            customsku_doc = customsku_collection.find_one({
-                "_id": object_id,
-                "Client": client_id,
-                "Locale_Specific_Data.locale": locale
-            })
-        except Exception:
-            pass
-    # 2. By SKU
-    if not customsku_doc and valid_value(ids.SKU):
-        customsku_doc = customsku_collection.find_one({
-            "Identifiers.SKU": ids.SKU,
-            "Client": client_id,
-            "Locale_Specific_Data.locale": locale
-        })
-    # 3. By GTIN
-    if not customsku_doc and valid_value(ids.GTIN):
-        customsku_doc = customsku_collection.find_one({
-            "Identifiers.GTIN": ids.GTIN,
-            "Client": client_id,
-            "Locale_Specific_Data.locale": locale
-        })
-    return customsku_doc
-
-def lookup_mastersku(customsku_doc, locale):
-    """
-    If CustomSKU has a MasterSKU, try to find a MasterSKU document 
-    with the correct _id and locale.
-    """
-    if not customsku_doc or "MasterSKU" not in customsku_doc:
-        return None
-    try:
-        master_id = customsku_doc["MasterSKU"]
-        if isinstance(master_id, str):
-            master_id = ObjectId(master_id)
-        mastersku_doc = mastersku_collection.find_one({
-            "_id": master_id,
-            "Locale_Specific_Data.locale": locale
-        })
-        return mastersku_doc
-    except Exception:
-        return None
 
 def fallback_value(input_val, *fallbacks):
     """
@@ -400,76 +325,42 @@ def register(payload: RegisterRequest, _: None = Depends(verify_token)):
             })
             continue
 
-        # --- Lookup CustomSKU & MasterSKU, filter for correct locale ---
-        customsku_doc = lookup_customsku(ids, client_doc["Client_ID"], payload.locale)
-        customsku_id = str(customsku_doc["_id"]) if customsku_doc else None
-        customsku_obj = prepare_doc_for_embed(customsku_doc)
-        lsd = None
-        if customsku_obj and "Locale_Specific_Data" in customsku_obj:
-            lsd = extract_locale_specific_data(customsku_obj, payload.locale)
-            customsku_obj["Locale_Specific_Data"] = [lsd] if lsd else []
-
-        mastersku_doc = lookup_mastersku(customsku_doc, payload.locale)
-        mastersku_id = str(mastersku_doc["_id"]) if mastersku_doc else None
-        mastersku_obj = prepare_doc_for_embed(mastersku_doc)
-        if mastersku_obj and "Locale_Specific_Data" in mastersku_obj:
-            lsd_master = extract_locale_specific_data(mastersku_obj, payload.locale)
-            mastersku_obj["Locale_Specific_Data"] = [lsd_master] if lsd_master else []
-
-        # --- Fallback field population for blank fields ---
-        fields_to_fill = [
-            ("make", "Make"),
-            ("model", "Model"),
-            ("SKU", "SKU"),
-            ("category", "Category"),
-            ("gtee_parts", "gtee_parts"),
-            ("gtee_labour", "gtee_labour"),
-            ("promo", "promo"),
-            ("price", "Price"),
-        ]
-
-        for field, sku_field in fields_to_fill:
-            fallback_locale = lsd.get(sku_field) if lsd and lsd.get(sku_field) is not None else None
-
-            # For guarantee/promo fields, also try Guarantees object in locale-specific data
-            fallback_gtee = None
-            if field in ("gtee_parts", "gtee_labour", "promo") and lsd and "Guarantees" in lsd:
-                if field == "gtee_parts":
-                    fallback_gtee = lsd["Guarantees"].get("Parts")
-                elif field == "gtee_labour":
-                    fallback_gtee = lsd["Guarantees"].get("Labour")
-                elif field == "promo":
-                    fallback_gtee = lsd["Guarantees"].get("Promotion")
-            if field == "category":
-                fallback_root = customsku_obj.get("Category") if customsku_obj and customsku_obj.get("Category") is not None else None
-                value = fallback_value(getattr(ids, field, None), fallback_locale, fallback_root)
-                setattr(ids, field, value)
-            else:
-                fallback_identifiers = None
-                if customsku_obj and "Identifiers" in customsku_obj:
-                    fallback_identifiers = (
-                        customsku_obj["Identifiers"].get(field)
-                        or customsku_obj["Identifiers"].get(field.capitalize())
-                    )
-                fallback_root = customsku_obj.get(sku_field) if customsku_obj and customsku_obj.get(sku_field) is not None else None
-                if field == "price":
-                    value = fallback_value(unique.price, fallback_locale, fallback_gtee, fallback_identifiers, fallback_root)
-                    unique.price = value
-                else:
-                    value = fallback_value(getattr(ids, field, None), fallback_locale, fallback_gtee, fallback_identifiers, fallback_root)
-                    setattr(ids, field, value)
-
-        # --- title: ONLY fallback to locale-specific data Title if input is blank ---
-        ids.title = ids.title or (lsd.get("Title") if lsd and lsd.get("Title") is not None else "")
-
-        # --- price fallback for Unique_Parameters from CustomSKU.Locale_Specific_Data.MSRP ---
-        if (unique.price in (0, None, "", "string")) and lsd and lsd.get("MSRP") is not None:
+        try:
+            resolved, _ = catalog.resolve_lookup(
+                client_key=payload.clientkey,
+                locale=payload.locale,
+                sku=ids.SKU if valid_value(ids.SKU) else None,
+                gtin=ids.GTIN if valid_value(ids.GTIN) else None,
+                make=ids.make if valid_value(ids.make) else None,
+                model=ids.model if valid_value(ids.model) else None,
+            )
+        except (LookupError, ValueError):
+            resolved = None
+        product = (resolved or {}).get("product") or {}
+        guarantee = product.get("guarantee") or {}
+        gtins = product.get("gtins") or []
+        ids.GTIN = fallback_value(ids.GTIN, gtins[0] if gtins else None)
+        ids.make = fallback_value(ids.make, product.get("make"))
+        ids.model = fallback_value(ids.model, product.get("model"))
+        ids.SKU = fallback_value(ids.SKU, product.get("sku"))
+        ids.title = fallback_value(ids.title, product.get("title"))
+        ids.category = fallback_value(ids.category, product.get("category"))
+        ids.gtee_parts = fallback_value(ids.gtee_parts, guarantee.get("partsMonths"))
+        ids.gtee_labour = fallback_value(ids.gtee_labour, guarantee.get("labourMonths"))
+        ids.promo = fallback_value(
+            ids.promo,
+            product.get("localePromotion"),
+            product.get("globalPromotion"),
+        )
+        if unique.price in (0, None, "", "string"):
             try:
-                unique.price = float(lsd.get("MSRP"))
-            except Exception:
+                unique.price = float(product.get("price") or 0)
+            except (TypeError, ValueError):
                 unique.price = 0
 
-        matched_status = "matched" if (customsku_obj or mastersku_obj) else "no match"
+        customsku_id = (resolved or {}).get("customSkuId")
+        mastersku_id = (resolved or {}).get("masterSkuId")
+        matched_status = "matched" if resolved else "no match"
         if matched_status == "matched":
             any_matched = True
 
@@ -479,7 +370,7 @@ def register(payload: RegisterRequest, _: None = Depends(verify_token)):
             "Unique_Parameters": unique.dict(),
             "customSKU_id": customsku_id,
             "masterSKU_id": mastersku_id,
-            "masterSKU": mastersku_obj,
+            "catalogueSnapshot": product if resolved else None,
             "status": "matched" if matched_status == "matched" else "error logged",
             "registered_at": datetime.utcnow().isoformat() + "Z"
         })

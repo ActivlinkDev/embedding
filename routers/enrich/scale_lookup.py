@@ -169,7 +169,7 @@ async def get_shopping_result(
             ms_doc = mastersku_collection.find_one({"_id": ms_id})
             if not ms_doc:
                 raise Exception("MasterSKU not found")
-            model_val = (ms_doc.get("Model") or "").strip()
+            model_val = ((ms_doc.get("identifiers") or {}).get("model") or "").strip()
             title_val = (trimmed.get("title") or "").strip()
 
             def _normalize(s: str) -> str:
@@ -189,23 +189,23 @@ async def get_shopping_result(
             # build locale-specific update document
             serp_status = "found" if trimmed.get("product_details") else ("partial" if trimmed.get("gpc_id") else "skipped")
             locale_update = {
-                "SERP_Title": trimmed.get("title"),
-                "Google_ID": trimmed.get("gpc_id"),
-                "Merchant": trimmed.get("merchant"),
-                "Currency": trimmed.get("currency"),
-                "Price": trimmed.get("price_value") or trimmed.get("price"),
+                "title": trimmed.get("title"),
+                "market.googleId": trimmed.get("gpc_id"),
+                "market.merchant": trimmed.get("merchant"),
+                "market.currency": trimmed.get("currency"),
+                "market.referencePrice": trimmed.get("price_value") or trimmed.get("price"),
                 # include product_details.about_the_item and sellers_online when available
-                "about_the_item": None,
-                "sellers_online": None,
-                "created_at": utc_now_iso(),
-                "serp_status": serp_status,
+                "specifications": {},
+                "market.sellers": [],
+                "enrichment.updatedAt": utc_now_iso(),
+                "enrichment.status": serp_status,
             }
 
             # populate about_the_item and sellers_online from product_details if present
             pd = trimmed.get("product_details") if isinstance(trimmed.get("product_details"), dict) else None
             if pd:
                 if pd.get("about_the_item") is not None:
-                    locale_update["about_the_item"] = pd.get("about_the_item")
+                    locale_update["specifications"] = pd.get("about_the_item")
                 # Store only the `base_price_parsed` for each seller to avoid
                 # including tax/shipping/total price fields in the MasterSKU record.
                 sellers = pd.get("sellers_online")
@@ -223,24 +223,15 @@ async def get_shopping_result(
                                 "base_price_raw": bp_raw,
                                 "base_price_parsed": bp_parsed,
                             })
-                        locale_update["sellers_online"] = mapped
+                        locale_update["market.sellers"] = mapped
                     except Exception:
                         # Fallback: keep original sellers_online if mapping fails
-                        locale_update["sellers_online"] = pd.get("sellers_online")
+                        locale_update["market.sellers"] = pd.get("sellers_online")
 
-            # Attempt to set fields on an existing locale entry
-            result = mastersku_collection.update_one(
-                {"_id": ms_id, "Locale_Specific_Data.locale": locale},
-                {"$set": {f"Locale_Specific_Data.$.{k}": v for k, v in locale_update.items()}}
+            mastersku_collection.update_one(
+                {"_id": ms_id},
+                {"$set": {f"locales.{locale}.{k}": v for k, v in locale_update.items()}},
             )
-
-            if result.matched_count == 0:
-                # No existing locale entry - push a new one
-                new_locale_entry = {"locale": locale, **locale_update}
-                mastersku_collection.update_one(
-                    {"_id": ms_id},
-                    {"$push": {"Locale_Specific_Data": new_locale_entry}}
-                )
         except Exception as e:
             # don't fail the API if updating the MasterSKU fails; swallow with trace in response
             trimmed.setdefault("master_update_error", str(e))
