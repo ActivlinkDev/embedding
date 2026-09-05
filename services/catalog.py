@@ -126,6 +126,8 @@ def resolve_documents(
         "imageUrl": master.get("imageUrl") or master_assets.get("primaryImage"),
         "assets": deepcopy(master_assets),
         "market": deepcopy(master_market),
+        "description": master_locale.get("description"),
+        "features": deepcopy(master_locale.get("features") or []),
         "specifications": deepcopy(master_locale.get("specifications") or {}),
     }
     field_sources: dict[str, Any] = {
@@ -136,6 +138,8 @@ def resolve_documents(
         "imageUrl": "master",
         "assets": "master",
         "market": "master",
+        "description": "master",
+        "features": "master",
         "specifications": "master",
         "guarantee": guarantee_sources,
     }
@@ -280,7 +284,10 @@ class CatalogService:
             return self.customs.find_one(base), "sku"
         if master_id:
             base["masterSkuId"] = master_id
-            return self.customs.find_one(base), "master"
+            return self.customs.find_one(
+                base,
+                sort=[("skuNormalized", 1), ("_id", 1)],
+            ), "master"
         return None, None
 
     def resolve_custom(self, custom: dict, locale: str) -> Optional[dict]:

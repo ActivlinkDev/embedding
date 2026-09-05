@@ -114,6 +114,12 @@ def _run_background_tasks_inline(background_tasks: BackgroundTasks) -> None:
 
 def _classify(result: dict) -> tuple[str, str | None]:
     """Map a create_custom_sku_service return value onto an outcome bucket."""
+    if result.get("created"):
+        return CREATED, None
+    if result.get("localeAlreadyEnabled"):
+        return ALREADY_EXISTS, None
+    if result.get("localeAdded"):
+        return LOCALE_ADDED, None
     message = result.get("message")
     if not message or message == "CustomSKU created":
         return CREATED, None

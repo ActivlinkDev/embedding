@@ -53,7 +53,6 @@ def _inherit_path(name: str, locale: Optional[str]) -> str:
     root = {
         "Category": "overrides.category",
         "Global_Promotion": "overrides.globalPromotion",
-        "category": "overrides.category",
         "globalPromotion": "overrides.globalPromotion",
     }
     if name in root:
@@ -64,6 +63,9 @@ def _inherit_path(name: str, locale: Optional[str]) -> str:
         **LOCALE_FIELDS,
         "GTL": "guarantee.labourMonths",
         "GTP": "guarantee.partsMonths",
+        "Locale_Category": "category",
+        "localeCategory": "category",
+        "category": "category",
         "title": "title",
         "price": "price",
         "currency": "currency",

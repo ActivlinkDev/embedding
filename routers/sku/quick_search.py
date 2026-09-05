@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from services.catalog import serialize
 from utils.dependencies import verify_token
-from .catalog_dependencies import catalog, custom_collection, master_collection
+from .catalog_dependencies import catalog, custom_collection
 
 
 router = APIRouter(prefix="/sku", tags=["Catalog"])
@@ -35,30 +35,30 @@ def quick_search(
     if search and len(search) < 2:
         raise HTTPException(status_code=400, detail="q must be at least two characters")
 
-    query = base
+    customs = None
     if search:
         regex = {"$regex": re.escape(search), "$options": "i"}
-        master_ids = [
-            doc["_id"] for doc in master_collection.find(
-                {
-                    "$or": [
-                        {"identifiers.make": regex},
-                        {"identifiers.model": regex},
-                        {"identifiers.gtins": regex},
-                        {"category": regex},
-                    ]
-                },
-                {"_id": 1},
-            ).limit(500)
-        ]
-        query = {
-            "$and": [
-                base,
-                {"$or": [{"sku": regex}, {"masterSkuId": {"$in": master_ids}}]},
-            ]
-        }
-
-    customs = list(custom_collection.find(query).sort("skuNormalized", 1).limit(limit))
+        customs = list(custom_collection.aggregate([
+            {"$match": base},
+            {"$lookup": {
+                "from": "MasterSKU",
+                "localField": "masterSkuId",
+                "foreignField": "_id",
+                "as": "matchedMaster",
+            }},
+            {"$match": {"$or": [
+                {"sku": regex},
+                {"matchedMaster.identifiers.make": regex},
+                {"matchedMaster.identifiers.model": regex},
+                {"matchedMaster.identifiers.gtins": regex},
+                {"matchedMaster.category": regex},
+            ]}},
+            {"$sort": {"skuNormalized": 1, "_id": 1}},
+            {"$limit": limit},
+            {"$unset": "matchedMaster"},
+        ]))
+    if customs is None:
+        customs = list(custom_collection.find(base).sort("skuNormalized", 1).limit(limit))
     results = []
     for custom in customs:
         selected_locale = locale or next(iter(custom.get("enabledLocales") or []), None)

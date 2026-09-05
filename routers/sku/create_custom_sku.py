@@ -67,7 +67,11 @@ def _locale_override(details: Optional[LocaleDetails]) -> dict:
         if source in supplied:
             result[target] = getattr(details, source)
     if "Custom_Links" in supplied:
-        result["customLinks"] = [item.model_dump(exclude_none=True) for item in details.Custom_Links or []]
+        result["customLinks"] = (
+            None
+            if details.Custom_Links is None
+            else [item.model_dump(exclude_none=True) for item in details.Custom_Links]
+        )
     guarantee = {}
     if "GTL" in supplied:
         guarantee["labourMonths"] = details.GTL
@@ -147,16 +151,24 @@ def create_custom_sku_service(
         master = _master_for_request(data, background_tasks, request)
     locale_override = _locale_override(data.Locale_Details)
     now = utc_now()
+    provided = data.model_fields_set
+    locale_was_enabled = bool(existing and data.Locale in (existing.get("enabledLocales") or []))
 
     if existing:
         if existing.get("masterSkuId") != master["_id"]:
             raise HTTPException(status_code=409, detail="SKU already belongs to another MasterSKU")
         set_ops = {"updatedAt": now}
-        if locale_override:
-            set_ops[f"overrides.locales.{data.Locale}"] = locale_override
-        if data.Category is not None:
+        for key, value in locale_override.items():
+            if key == "guarantee" and isinstance(value, dict):
+                for guarantee_key, guarantee_value in value.items():
+                    set_ops[
+                        f"overrides.locales.{data.Locale}.guarantee.{guarantee_key}"
+                    ] = guarantee_value
+            else:
+                set_ops[f"overrides.locales.{data.Locale}.{key}"] = value
+        if "Category" in provided:
             set_ops["overrides.category"] = data.Category
-        if data.Global_Promotion is not None:
+        if "Global_Promotion" in provided:
             set_ops["overrides.globalPromotion"] = data.Global_Promotion
         custom_collection.update_one(
             {"_id": existing["_id"]},
@@ -171,9 +183,9 @@ def create_custom_sku_service(
         overrides: dict = {"locales": {}}
         if locale_override:
             overrides["locales"][data.Locale] = locale_override
-        if data.Category is not None:
+        if "Category" in provided:
             overrides["category"] = data.Category
-        if data.Global_Promotion is not None:
+        if "Global_Promotion" in provided:
             overrides["globalPromotion"] = data.Global_Promotion
         doc = {
             "schemaVersion": SCHEMA_VERSION,
@@ -200,7 +212,14 @@ def create_custom_sku_service(
         background_tasks.add_task(warm_widget_cache, data.ClientKey, str(saved["_id"]), data.Locale)
     except Exception:
         pass
-    return {"message": message, "customSku": serialize(saved), "resolved": serialize(resolved)}
+    return {
+        "message": message,
+        "created": existing is None,
+        "localeAdded": bool(existing and not locale_was_enabled),
+        "localeAlreadyEnabled": locale_was_enabled,
+        "customSku": serialize(saved),
+        "resolved": serialize(resolved),
+    }
 
 
 @router.post("/create_custom_sku")

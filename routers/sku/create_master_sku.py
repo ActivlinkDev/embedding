@@ -179,6 +179,8 @@ def create_master_sku_service(
         model=data.Model or None,
     )
     if existing and data.locale in (existing.get("locales") or {}):
+        if add_pricing:
+            background_tasks.add_task(_run_dseo_task, data.locale, str(existing["_id"]))
         return {"source": "master", "matchedBy": matched_by, "masterSku": serialize(existing)}
 
     product = _extract_product_data(data)
@@ -193,6 +195,11 @@ def create_master_sku_service(
         raise HTTPException(
             status_code=422,
             detail="Product make and model could not be resolved; provide both values",
+        )
+    if not product["category"]:
+        raise HTTPException(
+            status_code=422,
+            detail="Product category could not be resolved; provide Category",
         )
     base_url = str(request.base_url).rstrip("/") if request else os.getenv("FASTAPI_BASE_URL", "")
     key = master_match_key(product["make"], product["model"], product["gtins"])
@@ -293,6 +300,10 @@ async def proxy_masked(key: str):
 
 
 @router.get("/test-background")
-async def test_background(masterSKUid: str = Query(...), locale: str = Query("en_GB")):
+async def test_background(
+    masterSKUid: str = Query(...),
+    locale: str = Query("en_GB"),
+    _: None = Depends(verify_token),
+):
     asyncio.create_task(_run_dseo_task(locale, masterSKUid))
     return {"status": "scheduled"}
