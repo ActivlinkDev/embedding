@@ -1,29 +1,29 @@
-"""Create and enrich canonical v2 MasterSKU documents."""
+"""Create and enrich canonical v2 MasterSKU documents.
+
+This module exposes no routes of its own: masters are created as a side effect of
+`create_custom_sku`, which calls `create_master_sku_service` directly, and by the EPREL
+import. The `/sku/r/{key}` proxy that serves the documents written here lives in
+`routers.sku.masked_asset_proxy`.
+"""
 
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 import logging
 import os
 from typing import Any, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
-import httpx
+from fastapi import BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel, Field
 from pymongo import ReturnDocument
 import requests
-from starlette.background import BackgroundTask
 
 from services.catalog import SCHEMA_VERSION, master_match_key, normalize_text, serialize, utc_now
 from utils.category_tree import resolve as resolve_category
-from utils.dependencies import verify_token
 from .catalog_dependencies import catalog, database, master_collection, locale_collection
 
 
-router = APIRouter(prefix="/sku", tags=["Catalog"])
 logger = logging.getLogger(__name__)
 category_collection = database["Category"]
 url_map_collection = database["url_map"]
@@ -361,11 +361,6 @@ def _assets(product: dict, base_url: str) -> dict:
     return assets
 
 
-async def _close_upstream(response: httpx.Response, client: httpx.AsyncClient) -> None:
-    await response.aclose()
-    await client.aclose()
-
-
 async def _run_dseo_task(locale: str, masterSKUid: str):
     try:
         from routers.enrich.dseo_shopping import submit_dseo_shopping_task
@@ -485,57 +480,3 @@ def create_master_sku_service(
         "matchedBy": matched_by,
         "masterSku": serialize(saved),
     }
-
-
-@router.post("/create_master_sku")
-def create_master_sku(
-    data: MasterSKURequest,
-    request: Request,
-    background_tasks: BackgroundTasks,
-    add_pricing: bool = Query(True),
-    _: None = Depends(verify_token),
-):
-    return create_master_sku_service(data, background_tasks, request, add_pricing)
-
-
-@router.get("/r/{key}")
-async def proxy_masked(key: str):
-    doc = url_map_collection.find_one({"_id": key})
-    if not doc or not doc.get("url"):
-        raise HTTPException(status_code=404, detail="Not found")
-    expires_at = doc.get("expires_at")
-    if isinstance(expires_at, datetime):
-        comparable = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
-        if comparable < datetime.now(timezone.utc):
-            raise HTTPException(status_code=404, detail="Not found")
-    try:
-        client = httpx.AsyncClient(timeout=30.0)
-        try:
-            upstream_request = client.build_request("GET", doc["url"])
-            response = await client.send(upstream_request, stream=True, follow_redirects=True)
-        except Exception:
-            await client.aclose()
-            raise
-        headers = {
-            name: value for name, value in response.headers.items()
-            if name.lower() not in {"connection", "transfer-encoding"}
-        }
-        return StreamingResponse(
-            response.aiter_raw(),
-            status_code=response.status_code,
-            headers=headers,
-            media_type=response.headers.get("content-type"),
-            background=BackgroundTask(_close_upstream, response, client),
-        )
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {exc}")
-
-
-@router.get("/test-background")
-async def test_background(
-    masterSKUid: str = Query(...),
-    locale: str = Query("en_GB"),
-    _: None = Depends(verify_token),
-):
-    asyncio.create_task(_run_dseo_task(locale, masterSKUid))
-    return {"status": "scheduled"}
