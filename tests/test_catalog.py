@@ -11,13 +11,12 @@ def documents():
             "model": "ABC-1",
             "gtins": ["5012345678900"],
         },
-        "category": "Appliance",
+        "category": "Dishwasher",
         "imageUrl": "https://example.test/product.png",
         "locales": {
             "en_GB": {
                 "title": "Canonical title",
                 "category": "Dishwasher",
-                "categoryTitle": "Dishwasher",
                 "market": {"referencePrice": 499.0, "currency": "GBP"},
                 "assets": {"documents": []},
                 "specifications": {"width": "600 mm"},
@@ -91,14 +90,10 @@ def test_explicit_null_suppresses_an_inherited_value():
     assert result["fieldSources"]["title"] == "custom"
 
 
-def test_locale_category_title_is_localized_while_the_category_is_not():
-    """Rating matches on `category`; only `categoryTitle` carries the translation."""
+def test_rating_reads_the_root_category_and_display_reads_the_locale_block():
+    """The locale block holds the translation; only the root feeds rating."""
     custom, master = documents()
-    master["locales"]["es_ES"] = {
-        "title": "T\u00edtulo",
-        "category": "Dishwasher",
-        "categoryTitle": "Lavavajillas",
-    }
+    master["locales"]["es_ES"] = {"title": "T\u00edtulo", "category": "Lavavajillas"}
     custom["enabledLocales"] = ["en_GB", "es_ES"]
 
     result = resolve_documents(custom, master, "es_ES")
@@ -107,12 +102,32 @@ def test_locale_category_title_is_localized_while_the_category_is_not():
     assert result["product"]["categoryTitle"] == "Lavavajillas"
 
 
-def test_category_title_falls_back_to_the_category_before_the_backfill():
-    """A MasterSKU written before locale titles existed must still render a name."""
+def test_a_translated_locale_category_never_reaches_the_rating_key():
+    """The regression this split exists to prevent: mis-rating a Spanish journey."""
     custom, master = documents()
-    del master["locales"]["en_GB"]["categoryTitle"]
+    for locale, title in (("es_ES", "Lavavajillas"), ("fr_FR", "Lave-vaisselle")):
+        master["locales"][locale] = {"category": title}
+        assert resolve_documents(custom, master, locale)["product"]["category"] == "Dishwasher"
+
+
+def test_a_locale_block_naming_a_different_category_does_not_win_over_the_root():
+    """Older masters can disagree — a locale added after a reclassification. The
+    root is authoritative for rating now, and the locale block only for display."""
+    custom, master = documents()
+    master["category"] = "Appliance"
 
     result = resolve_documents(custom, master, "en_GB")
+
+    assert result["product"]["category"] == "Appliance"
+    assert result["product"]["categoryTitle"] == "Dishwasher"
+
+
+def test_category_title_falls_back_to_the_category_before_the_backfill():
+    """A locale block still holding the untranslated category renders the same."""
+    custom, master = documents()
+    master["locales"]["it_IT"] = {"title": "Titolo"}
+
+    result = resolve_documents(custom, master, "it_IT")
 
     assert result["product"]["categoryTitle"] == "Dishwasher"
 
@@ -129,14 +144,24 @@ def test_a_category_override_names_its_own_title():
     assert result["fieldSources"]["categoryTitle"] == "custom"
 
 
-def test_category_title_for_a_locale_the_master_does_not_carry():
-    """A locale with no master block falls back to the root category, not blank."""
+def test_a_root_override_sets_the_rating_category_for_every_locale():
+    custom, master = documents()
+    master["locales"]["es_ES"] = {"category": "Lavavajillas"}
+    custom["overrides"] = {"category": "Kitchen"}
+
+    result = resolve_documents(custom, master, "es_ES")
+
+    assert result["product"]["category"] == "Kitchen"
+
+
+def test_category_for_a_locale_the_master_does_not_carry():
+    """A locale with no master block still rates, and renders the root category."""
     custom, master = documents()
 
     result = resolve_documents(custom, master, "fr_FR")
 
-    assert result["product"]["category"] == "Appliance"
-    assert result["product"]["categoryTitle"] == "Appliance"
+    assert result["product"]["category"] == "Dishwasher"
+    assert result["product"]["categoryTitle"] == "Dishwasher"
 
 
 def test_match_key_prefers_gtin_and_normalizes_make_model_fallback():

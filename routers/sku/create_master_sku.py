@@ -419,14 +419,12 @@ def create_master_sku_service(
     now = utc_now()
     locale_block = {
         "title": product["title"] or f"{product['make']} {product['model']}".strip(),
-        # `category` is the taxonomy spelling, in every locale: it is the key
-        # assignment rules and rating tables match on, so localizing it would
-        # silently mis-rate every non-English journey. `categoryTitle` carries
-        # the translated name the product card renders, and falls back to the
-        # taxonomy spelling when the Category document has no title for this
-        # locale.
-        "category": product["category"],
-        "categoryTitle": localized_category_title(product["category"], data.locale),
+        # The category translated for this locale, from the Category taxonomy's
+        # `locale_title`. This is display copy: assignment and rating match on
+        # the untranslated `category` at the root of this document, which is why
+        # the root value below is never localized. Falls back to the taxonomy
+        # spelling when the Category document has no title for this locale.
+        "category": localized_category_title(product["category"], data.locale),
         "market": {
             "referencePrice": None,
             "currency": locale_info.get("currency", ""),
@@ -464,12 +462,15 @@ def create_master_sku_service(
         "createdAt": now,
     }
     master_filter = {"_id": existing["_id"]} if existing else {"matchKey": key}
+    updates: dict[str, Any] = {f"locales.{data.locale}": locale_block, "updatedAt": now}
+    # `category` is $setOnInsert, so an existing master that somehow carries none
+    # would never gain one — and it is the value rating matches on. Fill it in
+    # rather than leaving the rating key blank; a master that has one keeps it.
+    if existing and not (existing.get("category") or "").strip():
+        updates["category"] = product["category"]
     saved = master_collection.find_one_and_update(
         master_filter,
-        {
-            "$setOnInsert": set_on_insert,
-            "$set": {f"locales.{data.locale}": locale_block, "updatedAt": now},
-        },
+        {"$setOnInsert": set_on_insert, "$set": updates},
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
