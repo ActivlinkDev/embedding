@@ -76,6 +76,53 @@ def _find_matching_item(items: list, model: str) -> dict | None:
     return None
 
 
+def _price_stats(sellers: list, preferred_currency: str | None) -> dict | None:
+    """
+    Summarise the seller offers into min/mean for a single currency.
+
+    ``preferred_currency`` is the currency already recorded on the locale (set by
+    the shopping task). Anchoring on it keeps ``referencePrice`` and
+    ``market.currency`` describing the same money — a seller list can carry
+    offers from more than one currency, and averaging across them would be
+    meaningless. When the locale has no currency yet, the most common currency
+    in the list wins.
+
+    Returns None when no seller carries a usable price, so callers can leave the
+    existing reference price alone rather than blanking it.
+    """
+    priced: list[tuple[str, float]] = []
+    for seller in sellers:
+        value = seller.get("price")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if value <= 0:
+            continue
+        currency = (seller.get("currency") or "").strip().upper()
+        priced.append((currency, float(value)))
+
+    if not priced:
+        return None
+
+    target = (preferred_currency or "").strip().upper()
+    prices = [p for c, p in priced if c == target] if target else []
+    if not prices:
+        # No offers in the locale's currency (or none recorded yet) — fall back to
+        # whichever currency the sellers mostly quote, and report it so the caller
+        # can keep market.currency in step.
+        counts: dict[str, int] = {}
+        for currency, _ in priced:
+            counts[currency] = counts.get(currency, 0) + 1
+        target = max(counts, key=lambda c: (counts[c], c))
+        prices = [p for c, p in priced if c == target]
+
+    return {
+        "currency": target,
+        "min": min(prices),
+        "mean": round(sum(prices) / len(prices), 2),
+        "count": len(prices),
+    }
+
+
 def _process_task(task: dict) -> dict:
     """
     Extract the best-matching shopping item from a single DataforSEO task,
@@ -192,6 +239,9 @@ def _process_product_info_task(task: dict) -> dict:
     Handle a product_info postback: extract the product_info_element from
     result[0].items[0] and upsert it as an `extra_product_info` object into
     the matching MasterSKU locale entry.
+
+    The seller list this carries also re-prices the SKU: referencePrice becomes
+    the cheapest offer, with priceMin/priceMean/priceSampleSize stored beside it.
     """
     task_data = task.get("data") or {}
     master_sku_id = task_data.get("tag")
@@ -257,6 +307,28 @@ def _process_product_info_task(task: dict) -> dict:
         f"{prefix}.updatedAt": now,
         "updatedAt": now,
     }
+
+    # The shopping task set referencePrice from the price printed on the Google
+    # Shopping tile, which is a single headline offer and is regularly well above
+    # what the product actually sells for. The seller list is the better source:
+    # take the cheapest offer as the reference price and keep the mean alongside
+    # it so the spread stays visible. referencePrice feeds the quote
+    # (services/catalog.py resolves it into product.price), so an inflated one
+    # rates the customer's cover too high.
+    ms_doc = mastersku_collection.find_one(
+        {"_id": ms_id}, {f"{prefix}.market.currency": 1}
+    ) or {}
+    existing_currency = (
+        ((ms_doc.get("locales") or {}).get(locale) or {}).get("market") or {}
+    ).get("currency")
+    stats = _price_stats(sellers, existing_currency)
+    if stats:
+        update[f"{prefix}.market.referencePrice"] = stats["min"]
+        update[f"{prefix}.market.priceMin"] = stats["min"]
+        update[f"{prefix}.market.priceMean"] = stats["mean"]
+        update[f"{prefix}.market.priceSampleSize"] = stats["count"]
+        update[f"{prefix}.market.currency"] = stats["currency"]
+
     # These four are populated from Icecat at creation. DataforSEO frequently returns a
     # product_info element with some of them missing, so only overwrite what it actually
     # carries — an unconditional $set would blank good catalogue copy.
@@ -272,7 +344,8 @@ def _process_product_info_task(task: dict) -> dict:
 
     print(
         f"[DSEO Webhook] Stored extra_product_info for MasterSKU {master_sku_id} locale={locale} "
-        f"title={item.get('title')!r} sellers={len(sellers)} specs={len(specs_dict)}",
+        f"title={item.get('title')!r} sellers={len(sellers)} specs={len(specs_dict)} "
+        f"priceMin={(stats or {}).get('min')} priceMean={(stats or {}).get('mean')}",
         file=sys.stderr,
     )
     return {
@@ -282,6 +355,8 @@ def _process_product_info_task(task: dict) -> dict:
         "title": item.get("title"),
         "sellers": len(sellers),
         "specs": len(specs_dict),
+        "price_min": (stats or {}).get("min"),
+        "price_mean": (stats or {}).get("mean"),
     }
 
 
@@ -351,7 +426,10 @@ async def dseo_webhook(request: Request, background_tasks: BackgroundTasks):
     own `status`. Treat the status code as "received", never as "succeeded".
 
     When a shopping task yields a Google `Product_ID`, a `product_info` task is scheduled
-    automatically — which is why one submission can produce two postbacks.
+    automatically — which is why one submission can produce two postbacks. The two rounds price
+    the SKU differently on purpose: the shopping task records the price on the Google Shopping
+    tile, and the `product_info` round then replaces `market.referencePrice` with the cheapest
+    seller it found, recording `priceMin`, `priceMean` and `priceSampleSize` alongside it.
 
     There is **no bearer token** on this endpoint; the `id` query parameter is the task
     correlation, not a credential.
@@ -390,8 +468,15 @@ async def dseo_webhook(request: Request, background_tasks: BackgroundTasks):
         processing_results.append(outcome)
 
         # CustomSKUs inherit master pricing at read time. Rebuild only their
-        # derived quote caches; no catalogue data is copied.
-        if fn != "product_info" and outcome.get("status") == "ok":
+        # derived quote caches; no catalogue data is copied. Both task types can
+        # move the reference price — the shopping task sets it from the SERP tile,
+        # the product_info task replaces it with the cheapest seller — so a
+        # product_info postback that produced a price has to re-warm too, or the
+        # caches keep quoting the superseded figure.
+        price_changed = outcome.get("status") == "ok" and (
+            fn != "product_info" or outcome.get("price_min") is not None
+        )
+        if price_changed:
             background_tasks.add_task(
                 _warm_inherited_skus,
                 outcome["master_sku_id"],
