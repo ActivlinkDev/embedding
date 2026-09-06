@@ -20,9 +20,11 @@ from pymongo import ReturnDocument
 import requests
 
 from services.catalog import SCHEMA_VERSION, master_match_key, normalize_text, serialize, utc_now
+from utils.category_tree import known as known_category
 from utils.category_tree import localized_title as localized_category_title
 from utils.category_tree import resolve as resolve_category
 from .catalog_dependencies import catalog, database, master_collection, locale_collection
+from .category_validation import validate_category
 
 
 logger = logging.getLogger(__name__)
@@ -108,13 +110,20 @@ def compute_category_embedding(category_input: str):
 
 
 def _canonical_category(category_input: str, explicit_category: Optional[str]) -> str:
+    """Resolve the category to store at the root of the MasterSKU.
+
+    A category the caller named must already be in the taxonomy — it is the key
+    rating matches on, so `validate_category` raises rather than storing a name
+    nothing can rate. A category derived from enrichment text is guessed at
+    instead: exact lookup first, then the embedding classifier, and an empty
+    string when neither is confident enough for the caller to fall back on.
+    """
     if explicit_category and explicit_category.strip():
-        return resolve_category(explicit_category)["category"] or explicit_category.strip()
+        return validate_category(explicit_category) or ""
     if not category_input.strip():
         return ""
-    exact = resolve_category(category_input)
-    if exact.get("group") or exact.get("sector"):
-        return exact["category"] or ""
+    if known_category(category_input):
+        return resolve_category(category_input)["category"] or ""
     matched, _, _, _ = compute_category_embedding(category_input)
     return "" if matched == "Unknown" else matched
 

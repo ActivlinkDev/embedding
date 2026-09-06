@@ -191,3 +191,35 @@ def test_resolve_never_leaks_titles_into_the_placement_contract(monkeypatch):
     assert category_tree.resolve("LED Television") == {
         "category": "LED Television", "group": "Entertainment", "sector": "Technology",
     }
+
+
+# ── Membership ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("written", ["Washer Dryer", "washer-dryer", "  WASHER  DRYER "])
+def test_known_folds_case_and_punctuation(monkeypatch, written):
+    seed(monkeypatch, TAXONOMY)
+    assert category_tree.known(written) is True
+
+
+@pytest.mark.parametrize("written", ["Nonesuch", "", None, "   "])
+def test_known_rejects_what_the_taxonomy_does_not_hold(monkeypatch, written):
+    seed(monkeypatch, TAXONOMY)
+    assert category_tree.known(written) is False
+
+
+def test_known_does_not_infer_membership_from_group_and_sector(monkeypatch):
+    """A legitimate top-level entry carries neither and is still a real category."""
+    seed(monkeypatch, {"Orphan": {"category": "Orphan", "group": None, "sector": None}})
+    assert category_tree.known("Orphan") is True
+    assert category_tree.resolve("Orphan")["group"] is None
+
+
+def test_loaded_reports_an_unreadable_taxonomy(monkeypatch):
+    """`known` returning False must be distinguishable from Mongo being down."""
+    monkeypatch.setattr(category_tree, "_load", dict)
+    assert category_tree.loaded() is False
+    assert category_tree.known("Washer Dryer") is False
+
+    seed(monkeypatch, TAXONOMY)
+    assert category_tree.loaded() is True

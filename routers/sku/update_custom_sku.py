@@ -10,6 +10,7 @@ from pymongo.errors import DuplicateKeyError
 from services.catalog import normalize_sku, serialize, utc_now
 from utils.dependencies import verify_token
 from .catalog_dependencies import catalog, custom_collection
+from .category_validation import validate_category
 
 
 router = APIRouter(prefix="/sku", tags=["Catalog"])
@@ -114,7 +115,7 @@ def update_custom_sku(
             raise HTTPException(status_code=400, detail="SKU cannot be empty")
         set_ops.update({"sku": sku, "skuNormalized": normalize_sku(sku)})
     if "Category" in provided:
-        set_ops["overrides.category"] = data.Category
+        set_ops["overrides.category"] = validate_category(data.Category)
     if "Global_Promotion" in provided:
         set_ops["overrides.globalPromotion"] = data.Global_Promotion
 
@@ -122,7 +123,10 @@ def update_custom_sku(
         locale_provided = data.Locale_Details.model_fields_set
         for source, target in LOCALE_FIELDS.items():
             if source in locale_provided:
-                set_ops[f"overrides.locales.{data.Locale}.{target}"] = getattr(data.Locale_Details, source)
+                value = getattr(data.Locale_Details, source)
+                if source == "Category":
+                    value = validate_category(value, "Locale_Details.Category")
+                set_ops[f"overrides.locales.{data.Locale}.{target}"] = value
         if "GTL" in locale_provided:
             set_ops[f"overrides.locales.{data.Locale}.guarantee.labourMonths"] = data.Locale_Details.GTL
         if "GTP" in locale_provided:

@@ -168,6 +168,28 @@ def resolve(category: Optional[str]) -> Dict[str, Optional[str]]:
     return {"category": name, "group": None, "sector": None}
 
 
+def loaded() -> bool:
+    """Whether the taxonomy could be read at all.
+
+    Distinguishes "this category is not in the collection" from "the collection
+    is unreachable" — the two look identical through :func:`resolve`, and a
+    caller that rejects unknown categories must not reject every one of them
+    because Mongo blipped.
+    """
+    return bool(_tree())
+
+
+def known(category: Optional[str]) -> bool:
+    """Whether the taxonomy holds this category, folding case and punctuation.
+
+    Membership is tested against the collection itself rather than inferred from
+    a resolved ``group``/``sector``: a legitimate top-level entry can carry
+    neither, and would otherwise read as unknown.
+    """
+    name = (category or "").strip()
+    return bool(name) and _key(name) in _tree()
+
+
 def localized_title(category: Optional[str], locale: Optional[str]) -> str:
     """Return the customer-facing name of ``category`` in ``locale``.
 
