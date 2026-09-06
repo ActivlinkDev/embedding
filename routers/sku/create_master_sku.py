@@ -421,6 +421,9 @@ def create_master_sku_service(
         "category": product["category"],
         "market": {
             "referencePrice": None,
+            # Filled in by the DataforSEO product_info postback, from its sellers.
+            "priceMin": None,
+            "priceMean": None,
             "currency": locale_info.get("currency", ""),
             "merchant": None,
         },
