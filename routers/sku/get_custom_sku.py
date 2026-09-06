@@ -34,10 +34,23 @@ def get_custom_sku(
     if locale:
         if locale not in (custom.get("enabledLocales") or []):
             raise HTTPException(status_code=404, detail="Locale not enabled on CustomSKU")
-        response["resolved"] = serialize(catalog.resolve_custom(custom, locale))
+        locales = [locale]
     else:
-        response["resolved"] = serialize([
-            catalog.resolve_custom(custom, item)
-            for item in custom.get("enabledLocales") or []
-        ])
+        locales = list(custom.get("enabledLocales") or [])
+
+    resolved = [catalog.resolve_custom(custom, item) for item in locales]
+    # The baseline each locale falls back to once its overrides are removed.
+    # An editor cannot derive this from `resolved`, where an override has
+    # already replaced the inherited value.
+    inherited = [
+        catalog.resolve_custom(custom, item, ignore_overrides=True)
+        for item in locales
+    ]
+
+    if locale:
+        response["resolved"] = serialize(resolved[0])
+        response["inherited"] = serialize(inherited[0])
+    else:
+        response["resolved"] = serialize(resolved)
+        response["inherited"] = serialize(inherited)
     return response

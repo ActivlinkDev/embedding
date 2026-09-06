@@ -290,13 +290,28 @@ class CatalogService:
             ), "master"
         return None, None
 
-    def resolve_custom(self, custom: dict, locale: str) -> Optional[dict]:
+    def resolve_custom(
+        self,
+        custom: dict,
+        locale: str,
+        *,
+        ignore_overrides: bool = False,
+    ) -> Optional[dict]:
+        """Resolve a tenant SKU for one locale.
+
+        ``ignore_overrides`` resolves the same documents as if the tenant had
+        set no overrides at all.  That baseline is what an editor needs to show
+        the value a field falls back to when its override is removed, which is
+        otherwise invisible once an override hides it.
+        """
         master_id = custom.get("masterSkuId")
         if not isinstance(master_id, ObjectId):
             return None
         master = self.masters.find_one({"_id": master_id})
         if not master:
             return None
+        if ignore_overrides:
+            custom = {**custom, "overrides": {}}
         return resolve_documents(custom, master, locale, self.locale_defaults(locale))
 
     def resolve_lookup(
