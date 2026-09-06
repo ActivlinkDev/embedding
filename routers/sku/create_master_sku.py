@@ -20,8 +20,11 @@ from pymongo import ReturnDocument
 import requests
 
 from services.catalog import SCHEMA_VERSION, master_match_key, normalize_text, serialize, utc_now
+from utils.category_tree import known as known_category
+from utils.category_tree import localized_title as localized_category_title
 from utils.category_tree import resolve as resolve_category
 from .catalog_dependencies import catalog, database, master_collection, locale_collection
+from .category_validation import validate_category
 
 
 logger = logging.getLogger(__name__)
@@ -107,13 +110,20 @@ def compute_category_embedding(category_input: str):
 
 
 def _canonical_category(category_input: str, explicit_category: Optional[str]) -> str:
+    """Resolve the category to store at the root of the MasterSKU.
+
+    A category the caller named must already be in the taxonomy — it is the key
+    rating matches on, so `validate_category` raises rather than storing a name
+    nothing can rate. A category derived from enrichment text is guessed at
+    instead: exact lookup first, then the embedding classifier, and an empty
+    string when neither is confident enough for the caller to fall back on.
+    """
     if explicit_category and explicit_category.strip():
-        return resolve_category(explicit_category)["category"] or explicit_category.strip()
+        return validate_category(explicit_category) or ""
     if not category_input.strip():
         return ""
-    exact = resolve_category(category_input)
-    if exact.get("group") or exact.get("sector"):
-        return exact["category"] or ""
+    if known_category(category_input):
+        return resolve_category(category_input)["category"] or ""
     matched, _, _, _ = compute_category_embedding(category_input)
     return "" if matched == "Unknown" else matched
 
@@ -418,7 +428,12 @@ def create_master_sku_service(
     now = utc_now()
     locale_block = {
         "title": product["title"] or f"{product['make']} {product['model']}".strip(),
-        "category": product["category"],
+        # The category translated for this locale, from the Category taxonomy's
+        # `locale_title`. This is display copy: assignment and rating match on
+        # the untranslated `category` at the root of this document, which is why
+        # the root value below is never localized. Falls back to the taxonomy
+        # spelling when the Category document has no title for this locale.
+        "category": localized_category_title(product["category"], data.locale),
         "market": {
             "referencePrice": None,
             # Filled in by the DataforSEO product_info postback, from its sellers.
@@ -459,12 +474,15 @@ def create_master_sku_service(
         "createdAt": now,
     }
     master_filter = {"_id": existing["_id"]} if existing else {"matchKey": key}
+    updates: dict[str, Any] = {f"locales.{data.locale}": locale_block, "updatedAt": now}
+    # `category` is $setOnInsert, so an existing master that somehow carries none
+    # would never gain one — and it is the value rating matches on. Fill it in
+    # rather than leaving the rating key blank; a master that has one keeps it.
+    if existing and not (existing.get("category") or "").strip():
+        updates["category"] = product["category"]
     saved = master_collection.find_one_and_update(
         master_filter,
-        {
-            "$setOnInsert": set_on_insert,
-            "$set": {f"locales.{data.locale}": locale_block, "updatedAt": now},
-        },
+        {"$setOnInsert": set_on_insert, "$set": updates},
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )

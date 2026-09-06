@@ -12,6 +12,7 @@ from pymongo.errors import DuplicateKeyError
 from services.catalog import SCHEMA_VERSION, normalize_sku, serialize, utc_now
 from utils.dependencies import verify_token
 from .catalog_dependencies import catalog, custom_collection, locale_collection, master_collection
+from .category_validation import validate_category
 from .create_master_sku import MasterSKURequest, create_master_sku_service
 
 
@@ -65,7 +66,10 @@ def _locale_override(details: Optional[LocaleDetails]) -> dict:
     }
     for source, target in mapping.items():
         if source in supplied:
-            result[target] = getattr(details, source)
+            value = getattr(details, source)
+            if source == "Category":
+                value = validate_category(value, "Locale_Details.Category")
+            result[target] = value
     if "Custom_Links" in supplied:
         result["customLinks"] = (
             None
@@ -142,6 +146,12 @@ def create_custom_sku_service(
         "clientId": client_id,
         "skuNormalized": normalize_sku(sku),
     })
+    provided = data.model_fields_set
+    # Validated before anything is written: `_master_for_request` can create a
+    # MasterSKU, and a category rejected after that would strand it.
+    locale_override = _locale_override(data.Locale_Details)
+    root_category = validate_category(data.Category) if "Category" in provided else None
+
     master = None
     if data.masterSkuId:
         master = _master_for_request(data, background_tasks, request)
@@ -151,9 +161,7 @@ def create_custom_sku_service(
             master = None
     if master is None:
         master = _master_for_request(data, background_tasks, request)
-    locale_override = _locale_override(data.Locale_Details)
     now = utc_now()
-    provided = data.model_fields_set
     locale_was_enabled = bool(existing and data.Locale in (existing.get("enabledLocales") or []))
 
     if existing:
@@ -169,7 +177,7 @@ def create_custom_sku_service(
             else:
                 set_ops[f"overrides.locales.{data.Locale}.{key}"] = value
         if "Category" in provided:
-            set_ops["overrides.category"] = data.Category
+            set_ops["overrides.category"] = root_category
         if "Global_Promotion" in provided:
             set_ops["overrides.globalPromotion"] = data.Global_Promotion
         custom_collection.update_one(
@@ -186,7 +194,7 @@ def create_custom_sku_service(
         if locale_override:
             overrides["locales"][data.Locale] = locale_override
         if "Category" in provided:
-            overrides["category"] = data.Category
+            overrides["category"] = root_category
         if "Global_Promotion" in provided:
             overrides["globalPromotion"] = data.Global_Promotion
         doc = {

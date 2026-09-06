@@ -144,6 +144,11 @@ def resolve_documents(
         "guarantee": guarantee_sources,
     }
 
+    # Assignment and rating match on the taxonomy category, which lives at the
+    # root of the MasterSKU. The locale block's `category` is the same category
+    # translated for that locale — display copy, never a rating key — so it is
+    # deliberately not consulted here. A tenant can override the rating category
+    # globally or for one locale.
     category_override = locale_override if _present(locale_override, "category") else overrides
     _take(
         product,
@@ -151,7 +156,20 @@ def resolve_documents(
         "category",
         category_override,
         "category",
-        master_locale.get("category") or master.get("category"),
+        master.get("category"),
+        "",
+    )
+    # The category as the customer should read it. A tenant that overrides the
+    # category has named what the card renders too. A locale block written
+    # before the translation was stored still holds the untranslated taxonomy
+    # spelling, which reads the same as this fallback.
+    _take(
+        product,
+        field_sources,
+        "categoryTitle",
+        category_override,
+        "category",
+        master_locale.get("category") or product["category"],
         "",
     )
     _take(product, field_sources, "title", locale_override, "title", master_locale.get("title"), "")
