@@ -78,7 +78,8 @@ def _find_matching_item(items: list, model: str) -> dict | None:
 
 def _price_stats(sellers: list, preferred_currency: str | None) -> dict | None:
     """
-    Summarise the seller offers into min/mean for a single currency.
+    Summarise the seller offers into min/mean, and name the cheapest merchant,
+    for a single currency.
 
     ``preferred_currency`` is the currency already recorded on the locale (set by
     the shopping task). Anchoring on it keeps ``referencePrice`` and
@@ -90,7 +91,7 @@ def _price_stats(sellers: list, preferred_currency: str | None) -> dict | None:
     Returns None when no seller carries a usable price, so callers can leave the
     existing reference price alone rather than blanking it.
     """
-    priced: list[tuple[str, float]] = []
+    priced: list[tuple[str, float, str]] = []
     for seller in sellers:
         value = seller.get("price")
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -98,28 +99,34 @@ def _price_stats(sellers: list, preferred_currency: str | None) -> dict | None:
         if value <= 0:
             continue
         currency = (seller.get("currency") or "").strip().upper()
-        priced.append((currency, float(value)))
+        priced.append((currency, float(value), (seller.get("title") or "").strip()))
 
     if not priced:
         return None
 
     target = (preferred_currency or "").strip().upper()
-    prices = [p for c, p in priced if c == target] if target else []
-    if not prices:
+    offers = [o for o in priced if o[0] == target] if target else []
+    if not offers:
         # No offers in the locale's currency (or none recorded yet) — fall back to
         # whichever currency the sellers mostly quote, and report it so the caller
         # can keep market.currency in step.
         counts: dict[str, int] = {}
-        for currency, _ in priced:
+        for currency, _, _title in priced:
             counts[currency] = counts.get(currency, 0) + 1
         target = max(counts, key=lambda c: (counts[c], c))
-        prices = [p for c, p in priced if c == target]
+        offers = [o for o in priced if o[0] == target]
 
+    prices = [price for _c, price, _t in offers]
+    # min() over the tuples would tie-break on the seller name; DataforSEO returns
+    # the sellers in Google's own order, so the first offer at the lowest price is
+    # the one to name.
+    cheapest = min(offers, key=lambda o: o[1])
     return {
         "currency": target,
-        "min": min(prices),
+        "min": cheapest[1],
         "mean": round(sum(prices) / len(prices), 2),
         "count": len(prices),
+        "merchant": cheapest[2] or None,
     }
 
 
@@ -241,7 +248,8 @@ def _process_product_info_task(task: dict) -> dict:
     the matching MasterSKU locale entry.
 
     The seller list this carries also re-prices the SKU: referencePrice becomes
-    the cheapest offer, with priceMin/priceMean/priceSampleSize stored beside it.
+    the cheapest offer and merchant the seller quoting it, with
+    priceMin/priceMean/priceSampleSize stored beside them.
     """
     task_data = task.get("data") or {}
     master_sku_id = task_data.get("tag")
@@ -328,6 +336,11 @@ def _process_product_info_task(task: dict) -> dict:
         update[f"{prefix}.market.priceMean"] = stats["mean"]
         update[f"{prefix}.market.priceSampleSize"] = stats["count"]
         update[f"{prefix}.market.currency"] = stats["currency"]
+        # merchant names whoever quotes referencePrice. Leave the shopping task's
+        # value in place when the cheapest offer is anonymous, rather than
+        # replacing a real name with nothing.
+        if stats["merchant"]:
+            update[f"{prefix}.market.merchant"] = stats["merchant"]
 
     # These four are populated from Icecat at creation. DataforSEO frequently returns a
     # product_info element with some of them missing, so only overwrite what it actually
@@ -428,8 +441,9 @@ async def dseo_webhook(request: Request, background_tasks: BackgroundTasks):
     When a shopping task yields a Google `Product_ID`, a `product_info` task is scheduled
     automatically — which is why one submission can produce two postbacks. The two rounds price
     the SKU differently on purpose: the shopping task records the price on the Google Shopping
-    tile, and the `product_info` round then replaces `market.referencePrice` with the cheapest
-    seller it found, recording `priceMin`, `priceMean` and `priceSampleSize` alongside it.
+    tile, and the `product_info` round then replaces `market.referencePrice` and
+    `market.merchant` with the cheapest seller it found, recording `priceMin`, `priceMean` and
+    `priceSampleSize` alongside them.
 
     There is **no bearer token** on this endpoint; the `id` query parameter is the task
     correlation, not a credential.

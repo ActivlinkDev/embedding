@@ -18,9 +18,43 @@ def _seller(price, currency="GBP", title="Shop"):
 
 def test_min_and_mean_come_from_the_seller_offers():
     stats = dseo_webhook._price_stats(
-        [_seller(499.0), _seller(529.0), _seller(639.0)], "GBP"
+        [
+            _seller(639.0, title="Currys"),
+            _seller(499.0, title="Argos"),
+            _seller(529.0, title="Very"),
+        ],
+        "GBP",
     )
-    assert stats == {"currency": "GBP", "min": 499.0, "mean": 555.67, "count": 3}
+    assert stats == {
+        "currency": "GBP",
+        "min": 499.0,
+        "mean": 555.67,
+        "count": 3,
+        "merchant": "Argos",
+    }
+
+
+def test_the_named_merchant_is_the_first_at_the_lowest_price():
+    """Ties keep Google's ordering — not whichever name sorts first."""
+    stats = dseo_webhook._price_stats(
+        [_seller(499.0, title="Very"), _seller(499.0, title="Argos")], "GBP"
+    )
+    assert stats["merchant"] == "Very"
+
+
+def test_a_cheapest_offer_in_another_currency_cannot_claim_the_merchant():
+    stats = dseo_webhook._price_stats(
+        [_seller(420.0, "EUR", title="Amazon.de"), _seller(499.0, "GBP", title="Argos")],
+        "GBP",
+    )
+    assert stats["merchant"] == "Argos"
+    assert stats["min"] == 499.0
+
+
+def test_an_anonymous_cheapest_offer_reports_no_merchant():
+    stats = dseo_webhook._price_stats([_seller(499.0, title="")], "GBP")
+    assert stats["min"] == 499.0
+    assert stats["merchant"] is None
 
 
 def test_offers_in_another_currency_are_excluded():
@@ -97,7 +131,11 @@ def test_product_info_postback_replaces_the_serp_reference_price(monkeypatch):
     outcome = dseo_webhook._process_product_info_task(
         _product_info_task(
             master_id,
-            [_raw_seller(499.0), _raw_seller(529.0, title="Very"), _raw_seller(639.0, title="Currys")],
+            [
+                _raw_seller(639.0, title="Currys"),
+                _raw_seller(499.0, title="Argos"),
+                _raw_seller(529.0, title="Very"),
+            ],
         )
     )
 
@@ -110,6 +148,7 @@ def test_product_info_postback_replaces_the_serp_reference_price(monkeypatch):
     assert fields["locales.en_GB.market.priceMean"] == 555.67
     assert fields["locales.en_GB.market.priceSampleSize"] == 3
     assert fields["locales.en_GB.market.currency"] == "GBP"
+    assert fields["locales.en_GB.market.merchant"] == "Argos"
 
 
 def test_product_info_without_prices_leaves_the_reference_price_alone(monkeypatch):
@@ -128,3 +167,24 @@ def test_product_info_without_prices_leaves_the_reference_price_alone(monkeypatc
     fields = collection.updates[0][1]["$set"]
     assert "locales.en_GB.market.referencePrice" not in fields
     assert "locales.en_GB.market.priceMin" not in fields
+    assert "locales.en_GB.market.merchant" not in fields
+
+
+def test_an_unnamed_cheapest_seller_keeps_the_shopping_tasks_merchant(monkeypatch):
+    """A blank name must not overwrite the merchant the shopping task recorded."""
+    master_id = ObjectId()
+    collection = _FakeCollection(
+        {"_id": master_id, "locales": {"en_GB": {"market": {"currency": "GBP"}}}}
+    )
+    monkeypatch.setattr(dseo_webhook, "mastersku_collection", collection)
+    monkeypatch.setattr(
+        dseo_webhook.locale_collection, "find_one", lambda *a, **k: {"locale": "en_GB"}
+    )
+
+    dseo_webhook._process_product_info_task(
+        _product_info_task(master_id, [_raw_seller(499.0, title="")])
+    )
+
+    fields = collection.updates[0][1]["$set"]
+    assert fields["locales.en_GB.market.referencePrice"] == 499.0
+    assert "locales.en_GB.market.merchant" not in fields
