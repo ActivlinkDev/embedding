@@ -17,6 +17,7 @@ def documents():
             "en_GB": {
                 "title": "Canonical title",
                 "category": "Dishwasher",
+                "categoryTitle": "Dishwasher",
                 "market": {"referencePrice": 499.0, "currency": "GBP"},
                 "assets": {"documents": []},
                 "specifications": {"width": "600 mm"},
@@ -88,6 +89,54 @@ def test_explicit_null_suppresses_an_inherited_value():
 
     assert result["product"]["title"] is None
     assert result["fieldSources"]["title"] == "custom"
+
+
+def test_locale_category_title_is_localized_while_the_category_is_not():
+    """Rating matches on `category`; only `categoryTitle` carries the translation."""
+    custom, master = documents()
+    master["locales"]["es_ES"] = {
+        "title": "T\u00edtulo",
+        "category": "Dishwasher",
+        "categoryTitle": "Lavavajillas",
+    }
+    custom["enabledLocales"] = ["en_GB", "es_ES"]
+
+    result = resolve_documents(custom, master, "es_ES")
+
+    assert result["product"]["category"] == "Dishwasher"
+    assert result["product"]["categoryTitle"] == "Lavavajillas"
+
+
+def test_category_title_falls_back_to_the_category_before_the_backfill():
+    """A MasterSKU written before locale titles existed must still render a name."""
+    custom, master = documents()
+    del master["locales"]["en_GB"]["categoryTitle"]
+
+    result = resolve_documents(custom, master, "en_GB")
+
+    assert result["product"]["categoryTitle"] == "Dishwasher"
+
+
+def test_a_category_override_names_its_own_title():
+    """A tenant that renames the category has named what the card renders too."""
+    custom, master = documents()
+    custom["overrides"] = {"locales": {"en_GB": {"category": "Kitchen"}}}
+
+    result = resolve_documents(custom, master, "en_GB")
+
+    assert result["product"]["category"] == "Kitchen"
+    assert result["product"]["categoryTitle"] == "Kitchen"
+    assert result["fieldSources"]["categoryTitle"] == "custom"
+
+
+def test_category_title_for_a_locale_the_master_does_not_carry():
+    """A locale with no master block falls back to the root category, not blank."""
+    custom, master = documents()
+
+    result = resolve_documents(custom, master, "fr_FR")
+
+    assert result["product"]["category"] == "Appliance"
+    assert result["product"]["categoryTitle"] == "Appliance"
 
 
 def test_match_key_prefers_gtin_and_normalizes_make_model_fallback():

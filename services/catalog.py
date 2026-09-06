@@ -154,6 +154,20 @@ def resolve_documents(
         master_locale.get("category") or master.get("category"),
         "",
     )
+    # `category` is the taxonomy key that assignment and rating match on and is
+    # never localized; `categoryTitle` is the name to render. A tenant that
+    # overrides the category has named it itself, so the override is its own
+    # title. A MasterSKU written before locale titles were stored carries no
+    # `categoryTitle`, and reads as the taxonomy spelling until it is backfilled.
+    _take(
+        product,
+        field_sources,
+        "categoryTitle",
+        category_override,
+        "category",
+        master_locale.get("categoryTitle") or product["category"],
+        "",
+    )
     _take(product, field_sources, "title", locale_override, "title", master_locale.get("title"), "")
     _take(
         product,

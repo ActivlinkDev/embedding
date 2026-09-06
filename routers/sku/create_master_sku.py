@@ -20,6 +20,7 @@ from pymongo import ReturnDocument
 import requests
 
 from services.catalog import SCHEMA_VERSION, master_match_key, normalize_text, serialize, utc_now
+from utils.category_tree import localized_title as localized_category_title
 from utils.category_tree import resolve as resolve_category
 from .catalog_dependencies import catalog, database, master_collection, locale_collection
 
@@ -418,7 +419,14 @@ def create_master_sku_service(
     now = utc_now()
     locale_block = {
         "title": product["title"] or f"{product['make']} {product['model']}".strip(),
+        # `category` is the taxonomy spelling, in every locale: it is the key
+        # assignment rules and rating tables match on, so localizing it would
+        # silently mis-rate every non-English journey. `categoryTitle` carries
+        # the translated name the product card renders, and falls back to the
+        # taxonomy spelling when the Category document has no title for this
+        # locale.
         "category": product["category"],
+        "categoryTitle": localized_category_title(product["category"], data.locale),
         "market": {
             "referencePrice": None,
             "currency": locale_info.get("currency", ""),
