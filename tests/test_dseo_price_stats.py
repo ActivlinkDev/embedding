@@ -295,3 +295,50 @@ def test_a_single_letter_first_word_is_not_accepted_alone():
     """One character means nothing once a title is stripped to alphanumerics."""
     items = [_item("Hotpoint SMS6ZCI00G Dishwasher")]
     assert dseo_webhook._find_matching_item(items, "B Bosch", "SMS6ZCI00G") is None
+
+
+# --- brand matching on word boundaries --------------------------------------
+
+
+def test_a_short_brand_does_not_match_inside_another_word():
+    """"GE" folds into "fridge", "range" and "storage" — half of appliance copy."""
+    items = [_item("Samsung ABC123 fridge")]
+    assert dseo_webhook._find_matching_item(items, "GE", "ABC123") is None
+
+
+def test_a_short_brand_still_matches_as_its_own_word():
+    items = [_item("GE ABC123 Refrigerator")]
+    assert dseo_webhook._find_matching_item(items, "GE", "ABC123") is not None
+
+
+def test_a_brand_does_not_match_as_the_tail_of_a_longer_word():
+    items = [_item("Hotpoint Beko-compatible DVN04X20W hose")]
+    assert dseo_webhook._find_matching_item(items, "Eko", "DVN04X20W") is None
+
+
+def test_a_punctuated_model_still_matches_loosely():
+    """Sellers punctuate model numbers freely; only the brand must be exact."""
+    items = [_item("Beko DVN-04-X20W Dishwasher")]
+    assert dseo_webhook._find_matching_item(items, "Beko", "DVN04X20W") is not None
+
+
+def test_a_spaced_legal_entity_matches_across_consecutive_words():
+    items = [_item("LG Electronics DSHD24U Dishwasher")]
+    assert dseo_webhook._find_matching_item(items, "LGElectronics", "DSHD24U") is not None
+
+
+# --- every match is returned, in order ---------------------------------------
+
+
+def test_all_matching_items_are_returned_in_page_order():
+    items = [
+        _item("Beko DVN04X20W drawer", price=11.99),
+        _item("Beko DVN04X20W Dishwasher", price=449.0),
+    ]
+    titles = [i["title"] for i in dseo_webhook._matching_items(items, "Beko", "DVN04X20W")]
+    assert titles == ["Beko DVN04X20W drawer", "Beko DVN04X20W Dishwasher"]
+
+
+def test_non_matching_items_are_left_out():
+    items = [_item("Hotpoint HDW1 Dishwasher"), _item("Beko DVN04X20W Dishwasher")]
+    assert len(dseo_webhook._matching_items(items, "Beko", "DVN04X20W")) == 1

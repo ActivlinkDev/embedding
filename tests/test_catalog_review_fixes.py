@@ -551,3 +551,48 @@ def test_product_info_below_the_floor_leaves_the_locale_alone(monkeypatch):
     assert "locales.en_GB.market.sellers" not in set_values
     assert "locales.en_GB.description" not in set_values
     assert "46.49" in set_values["locales.en_GB.enrichment.rejectedReason"]
+
+
+def test_an_accessory_listed_above_the_product_does_not_reject_the_task(monkeypatch):
+    """Google orders the results; a spare part on top must not decide the page.
+
+    Both listings carry the make and the model, so the floor is the only thing
+    separating them — and it has to be applied per candidate, not once.
+    """
+    captured = {}
+    _dseo_master(monkeypatch, captured, "Beko DVN04X20W Freestanding Dishwasher")
+    monkeypatch.setattr(dseo_webhook, "min_market_price", lambda *_a: 80.0)
+
+    result = dseo_webhook._process_task({
+        "data": {"tag": str(ObjectId()), "location_code": 2826},
+        "result": [{"items": [
+            {"title": "Beko DVN04X20W drawer", "price": 11.99, "currency": "GBP"},
+            {"title": "Beko DVN04X20W Dishwasher", "price": 449.0, "currency": "GBP",
+             "seller": "Currys"},
+        ]}],
+    })
+
+    set_values = captured["update"]["$set"]
+    assert result["status"] == "ok"
+    assert set_values["locales.en_GB.market.referencePrice"] == 449.0
+    assert set_values["locales.en_GB.market.merchant"] == "Currys"
+
+
+def test_the_task_is_rejected_only_when_every_match_fails_the_floor(monkeypatch):
+    captured = {}
+    _dseo_master(monkeypatch, captured, "Beko DVN04X20W Freestanding Dishwasher")
+    monkeypatch.setattr(dseo_webhook, "min_market_price", lambda *_a: 80.0)
+
+    result = dseo_webhook._process_task({
+        "data": {"tag": str(ObjectId()), "location_code": 2826},
+        "result": [{"items": [
+            {"title": "Beko DVN04X20W drawer", "price": 11.99, "currency": "GBP"},
+            {"title": "Beko DVN04X20W door seal", "price": 24.0, "currency": "GBP"},
+        ]}],
+    })
+
+    assert result["status"] == "rejected"
+    assert result["candidates"] == 2
+    # Reported against the first, which is the one a human would look at.
+    assert "11.99" in result["reason"]
+    assert "locales.en_GB.market.referencePrice" not in captured["update"]["$set"]

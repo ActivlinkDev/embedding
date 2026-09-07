@@ -1,6 +1,7 @@
 import gzip
 import json
 import os
+import re
 import sys
 
 from utils.api_docs import json_response
@@ -62,11 +63,46 @@ def _flatten_items(items: list) -> list:
     return flat
 
 
-def _find_matching_item(items: list, make: str, model: str) -> dict | None:
-    """Return the first item whose title carries both the make and the model.
+def _title_words(title: str) -> list[str]:
+    """A title split into normalised words, punctuation dropped.
 
-    Returns None if either is empty — avoids enriching incomplete SKUs with an
-    arbitrary first result (consistent with the previous ScaleSERP behaviour).
+    Kept separate from :func:`_normalize`, which folds the whole string into one
+    run of alphanumerics. That folding is right for model numbers, which sellers
+    punctuate freely ("DVN-04-X20W"), and wrong for brands — see
+    :func:`_brand_present`.
+    """
+    return [word.lower() for word in re.split(r"[^0-9A-Za-z]+", title or "") if word]
+
+
+def _brand_present(words: list[str], brand: str) -> bool:
+    """Whether ``brand`` appears in ``words`` as whole words, not as a fragment.
+
+    Substring matching cannot be used for a brand. Folded to bare alphanumerics,
+    "GE" appears inside "fridge", "range" and "storage" — three of the commonest
+    words in an appliance listing — so a GE SKU would match a Samsung fridge on
+    any model-number coincidence. The model number is punctuated unpredictably
+    and so still matches loosely; the brand is what has to be exact.
+
+    Consecutive words are joined before comparing, so a make written as one word
+    still matches a title that spaces it ("LG Electronics" -> "lgelectronics").
+    """
+    for start in range(len(words)):
+        joined = ""
+        for word in words[start:]:
+            joined += word
+            if joined == brand:
+                return True
+            if len(joined) >= len(brand):
+                break
+    return False
+
+
+def _matching_items(items: list, make: str, model: str) -> list:
+    """Every item whose title carries both the make and the model, in order.
+
+    Returns nothing if either is empty — avoids enriching incomplete SKUs with
+    an arbitrary first result (consistent with the previous ScaleSERP
+    behaviour).
 
     The model alone is not enough to identify a product. ``_normalize`` strips
     titles to bare alphanumerics, so a model like ``DVN04X20W`` matches anywhere
@@ -78,18 +114,29 @@ def _find_matching_item(items: list, make: str, model: str) -> dict | None:
     spare part for six compatible Beko models passes both tests. The price floor
     in :func:`_implausible_price` is what catches those, and it is the guard that
     matters, because a wrong title displays badly while a wrong price rates the
-    cover.
+    cover. Every match is returned rather than just the first so the caller can
+    apply that floor to each in turn: a compatible accessory listed above the
+    product itself must not decide the whole task.
     """
-    flat = _flatten_items(items)
     brand = _brand_tokens(make)
     norm_model = _normalize(model)
     if not brand or not norm_model:
-        return None
-    for item in flat:
-        norm_title = _normalize(item.get("title") or "")
-        if norm_model in norm_title and any(token in norm_title for token in brand):
-            return item
-    return None
+        return []
+    matches = []
+    for item in _flatten_items(items):
+        title = item.get("title") or ""
+        if norm_model not in _normalize(title):
+            continue
+        words = _title_words(title)
+        if any(_brand_present(words, token) for token in brand):
+            matches.append(item)
+    return matches
+
+
+def _find_matching_item(items: list, make: str, model: str) -> dict | None:
+    """The first item matching both the make and the model, or None."""
+    matches = _matching_items(items, make, model)
+    return matches[0] if matches else None
 
 
 def _brand_tokens(make: str) -> list[str]:
@@ -102,9 +149,9 @@ def _brand_tokens(make: str) -> list[str]:
     "Corporation" stand in for the brand and pass nearly every title.
 
     Two characters is the floor, which keeps real short brands (LG, GE) while
-    rejecting a single stray letter. It is a low bar on purpose: the brand only
-    corroborates here, the model number is what identifies the product, and both
-    have to be present.
+    rejecting a single stray letter. Those are safe here only because
+    :func:`_brand_present` compares whole words; as a substring "GE" matches
+    half the appliance listings on the page.
     """
     full = _normalize(make)
     if not full:
@@ -233,8 +280,8 @@ def _process_task(task: dict) -> dict:
     if not items:
         return {"status": "no_results", "master_sku_id": master_sku_id, "locale": locale}
 
-    item = _find_matching_item(items, make, model)
-    if not item:
+    candidates = _matching_items(items, make, model)
+    if not candidates:
         return {
             "status": "no_match",
             "master_sku_id": master_sku_id,
@@ -245,11 +292,25 @@ def _process_task(task: dict) -> dict:
 
     # A price the category cannot plausibly carry means the title matched
     # something that is not the product — an accessory or a spare part quoting
-    # the model number. Reject the whole match rather than just the price: the
-    # rest of the item describes that same wrong listing, and its product_id
-    # would send the follow-up product_info round after it too.
-    rejection = _implausible_price(item.get("price"), item.get("currency"), category)
-    if rejection:
+    # the model number. Such a candidate is skipped rather than ending the task:
+    # Google orders the results, and a compatible accessory listed above the
+    # appliance would otherwise reject a page that also holds the real product.
+    # Only when every match fails is the task rejected, reported against the
+    # first — and then the whole item is dropped, not just its price, because
+    # the rest of it describes that same wrong listing and its product_id would
+    # send the follow-up product_info round after it too.
+    item = None
+    rejection = None
+    for candidate in candidates:
+        reason = _implausible_price(
+            candidate.get("price"), candidate.get("currency"), category
+        )
+        if reason is None:
+            item = candidate
+            break
+        if rejection is None:
+            rejection = reason
+    if item is None:
         now = utc_now()
         mastersku_collection.update_one(
             {"_id": ms_id},
@@ -261,8 +322,9 @@ def _process_task(task: dict) -> dict:
             }},
         )
         print(
-            f"[DSEO Webhook] Rejected match for MasterSKU {master_sku_id} locale={locale} "
-            f"title={item.get('title')!r}: {rejection}",
+            f"[DSEO Webhook] Rejected all {len(candidates)} match(es) for MasterSKU "
+            f"{master_sku_id} locale={locale} "
+            f"title={candidates[0].get('title')!r}: {rejection}",
             file=sys.stderr,
         )
         return {
@@ -270,7 +332,8 @@ def _process_task(task: dict) -> dict:
             "master_sku_id": master_sku_id,
             "locale": locale,
             "reason": rejection,
-            "title": item.get("title"),
+            "title": candidates[0].get("title"),
+            "candidates": len(candidates),
         }
 
     # Build the canonical locale market update.
