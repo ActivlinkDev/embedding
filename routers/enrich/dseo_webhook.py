@@ -14,6 +14,7 @@ from bson import ObjectId
 from dotenv import load_dotenv
 
 from services.catalog import utc_now
+from utils.category_tree import min_market_price
 
 load_dotenv()
 
@@ -61,19 +62,82 @@ def _flatten_items(items: list) -> list:
     return flat
 
 
-def _find_matching_item(items: list, model: str) -> dict | None:
-    """Return the first item whose title contains the normalised model string.
-    Returns None if model is empty — avoids enriching incomplete SKUs with an
+def _find_matching_item(items: list, make: str, model: str) -> dict | None:
+    """Return the first item whose title carries both the make and the model.
+
+    Returns None if either is empty — avoids enriching incomplete SKUs with an
     arbitrary first result (consistent with the previous ScaleSERP behaviour).
+
+    The model alone is not enough to identify a product. ``_normalize`` strips
+    titles to bare alphanumerics, so a model like ``DVN04X20W`` matches anywhere
+    inside anything, including a listing for a different brand that happens to
+    quote the code. Requiring the make narrows that: it is the one token a
+    genuine listing for the product always carries.
+
+    It is not sufficient on its own, though — a marketplace seller listing a
+    spare part for six compatible Beko models passes both tests. The price floor
+    in :func:`_implausible_price` is what catches those, and it is the guard that
+    matters, because a wrong title displays badly while a wrong price rates the
+    cover.
     """
     flat = _flatten_items(items)
+    brand = _brand_tokens(make)
     norm_model = _normalize(model)
-    if not norm_model:
+    if not brand or not norm_model:
         return None
     for item in flat:
-        if norm_model in _normalize(item.get("title") or ""):
+        norm_title = _normalize(item.get("title") or "")
+        if norm_model in norm_title and any(token in norm_title for token in brand):
             return item
     return None
+
+
+def _brand_tokens(make: str) -> list[str]:
+    """The forms of ``make`` a genuine listing title might carry.
+
+    Icecat stores the legal entity — "LG Electronics", "Whirlpool Corporation" —
+    while a shopping listing prints the brand alone. Requiring the full string
+    would turn working enrichments into no-matches, so the first word counts as
+    well. Only those two forms: matching on any word would let "Electronics" or
+    "Corporation" stand in for the brand and pass nearly every title.
+
+    Two characters is the floor, which keeps real short brands (LG, GE) while
+    rejecting a single stray letter. It is a low bar on purpose: the brand only
+    corroborates here, the model number is what identifies the product, and both
+    have to be present.
+    """
+    full = _normalize(make)
+    if not full:
+        return []
+    first = _normalize((make.strip().split() or [""])[0])
+    if first and first != full and len(first) >= 2:
+        return [full, first]
+    return [full]
+
+
+def _implausible_price(price, currency: str | None, category: str | None) -> str | None:
+    """Why ``price`` cannot be a real price for ``category``, or None if it can.
+
+    The floor comes from the category taxonomy and is usually absent, in which
+    case any price passes and behaviour is unchanged. Where one is configured it
+    is the last line of defence against a mis-matched SERP item: enrichment
+    matches on the product name, and an accessory or spare-part listing that
+    quotes the model number is indistinguishable from the appliance by title
+    alone. ``market.referencePrice`` feeds the quote, so storing 11.99 for a
+    dishwasher under-rates the cover rather than merely looking wrong.
+
+    A missing or non-numeric price is not judged here — callers already drop
+    those, and reporting them as implausible would blame the wrong thing.
+    """
+    if isinstance(price, bool) or not isinstance(price, (int, float)):
+        return None
+    floor = min_market_price(category, currency)
+    if floor is None or price >= floor:
+        return None
+    return (
+        f"price {price} {currency or ''}".strip()
+        + f" is below the {floor} floor for category {category!r}"
+    )
 
 
 def _price_stats(sellers: list, preferred_currency: str | None) -> dict | None:
@@ -158,7 +222,10 @@ def _process_task(task: dict) -> dict:
     if not ms_doc:
         return {"status": "error", "reason": f"MasterSKU {master_sku_id} not found"}
 
-    model = ((ms_doc.get("identifiers") or {}).get("model") or "").strip()
+    identifiers = ms_doc.get("identifiers") or {}
+    make = (identifiers.get("make") or "").strip()
+    model = (identifiers.get("model") or "").strip()
+    category = (ms_doc.get("category") or "").strip()
 
     # Dig into result items
     results = task.get("result") or []
@@ -166,9 +233,45 @@ def _process_task(task: dict) -> dict:
     if not items:
         return {"status": "no_results", "master_sku_id": master_sku_id, "locale": locale}
 
-    item = _find_matching_item(items, model)
+    item = _find_matching_item(items, make, model)
     if not item:
-        return {"status": "no_match", "master_sku_id": master_sku_id, "locale": locale, "model": model}
+        return {
+            "status": "no_match",
+            "master_sku_id": master_sku_id,
+            "locale": locale,
+            "make": make,
+            "model": model,
+        }
+
+    # A price the category cannot plausibly carry means the title matched
+    # something that is not the product — an accessory or a spare part quoting
+    # the model number. Reject the whole match rather than just the price: the
+    # rest of the item describes that same wrong listing, and its product_id
+    # would send the follow-up product_info round after it too.
+    rejection = _implausible_price(item.get("price"), item.get("currency"), category)
+    if rejection:
+        now = utc_now()
+        mastersku_collection.update_one(
+            {"_id": ms_id},
+            {"$set": {
+                f"locales.{locale}.enrichment.source": "DataforSEO",
+                f"locales.{locale}.enrichment.status": "rejected",
+                f"locales.{locale}.enrichment.rejectedReason": rejection,
+                f"locales.{locale}.enrichment.updatedAt": now,
+            }},
+        )
+        print(
+            f"[DSEO Webhook] Rejected match for MasterSKU {master_sku_id} locale={locale} "
+            f"title={item.get('title')!r}: {rejection}",
+            file=sys.stderr,
+        )
+        return {
+            "status": "rejected",
+            "master_sku_id": master_sku_id,
+            "locale": locale,
+            "reason": rejection,
+            "title": item.get("title"),
+        }
 
     # Build the canonical locale market update.
     rating_obj = item.get("product_rating") or {}
@@ -188,7 +291,6 @@ def _process_task(task: dict) -> dict:
         "updatedAt": now,
     }
     optional_values = {
-        f"{prefix}.title": item.get("title"),
         f"{prefix}.market.googleId": item.get("gid"),
         f"{prefix}.market.merchant": item.get("seller"),
         f"{prefix}.market.currency": item.get("currency"),
@@ -205,6 +307,20 @@ def _process_task(task: dict) -> dict:
     })
     if image_list and image_list[0]:
         locale_update[f"{prefix}.assets.primaryImage"] = image_list[0]
+
+    # The title is deliberately not taken from the SERP item. This task's job is
+    # pricing; the title it carries is a merchant's listing name, written to win
+    # a search rather than to name a product, and overwriting the Icecat copy
+    # seeded at creation with it produced entries like "Beko Din15c20 Dvn04x20w
+    # Din15x20 Dvn04x20s Bdfn15420 Dvs04x20x". It is only used to fill a locale
+    # that has no title at all, where anything beats blank.
+    existing_title = (
+        ((ms_doc.get("locales") or {}).get(locale) or {}).get("title") or ""
+    ).strip()
+    serp_title = (item.get("title") or "").strip()
+    if not existing_title and serp_title:
+        locale_update[f"{prefix}.title"] = serp_title
+
     mastersku_collection.update_one({"_id": ms_id}, {"$set": locale_update})
 
     print(
@@ -309,12 +425,6 @@ def _process_product_info_task(task: dict) -> dict:
 
     now = utc_now()
     prefix = f"locales.{locale}"
-    update = {
-        f"{prefix}.market.sellers": sellers,
-        f"{prefix}.enrichment.productInfoAt": now,
-        f"{prefix}.updatedAt": now,
-        "updatedAt": now,
-    }
 
     # The shopping task set referencePrice from the price printed on the Google
     # Shopping tile, which is a single headline offer and is regularly well above
@@ -324,12 +434,50 @@ def _process_product_info_task(task: dict) -> dict:
     # (services/catalog.py resolves it into product.price), so an inflated one
     # rates the customer's cover too high.
     ms_doc = mastersku_collection.find_one(
-        {"_id": ms_id}, {f"{prefix}.market.currency": 1}
+        {"_id": ms_id}, {f"{prefix}.market.currency": 1, "category": 1}
     ) or {}
     existing_currency = (
         ((ms_doc.get("locales") or {}).get(locale) or {}).get("market") or {}
     ).get("currency")
+    category = (ms_doc.get("category") or "").strip()
     stats = _price_stats(sellers, existing_currency)
+
+    # The cheapest seller is where a mis-match shows up first: a seller list for
+    # the wrong product is cheapest exactly where it is least like the appliance.
+    # A price the category cannot carry condemns the whole element, not just the
+    # price — the description, features, specs and gallery below all describe
+    # that same listing, and writing them would overwrite good Icecat copy with
+    # an accessory's. Record why and leave the locale as it stands.
+    rejection = (
+        _implausible_price(stats["min"], stats["currency"], category) if stats else None
+    )
+    if rejection:
+        mastersku_collection.update_one(
+            {"_id": ms_id},
+            {"$set": {
+                f"{prefix}.enrichment.productInfoAt": now,
+                f"{prefix}.enrichment.rejectedReason": rejection,
+            }},
+        )
+        print(
+            f"[DSEO Webhook] Rejected product_info for MasterSKU {master_sku_id} "
+            f"locale={locale} title={item.get('title')!r}: {rejection}",
+            file=sys.stderr,
+        )
+        return {
+            "status": "rejected",
+            "master_sku_id": master_sku_id,
+            "locale": locale,
+            "reason": rejection,
+            "title": item.get("title"),
+        }
+
+    update = {
+        f"{prefix}.market.sellers": sellers,
+        f"{prefix}.enrichment.productInfoAt": now,
+        f"{prefix}.updatedAt": now,
+        "updatedAt": now,
+    }
     if stats:
         update[f"{prefix}.market.referencePrice"] = stats["min"]
         update[f"{prefix}.market.priceMin"] = stats["min"]
@@ -418,7 +566,14 @@ def _slim_payload(body: dict) -> dict:
                         "locale": "en_GB",
                         "status": "ok",
                         "product_id": "1234567890123456789",
-                    }
+                    },
+                    {
+                        "function": "products",
+                        "master_sku_id": "681aa2f1c4b21d0f8c9e0055",
+                        "locale": "en_GB",
+                        "status": "rejected",
+                        "reason": "price 11.99 GBP is below the 80.0 floor for category 'Dishwasher'",
+                    },
                 ],
             },
         ),
@@ -437,6 +592,14 @@ async def dseo_webhook(request: Request, background_tasks: BackgroundTasks):
     **It always returns `200`**, even when a task cannot be matched or stored, so DataforSEO does
     not retry into a loop. The real outcome is in `processed`, one entry per task, each with its
     own `status`. Treat the status code as "received", never as "succeeded".
+
+    A task whose best match carries a price the SKU's category cannot plausibly have — an
+    accessory or spare-part listing that quotes the model number — is reported as `rejected` and
+    nothing from it is stored, because every other field describes that same wrong listing. The
+    floor comes from `min_market_price` on the `Category` document and categories without one are
+    never rejected. `locales.<locale>.title` is only ever filled in when the locale has no title:
+    the catalogue title written at creation is the product's name, while the one on a shopping
+    result is a merchant's listing copy.
 
     When a shopping task yields a Google `Product_ID`, a `product_info` task is scheduled
     automatically — which is why one submission can produce two postbacks. The two rounds price

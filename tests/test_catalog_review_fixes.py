@@ -94,7 +94,7 @@ def test_dseo_partial_result_does_not_clear_canonical_price(monkeypatch):
     monkeypatch.setattr(
         dseo_webhook.mastersku_collection,
         "find_one",
-        lambda *_args, **_kwargs: {"identifiers": {"model": "ABC-1"}},
+        lambda *_args, **_kwargs: {"identifiers": {"make": "Acme", "model": "ABC-1"}},
     )
     monkeypatch.setattr(
         dseo_webhook.mastersku_collection,
@@ -104,7 +104,7 @@ def test_dseo_partial_result_does_not_clear_canonical_price(monkeypatch):
 
     result = dseo_webhook._process_task({
         "data": {"tag": str(master_id), "location_code": 2826},
-        "result": [{"items": [{"title": "Retailer ABC-1", "price": None, "currency": None}]}],
+        "result": [{"items": [{"title": "Acme ABC-1 at Retailer", "price": None, "currency": None}]}],
     })
 
     set_values = captured["update"]["$set"]
@@ -389,3 +389,165 @@ def test_locale_block_carries_the_mapped_copy(monkeypatch):
     assert block["assets"]["gallery"]
     assert captured["$setOnInsert"]["identifiers"]["model"] == "58A6Q"
     assert captured["$setOnInsert"]["provenance"]["icecatId"] == "130727235"
+
+
+# --- the Beko DVN04X20W en_GB locale ----------------------------------------
+#
+# A shopping match on the model number alone landed on an eBay spare-parts
+# listing. Its title replaced the Icecat one and its 11.99 GBP became the price
+# the quote rated a full-size dishwasher on.
+
+
+def _dseo_task(master_id, title, price, currency="GBP"):
+    return {
+        "data": {"tag": str(master_id), "location_code": 2826},
+        "result": [{"items": [{
+            "title": title,
+            "price": price,
+            "currency": currency,
+            "seller": "eBay - domestic-electricals",
+            "product_id": "8428454892147097331",
+        }]}],
+    }
+
+
+def _dseo_master(monkeypatch, captured, locale_title, category="Dishwasher"):
+    monkeypatch.setattr(
+        dseo_webhook.locale_collection, "find_one", lambda *_a, **_k: {"locale": "en_GB"}
+    )
+    monkeypatch.setattr(
+        dseo_webhook.mastersku_collection,
+        "find_one",
+        lambda *_a, **_k: {
+            "identifiers": {"make": "Beko", "model": "DVN04X20W"},
+            "category": category,
+            "locales": {"en_GB": {"title": locale_title}},
+        },
+    )
+    monkeypatch.setattr(
+        dseo_webhook.mastersku_collection,
+        "update_one",
+        lambda query, update: captured.update({"query": query, "update": update}),
+    )
+
+
+def test_a_shopping_result_never_overwrites_the_catalogue_title(monkeypatch):
+    """The SERP title is a merchant's listing copy, not the product's name."""
+    captured = {}
+    _dseo_master(monkeypatch, captured, "Beko DVN04X20W Freestanding Dishwasher")
+
+    result = dseo_webhook._process_task(
+        _dseo_task(ObjectId(), "Beko Din15c20 Dvn04x20w Din15x20 Bdfn15420", 449.0)
+    )
+
+    assert result["status"] == "ok"
+    assert "locales.en_GB.title" not in captured["update"]["$set"]
+
+
+def test_a_locale_with_no_title_is_filled_from_the_shopping_result(monkeypatch):
+    """Anything beats blank — this is the only case the SERP title is used."""
+    captured = {}
+    _dseo_master(monkeypatch, captured, "")
+
+    dseo_webhook._process_task(_dseo_task(ObjectId(), "Beko DVN04X20W Dishwasher", 449.0))
+
+    assert captured["update"]["$set"]["locales.en_GB.title"] == "Beko DVN04X20W Dishwasher"
+
+
+def test_a_price_below_the_category_floor_stores_nothing(monkeypatch):
+    """11.99 for a dishwasher means the match is a spare part, not the appliance.
+
+    referencePrice feeds the quote, so this must not reach the locale — and nor
+    must the rest of the item, which describes that same wrong listing.
+    """
+    captured = {}
+    _dseo_master(monkeypatch, captured, "Beko DVN04X20W Freestanding Dishwasher")
+    monkeypatch.setattr(
+        dseo_webhook,
+        "min_market_price",
+        lambda category, currency: 80.0 if category == "Dishwasher" else None,
+    )
+
+    result = dseo_webhook._process_task(
+        _dseo_task(ObjectId(), "Beko Din15c20 Dvn04x20w Din15x20 Bdfn15420", 11.99)
+    )
+
+    set_values = captured["update"]["$set"]
+    assert result["status"] == "rejected"
+    assert "locales.en_GB.market.referencePrice" not in set_values
+    assert "locales.en_GB.title" not in set_values
+    assert set_values["locales.en_GB.enrichment.status"] == "rejected"
+    assert "11.99" in set_values["locales.en_GB.enrichment.rejectedReason"]
+
+
+def test_a_rejected_match_does_not_schedule_the_product_info_round(monkeypatch):
+    """product_id belongs to the wrong listing; following it compounds the error."""
+    captured = {}
+    _dseo_master(monkeypatch, captured, "Beko DVN04X20W Freestanding Dishwasher")
+    monkeypatch.setattr(dseo_webhook, "min_market_price", lambda *_a: 80.0)
+
+    result = dseo_webhook._process_task(_dseo_task(ObjectId(), "Beko DVN04X20W part", 11.99))
+
+    # The dispatcher gates both the product_info follow-up and the quote-cache
+    # re-warm on status == "ok".
+    assert result["status"] != "ok"
+    assert "product_id" not in result
+
+
+def test_a_priced_appliance_still_enriches_normally(monkeypatch):
+    """The floor must not stand between a real match and the locale."""
+    captured = {}
+    _dseo_master(monkeypatch, captured, "Beko DVN04X20W Freestanding Dishwasher")
+    monkeypatch.setattr(dseo_webhook, "min_market_price", lambda *_a: 80.0)
+
+    result = dseo_webhook._process_task(
+        _dseo_task(ObjectId(), "Beko DVN04X20W Dishwasher", 449.0)
+    )
+
+    set_values = captured["update"]["$set"]
+    assert result["status"] == "ok"
+    assert set_values["locales.en_GB.market.referencePrice"] == 449.0
+    assert set_values["locales.en_GB.enrichment.status"] == "found"
+
+
+def test_product_info_below_the_floor_leaves_the_locale_alone(monkeypatch):
+    """The cheapest seller is where a mis-match shows up first.
+
+    This round overwrites description, features, specs and gallery as well as
+    the price, so an implausible cheapest offer has to stop all of it — the
+    alternative is Icecat copy replaced by an accessory's.
+    """
+    captured = {}
+    monkeypatch.setattr(
+        dseo_webhook.locale_collection, "find_one", lambda *_a, **_k: {"locale": "en_GB"}
+    )
+    monkeypatch.setattr(
+        dseo_webhook.mastersku_collection,
+        "find_one",
+        lambda *_a, **_k: {
+            "category": "Dishwasher",
+            "locales": {"en_GB": {"market": {"currency": "GBP"}}},
+        },
+    )
+    monkeypatch.setattr(
+        dseo_webhook.mastersku_collection,
+        "update_one",
+        lambda query, update: captured.update({"query": query, "update": update}),
+    )
+    monkeypatch.setattr(dseo_webhook, "min_market_price", lambda *_a: 80.0)
+
+    result = dseo_webhook._process_product_info_task({
+        "data": {"tag": str(ObjectId()), "location_code": 2826, "function": "product_info"},
+        "result": [{"items": [{
+            "title": "Beko Dishwasher Detergent Tablet Drawer Dispenser",
+            "description": "Genuine Beko spare part",
+            "sellers": [{"title": "bekoofficialspares", "price": {"current": 46.49, "currency": "GBP"}}],
+        }]}],
+    })
+
+    set_values = captured["update"]["$set"]
+    assert result["status"] == "rejected"
+    assert "locales.en_GB.market.referencePrice" not in set_values
+    assert "locales.en_GB.market.sellers" not in set_values
+    assert "locales.en_GB.description" not in set_values
+    assert "46.49" in set_values["locales.en_GB.enrichment.rejectedReason"]
