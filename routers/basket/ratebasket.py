@@ -1,3 +1,4 @@
+from .currency import basket_currency
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional, Tuple
@@ -610,6 +611,7 @@ def rate_basket(payload: RateBasketRequest, _: None = Depends(verify_token)):
         raise HTTPException(status_code=404, detail="Basket not found")
 
     items: List[Dict[str, Any]] = basket.get("Basket", []) or []
+    basket_currency(items)
     # Fallback client/locale from basket root for rules matching if missing on items
     root_client = basket.get("client")
     root_locale = basket.get("locale")

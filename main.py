@@ -2,6 +2,12 @@
 import os
 import importlib
 import asyncio, traceback
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load configuration before importing routers that read it during initialization.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 from fastapi import FastAPI, Request
 from routers.quote import router as quote_router
 from routers.auth import router as auth_router

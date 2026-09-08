@@ -7,6 +7,7 @@ from datetime import datetime
 import os
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
+from .currency import basket_currency, normalize_currency, currency_guard_filter
 from .ratebasket import rate_basket, RateBasketRequest
 
 router = APIRouter(tags=["Basket"])
@@ -367,7 +368,7 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
             "product_name": payload.product_name,
             "product_description": payload.product_description,
             "product_images": payload.product_images,
-            "currency": product.get("currency"),
+            "currency": normalize_currency(product.get("currency")),
             "category": product.get("category"),
             "make": payload_make
                      or (quote.get("make") if isinstance(quote.get("make"), str) else None)
@@ -416,7 +417,7 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
             # append are one operation and two concurrent opposite-mode adds cannot
             # both win.
             new_mode = basket_item.get("mode")
-            criteria = {**criteria, **mode_guard_filter(new_mode)}
+            criteria = {**criteria, **mode_guard_filter(new_mode), **currency_guard_filter(basket_item.get("currency"))}
             update = {"$push": {"Basket": basket_item}}
 
         result = basket_collection.find_one_and_update(
@@ -427,10 +428,12 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
         if not result:
             # Nothing matched: either there is no such basket, or the guard rejected
             # it. Re-read by id alone to say which, and to name the offending modes.
-            existing = basket_collection.find_one({"_id": bid}, {"Basket.mode": 1})
+            existing = basket_collection.find_one({"_id": bid}, {"Basket.mode": 1, "Basket.currency": 1})
             if not existing:
                 raise HTTPException(status_code=404, detail="Basket not found for provided basket_id")
             # Raises the 409 naming both kinds of cover when the guard is what refused.
+            if payload.add_to_basket is not False:
+                basket_currency([*(existing.get("Basket") or []), basket_item])
             assert_no_mode_conflict(existing.get("Basket") or [], new_mode)
             # The basket exists and no longer conflicts — a concurrent write changed
             # it between the update and this read. Nothing was appended either way.

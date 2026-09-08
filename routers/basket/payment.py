@@ -1,3 +1,4 @@
+from .currency import basket_currency
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import AliasChoices, BaseModel, Field, EmailStr
 from typing import Optional, Dict, Any, List
@@ -85,11 +86,7 @@ class BasketPaymentRequest(BaseModel):
 
 
 def _extract_currency(items: list[dict[str, Any]]) -> str:
-    for it in items:
-        cur = (it or {}).get("currency")
-        if cur:
-            return str(cur).lower()
-    return "gbp"  # default fallback
+    return basket_currency(items).lower()
 
 
 def _extract_locale(items: list[dict[str, Any]]) -> Optional[str]:
