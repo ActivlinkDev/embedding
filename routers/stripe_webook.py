@@ -4,8 +4,8 @@ import stripe
 from utils.api_docs import error, json_response
 import os
 import sys
-from pymongo import MongoClient
 from bson import ObjectId
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Payments"])
 
@@ -17,7 +17,7 @@ STRIPE_API_KEY = os.getenv("STRIPE_API_KEY")
 if STRIPE_API_KEY:
     stripe.api_key = STRIPE_API_KEY
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 stripe_completed_collection = db["Stripe_completed"]
 customer_collection = db["Customer"]

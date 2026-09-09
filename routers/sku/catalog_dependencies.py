@@ -3,9 +3,9 @@
 import os
 
 from dotenv import load_dotenv
-from pymongo import MongoClient
 
 from services.catalog import CatalogService
+from utils.mongo import require_client
 
 
 load_dotenv()
@@ -14,7 +14,7 @@ mongo_uri = os.getenv("MONGO_URI")
 if not mongo_uri:
     raise RuntimeError("MONGO_URI not set in environment")
 
-mongo_client = MongoClient(mongo_uri)
+mongo_client = require_client()
 database = mongo_client["Activlink"]
 master_collection = database["MasterSKU"]
 custom_collection = database["CustomSKU"]

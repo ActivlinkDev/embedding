@@ -1,14 +1,14 @@
 from fastapi import APIRouter, Body, HTTPException
-from pymongo import MongoClient
 from bson import ObjectId
 import os
 
 from utils.api_docs import error, json_response
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Customers"])
 
 # Setup Mongo client and collections
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 customer_collection = db["Customer"]
 basket_collection = db["Basket_Quotes"]

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from pymongo import MongoClient
+from utils.mongo import require_client
 from bson import ObjectId
 import os
 
@@ -140,7 +140,7 @@ async def embedded_quote(payload: EmbeddedQuoteRequest, _: None = Depends(verify
     client_key = getattr(payload, 'clientKey', None)
     if not client_key:
         try:
-            mongo = MongoClient(os.getenv('MONGO_URI'))
+            mongo = require_client()
             db = mongo['Activlink']
             devices_col = db['Devices']
             try:

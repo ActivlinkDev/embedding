@@ -1,6 +1,5 @@
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
-from pymongo import MongoClient
 from utils.api_docs import error, json_response, secured
 from utils.category_tree import resolve as resolve_category
 from utils.dependencies import verify_token
@@ -9,10 +8,11 @@ import logging
 import os
 import re
 from typing import List, Optional
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Payments"])
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 ratings = db["Rating"]
 error_log_collection = db["Error_Log_RateRequest"]

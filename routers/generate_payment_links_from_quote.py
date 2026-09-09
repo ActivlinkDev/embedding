@@ -3,14 +3,14 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 from bson import ObjectId
 from routers.generate_payment_link import generate_checkout_session, CheckoutSessionRequest, ModeEnum
-from pymongo import MongoClient
 import os
 
 from utils.api_docs import error, json_response
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Payments"])
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 quotes_collection = db["Quotes"]
 

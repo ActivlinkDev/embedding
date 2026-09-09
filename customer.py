@@ -1,9 +1,10 @@
-from pymongo import MongoClient
 from bson import ObjectId
+
+from utils.mongo import require_client
 
 def get_or_create_customer(name: str, telephone: str, email: str):
     # Connect to your MongoDB as per your env/settings
-    client = MongoClient(os.getenv("MONGO_URI"))
+    client = require_client()
     db = client["Activlink"]
     customer_collection = db["Customer"]
 

@@ -91,12 +91,22 @@ def mongo_vector_search(query_embedding, mongo_uri: str = None, db_name: str = "
 
     try:
         from pymongo import MongoClient
+        from utils.mongo import get_client
     except Exception:
         logger.debug("mongo_vector_search: pymongo not available")
         return None, 0.0
 
     try:
-        client = MongoClient(mongo_uri)
+        # Share the process-wide client for the normal case. Building one per call meant a
+        # fresh SRV/TXT resolution on every search. An explicitly passed URI that is not the
+        # configured one still gets its own client, since the shared one would be the wrong
+        # cluster.
+        if mongo_uri == os.getenv("MONGO_URI"):
+            client = get_client()
+            if client is None:
+                return None, 0.0
+        else:
+            client = MongoClient(mongo_uri)
         db = client[db_name]
         coll = db[collection_name]
 

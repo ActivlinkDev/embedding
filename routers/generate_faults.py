@@ -1,6 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
-from pymongo import MongoClient
 import openai
 import os
 import json
@@ -8,6 +7,7 @@ from typing import Optional, List, Dict, Any
 
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token  # <-- import your auth here
+from utils.mongo import require_client
 
 # -------------------------------
 # MongoDB and OpenAI setup
@@ -16,7 +16,7 @@ router = APIRouter(
     prefix="/faults",
     tags=["Operations"]
 )
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 faults_collection = db["Faults"]
 

@@ -2,9 +2,10 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from typing import Optional
 import os
-from pymongo import MongoClient
+import pymongo
 
 from utils.api_docs import error, json_response, secured
+from utils.mongo import get_client
 from utils.common import embed_query, cosine_similarity
 from utils.dependencies import verify_token
 
@@ -69,28 +70,14 @@ class MatchResponse(BaseModel):
 
 
 # Mongo configuration (used only for lookup; missing MONGO_URI will be tolerated)
-MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB = os.getenv("MONGO_DB_NAME", "Activlink")
 MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "Category")
 
-_mongo_client = None
 def _get_mongo_client():
-    global _mongo_client
-    if _mongo_client is None:
-        if not MONGO_URI:
-            return None
-        try:
-            # Bounded timeouts so a stuck/unhealthy Atlas Search backend can never
-            # block a request (and therefore a uvicorn worker thread) indefinitely.
-            _mongo_client = MongoClient(
-                MONGO_URI,
-                serverSelectionTimeoutMS=5000,
-                connectTimeoutMS=5000,
-                socketTimeoutMS=8000,
-            )
-        except Exception:
-            _mongo_client = None
-    return _mongo_client
+    try:
+        return get_client()
+    except Exception:
+        return None
 
 @router.post(
     "/match",
@@ -161,7 +148,11 @@ def match_category(
 
             # maxTimeMS bounds the server-side $vectorSearch so a hung Atlas Search
             # node raises (caught below) instead of hanging the request forever.
-            results = list(coll.aggregate([stage], maxTimeMS=5000))
+            # pymongo.timeout bounds the client side too — server selection and socket
+            # reads — which used to come from this module's own per-client timeouts
+            # before the client became shared process-wide.
+            with pymongo.timeout(8):
+                results = list(coll.aggregate([stage], maxTimeMS=5000))
             if results:
                 doc = results[0]
                 # category field may have different names in documents

@@ -6,10 +6,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Any
-from pymongo import MongoClient
 from bson import ObjectId
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from utils.mongo import require_client
 
 router = APIRouter(prefix="/scale", tags=["Enrichment"])
 
@@ -17,7 +17,7 @@ SCALE_SERP_API_KEY = os.getenv("SCALE_SERP_API_KEY")
 SCALE_SERP_BASE_URL = "https://api.scaleserp.com/search"
 
 load_dotenv()
-mongo_client = MongoClient(os.getenv("MONGO_URI"))
+mongo_client = require_client()
 db = mongo_client["Activlink"]
 locale_collection = db["Locale_Params"]
 mastersku_collection = db["MasterSKU"]

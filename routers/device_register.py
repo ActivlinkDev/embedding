@@ -4,13 +4,13 @@ from typing import Optional, List, Any
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from routers.sku.catalog_dependencies import catalog
-from pymongo import MongoClient
 import os
 from datetime import datetime
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Devices"])
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 clients_collection = db["ClientKey"]
 locale_params_collection = db["Locale_Params"]

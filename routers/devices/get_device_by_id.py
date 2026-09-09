@@ -1,13 +1,13 @@
 from fastapi import APIRouter, Query, HTTPException
-from pymongo import MongoClient
 from bson import ObjectId
 import os
 
 from utils.api_docs import error, json_response
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Devices"])
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 devices_collection = db["Devices"]
 
@@ -83,7 +83,8 @@ def get_device_by_id(device_id: str = Query(..., alias="device_id")):
         objid = None
 
     query = {"_id": objid} if objid is not None else {"_id": device_id}
-    doc = devices_collection.find_one(query)
+    # Receipts and verified contact details are private to the registration session.
+    doc = devices_collection.find_one(query, {'receipt': 0, 'registrationPhone': 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Device not found")
     return {"data": _serialize(doc)}

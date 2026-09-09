@@ -1,12 +1,12 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
-from pymongo import MongoClient
 from bson import ObjectId
 import os
 from dotenv import load_dotenv
 
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
+from utils.mongo import require_client
 
 load_dotenv()
 
@@ -19,7 +19,7 @@ mongo_uri = os.getenv("MONGO_URI")
 if not mongo_uri:
     raise RuntimeError("MONGO_URI not set in environment.")
 
-client = MongoClient(mongo_uri)
+client = require_client()
 db = client["Activlink"]
 customsku_collection = db["CustomSKU"]
 clientkey_collection = db["ClientKey"]
