@@ -19,7 +19,6 @@ registered device, so this path starts from a CustomSKU and never writes a
 from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from pymongo import MongoClient
 from bson import ObjectId
 from datetime import datetime, timedelta
 import os
@@ -33,10 +32,11 @@ from .product_assignment import (
     calculate_age_in_months,
 )
 from .rate_request import RateRequest as RateReqModel, price_and_group, store_quote
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Quotes"])
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 clientkey_collection = db["ClientKey"]
 customsku_collection = db["CustomSKU"]

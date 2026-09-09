@@ -1,9 +1,9 @@
 from fastapi import APIRouter, HTTPException, Query
-from pymongo import MongoClient
 import os
 from dotenv import load_dotenv
 
 from utils.api_docs import error, json_response
+from utils.mongo import require_client
 
 load_dotenv()
 
@@ -11,7 +11,7 @@ router = APIRouter(
     prefix="/locale",
     tags=["Localization"])
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 collection = db["Locale_Params"]  # ✅ your target collection
 

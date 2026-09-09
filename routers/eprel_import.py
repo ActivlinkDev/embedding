@@ -21,7 +21,6 @@ import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
-from pymongo import MongoClient
 
 from utils import eprel
 from utils.dependencies import verify_token
@@ -31,6 +30,7 @@ from utils.eprel_mapping import (
     make_from,
     resolve_category,
 )
+from utils.mongo import require_client
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ router = APIRouter(
     dependencies=[Depends(verify_token)],
 )
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client[os.getenv("MONGO_DB", "Activlink")]
 products_collection = db["EPREL_Products"]
 jobs_collection = db["EPREL_ImportJobs"]

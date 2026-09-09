@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Query, HTTPException, Depends
-from pymongo import MongoClient
 from bson import ObjectId
 import os
 
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Customers"], prefix="")
 
@@ -12,7 +12,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
     raise RuntimeError("MONGO_URI not set in environment")
 
-client = MongoClient(MONGO_URI)
+client = require_client()
 db = client["Activlink"]
 customer_collection = db["Customer"]
 

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
-from pymongo import MongoClient, ReturnDocument
+from pymongo import ReturnDocument
 from bson import ObjectId
 from datetime import datetime
 import os
@@ -9,11 +9,12 @@ from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from .currency import basket_currency, normalize_currency, currency_guard_filter
 from .ratebasket import rate_basket, RateBasketRequest
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Basket"])
 
 # DB setup (reuse suite conventions)
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 quotes_collection = db["Quotes"]
 basket_collection = db["Basket_Quotes"]

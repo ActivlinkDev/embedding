@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Query, Depends
 from typing import List
 import httpx
 import os
-from pymongo import MongoClient
+from utils.mongo import get_collection
 from utils.api_docs import error
 from utils.dependencies import verify_token
 from utils.locale import resolve_strapi_locale, LocaleNotSupportedError
@@ -14,17 +14,10 @@ STRAPI_BEARER_TOKEN = os.getenv("STRAPI_BEARER_TOKEN")
 if not STRAPI_BEARER_TOKEN:
     raise RuntimeError("STRAPI_BEARER_TOKEN environment variable must be set")
 
-# Lazily create Mongo client at request time to avoid DNS/SRV lookups during module import
-_mongo_client = None
-
 def _get_locale_params_collection():
-    global _mongo_client
+    # The shared client is lazy, so this still does no DNS/SRV work until the first query.
     try:
-        if _mongo_client is None:
-            # connect=False defers initial connection; for mongodb+srv this may still resolve at first use
-            _mongo_client = MongoClient(os.getenv("MONGO_URI"), connect=False)
-        db = _mongo_client["Activlink"]
-        return db["Locale_Params"]
+        return get_collection("Locale_Params")
     except Exception:
         # If Mongo is unreachable or DNS fails, fall back to pure transform without DB mapping
         return None

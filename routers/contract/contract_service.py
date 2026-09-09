@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 from bson import ObjectId
 from bson.errors import InvalidId
-from pymongo import MongoClient
+from utils.mongo import require_client
 
 
 def _add_months(dt: datetime, months: int) -> datetime:
@@ -25,7 +25,7 @@ def _add_months(dt: datetime, months: int) -> datetime:
     day = min(dt.day, calendar.monthrange(year, month)[1])
     return dt.replace(year=year, month=month, day=day)
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 contracts_collection = db["Contracts"]
 orders_collection = db["ContractOrders"]

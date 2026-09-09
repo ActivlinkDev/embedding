@@ -1,11 +1,11 @@
 # routers/client_lookup.py
 
 from fastapi import APIRouter, HTTPException, Query, Depends
-from pymongo import MongoClient
 import os
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from dotenv import load_dotenv
+from utils.mongo import require_client
 
 # Load environment variables from .env
 load_dotenv()
@@ -14,7 +14,7 @@ router = APIRouter(tags=["Catalog"])
 
 # MongoDB connection
 MONGO_URI = os.getenv("MONGO_URI", "your-default-mongo-uri")
-client = MongoClient(MONGO_URI)
+client = require_client()
 db = client["Activlink"]
 collection = db["ClientKey"]
 

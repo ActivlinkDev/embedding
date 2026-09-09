@@ -4,12 +4,12 @@ import logging
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
-from pymongo import MongoClient
 from bson import ObjectId
 from dotenv import load_dotenv
 
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
+from utils.mongo import require_client
 
 load_dotenv()
 
@@ -22,7 +22,7 @@ DATAFORSEO_PASSWORD = os.getenv("DATAFORSEO_PASSWORD")
 DATAFORSEO_PRODUCT_INFO_URL = "https://api.dataforseo.com/v3/merchant/google/product_info/task_post"
 DSEO_WEBHOOK_BASE_URL = os.getenv("DSEO_WEBHOOK_BASE_URL", "").rstrip("/")
 
-mongo_client = MongoClient(os.getenv("MONGO_URI"))
+mongo_client = require_client()
 db = mongo_client["Activlink"]
 locale_collection = db["Locale_Params"]
 mastersku_collection = db["MasterSKU"]

@@ -24,13 +24,14 @@ import threading
 import time
 from typing import Dict, Optional
 
-from pymongo import MongoClient
+import pymongo
+
+from utils.mongo import get_client
 
 logger = logging.getLogger(__name__)
 
 CACHE_TTL_SECONDS = int(os.getenv("CATEGORY_TREE_TTL_SECONDS", "300"))
 
-_client = None
 _cache: Dict[str, Dict[str, Optional[str]]] = {}
 _cache_loaded_at = 0.0
 _lock = threading.Lock()
@@ -48,22 +49,14 @@ def _key(value: Optional[str]) -> str:
 
 def _collection():
     """The ``Category`` collection, or None when Mongo is unreachable."""
-    global _client
-    if _client is None:
-        uri = os.getenv("MONGO_URI")
-        if not uri:
-            return None
-        try:
-            _client = MongoClient(
-                uri,
-                serverSelectionTimeoutMS=5000,
-                connectTimeoutMS=5000,
-                socketTimeoutMS=8000,
-            )
-        except Exception:
-            logger.exception("[category-tree] could not create Mongo client")
-            return None
-    return _client[os.getenv("MONGO_DB_NAME", "Activlink")]["Category"]
+    try:
+        client = get_client()
+    except Exception:
+        logger.exception("[category-tree] could not create Mongo client")
+        return None
+    if client is None:
+        return None
+    return client[os.getenv("MONGO_DB_NAME", "Activlink")]["Category"]
 
 
 def _titles(doc: dict) -> Dict[str, str]:
@@ -95,9 +88,15 @@ def _load() -> Dict[str, Dict[str, Optional[str]]]:
         return {}
 
     tree: Dict[str, Dict[str, Optional[str]]] = {}
-    for doc in coll.find(
-        {}, {"_id": 0, "category": 1, "group": 1, "sector": 1, "locale_title": 1}
-    ):
+    # Bounded so a stuck/unhealthy Atlas can never block a request (and therefore a uvicorn
+    # worker thread) indefinitely. This used to be per-client connect/socket timeouts; the
+    # client is now shared process-wide, so the bound belongs on the operation instead.
+    with pymongo.timeout(8):
+        cursor = coll.find(
+            {}, {"_id": 0, "category": 1, "group": 1, "sector": 1, "locale_title": 1}
+        )
+        docs = list(cursor)
+    for doc in docs:
         name = (doc.get("category") or "").strip()
         if not name:
             continue

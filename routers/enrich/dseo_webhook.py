@@ -9,11 +9,11 @@ import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
-from pymongo import MongoClient
 from bson import ObjectId
 from dotenv import load_dotenv
 
 from services.catalog import utc_now
+from utils.mongo import require_client
 
 load_dotenv()
 
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/dseo", tags=["Enrichment"])
 
-mongo_client = MongoClient(os.getenv("MONGO_URI"))
+mongo_client = require_client()
 db = mongo_client["Activlink"]
 dseo_results_collection = db["DSEO_Results"]
 mastersku_collection = db["MasterSKU"]

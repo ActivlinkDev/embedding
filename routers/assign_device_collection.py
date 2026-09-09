@@ -2,15 +2,15 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from bson import ObjectId
-from pymongo import MongoClient
 import os
 
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Assignments"])
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 device_collection = db["Device_Collection"]
 devices_collection = db["Devices"]

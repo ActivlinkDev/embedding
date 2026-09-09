@@ -12,11 +12,11 @@ import datetime
 from typing import Optional
 
 import jwt
-from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 
-MONGO_URI = os.getenv("MONGO_URI")
-_client = MongoClient(MONGO_URI) if MONGO_URI else None
+from utils.mongo import get_client
+
+_client = get_client()
 _db = _client["Activlink"] if _client is not None else None
 _service_clients = _db["ServiceClient"] if _db is not None else None
 
@@ -34,7 +34,9 @@ def _ensure_index() -> None:
         print(f"[jwt_auth] Could not create ServiceClient index: {e}")
 
 
-_ensure_index()
+# Deliberately not called at import: the shared client is lazy, and creating the index here
+# would open a connection (and resolve SRV) just to import this module. Every write path
+# calls _ensure_index() first.
 
 JWT_SIGNING_SECRET = os.getenv("JWT_SIGNING_SECRET")
 JWT_ISSUER = os.getenv("JWT_ISSUER", "activlink-embedding")

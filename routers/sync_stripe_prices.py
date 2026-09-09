@@ -1,9 +1,9 @@
 from fastapi import APIRouter, HTTPException
 import stripe
 import os
-from pymongo import MongoClient
 
 from utils.api_docs import error, json_response
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Payments"])
 
@@ -12,7 +12,7 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 # Set your MongoDB connection details
 MONGO_URI = os.getenv("MONGO_URI")
-client = MongoClient(MONGO_URI)
+client = require_client()
 db = client["Activlink"]        # <- Use your actual database name
 stripe_prices_col = db["Stripe_Price_ID"]
 

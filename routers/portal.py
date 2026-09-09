@@ -1,26 +1,21 @@
 from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
-from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 import os, hashlib, hmac, secrets, datetime
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
+from utils.mongo import get_client
 
 router = APIRouter(prefix="/portal", tags=["Portal"])
 
-_mongo_uri = os.getenv("MONGO_URI")
-_client = MongoClient(_mongo_uri) if _mongo_uri else None
-_db = _client["Activlink"] if _client else None
+_client = get_client()
+_db = _client["Activlink"] if _client is not None else None
 _users = _db["PortalUser"] if _db is not None else None
 _keys = _db["ClientKey"] if _db is not None else None
 
+# The index is created before the first write rather than at import: the shared client is
+# lazy, and a create_index here would open a connection (and resolve SRV) just to import.
 _index_ready = False
-try:
-    if _users is not None:
-        _users.create_index("username", unique=True)
-        _index_ready = True
-except Exception as e:
-    print(f"[portal] Could not create PortalUser index at startup (will retry before first write): {e}")
 
 
 def _ensure_index() -> None:
