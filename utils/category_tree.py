@@ -6,7 +6,8 @@ titles and an embedding. Assignment rules and rating tables match at any of the
 three levels, so both need the group and sector for a device's category.
 ``locale_title`` carries the customer-facing name per locale ("Televisor LED"),
 which :func:`localized_title` reads; the taxonomy spelling stays the key that
-rules and rating tables match on.
+rules and rating tables match on. ``min_market_price`` is the optional sanity
+floor :func:`min_market_price` reads — see its docstring.
 
 The collection is small (tens of documents) and changes rarely, so it is cached
 in-process and refreshed on a TTL. The embedding field is *never* fetched: it is
@@ -77,6 +78,47 @@ def _titles(doc: dict) -> Dict[str, str]:
     return titles
 
 
+def _amount(value) -> Optional[float]:
+    """A positive number, or None for anything else.
+
+    Zero, negatives and non-numerics all read as "no floor configured" rather
+    than as a floor of nothing: a typo in the collection must not start
+    rejecting every price for a category. ``bool`` is excluded explicitly — it
+    is an ``int`` in Python, and ``True`` would otherwise become a 1.0 floor.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if value > 0 else None
+
+
+def _min_market_price(doc: dict) -> Dict[str, float]:
+    """Fold ``min_market_price`` into a ``{CURRENCY: amount}`` map.
+
+    Written in the collection either as a per-currency object —
+    ``{"GBP": 80, "EUR": 95}`` — or as a bare number, which is stored under
+    ``"*"`` and applies to every currency. Per-currency is the honest form: the
+    locales share a taxonomy but not a scale, and one number cannot be a
+    sensible floor for both EUR and TRL.
+
+    Currency keys are upper-cased so they compare against the enrichment
+    payload's own casing. An unusable entry is dropped, leaving the category
+    with no floor for that currency rather than a nonsense one.
+    """
+    raw = doc.get("min_market_price")
+    flat = _amount(raw)
+    if flat is not None:
+        return {"*": flat}
+    if not isinstance(raw, dict):
+        return {}
+    floors: Dict[str, float] = {}
+    for currency, value in raw.items():
+        code = str(currency or "").strip().upper()
+        amount = _amount(value)
+        if code and amount is not None:
+            floors[code] = amount
+    return floors
+
+
 def _load() -> Dict[str, Dict[str, Optional[str]]]:
     """Read the taxonomy into a name -> {category, group, sector, titles} map.
 
@@ -93,7 +135,15 @@ def _load() -> Dict[str, Dict[str, Optional[str]]]:
     # client is now shared process-wide, so the bound belongs on the operation instead.
     with pymongo.timeout(8):
         cursor = coll.find(
-            {}, {"_id": 0, "category": 1, "group": 1, "sector": 1, "locale_title": 1}
+            {},
+            {
+                "_id": 0,
+                "category": 1,
+                "group": 1,
+                "sector": 1,
+                "locale_title": 1,
+                "min_market_price": 1,
+            },
         )
         docs = list(cursor)
     for doc in docs:
@@ -114,6 +164,7 @@ def _load() -> Dict[str, Dict[str, Optional[str]]]:
             "group": (doc.get("group") or None),
             "sector": (doc.get("sector") or None),
             "titles": _titles(doc),
+            "min_market_price": _min_market_price(doc),
         }
     return tree
 
@@ -221,6 +272,35 @@ def localized_title(category: Optional[str], locale: Optional[str]) -> str:
             if candidate.split("_")[0].lower() == language:
                 return titles[candidate]
     return titles.get("en_GB") or canonical
+
+
+def min_market_price(category: Optional[str], currency: Optional[str]) -> Optional[float]:
+    """The lowest plausible price for a device in ``category``, in ``currency``.
+
+    Enrichment matches a product by name against a shopping SERP, and a loose
+    match lands on an accessory or a spare part rather than the appliance — a
+    Beko dishwasher came back priced at 11.99 GBP off an eBay parts listing.
+    ``market.referencePrice`` is what the quote rates on (``services.catalog``
+    resolves it into ``product.price``), so a price that low does not merely
+    display wrongly, it under-rates the cover. Callers reject a price below this
+    floor instead of storing it.
+
+    Returns None — meaning "store whatever enrichment found", the behaviour
+    before this floor existed — whenever there is nothing trustworthy to check
+    against: a category the collection does not know, one carrying no
+    ``min_market_price``, or a currency that floor does not cover. A floor
+    written as a bare number covers every currency; one written per currency
+    covers only the currencies it names, so adding a locale does not silently
+    start policing its prices against another country's scale.
+    """
+    name = (category or "").strip()
+    if not name:
+        return None
+    floors = (_tree().get(_key(name)) or {}).get("min_market_price") or {}
+    code = str(currency or "").strip().upper()
+    if code and code in floors:
+        return floors[code]
+    return floors.get("*")
 
 
 def refresh() -> int:

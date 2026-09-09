@@ -188,3 +188,157 @@ def test_an_unnamed_cheapest_seller_keeps_the_shopping_tasks_merchant(monkeypatc
     fields = collection.updates[0][1]["$set"]
     assert fields["locales.en_GB.market.referencePrice"] == 499.0
     assert "locales.en_GB.market.merchant" not in fields
+
+
+# --- match tightening, title policy and the category price floor -------------
+#
+# The en_GB locale of a Beko DVN04X20W dishwasher came back titled "Beko
+# Din15c20 Dvn04x20w Din15x20 Dvn04x20s Bdfn15420 Dvs04x20x" at 11.99 GBP: the
+# model number alone matched an eBay spare-parts listing, whose title then
+# overwrote the Icecat one and whose price became what the quote rated on.
+
+
+def _item(title, price=499.0, currency="GBP", **extra):
+    return {"title": title, "price": price, "currency": currency, **extra}
+
+
+def test_the_make_must_appear_as_well_as_the_model():
+    """A bare model number is not an identifier — it matches inside anything."""
+    items = [_item("Hotpoint DVN04X20W Dishwasher"), _item("Beko DVN04X20W Dishwasher")]
+    assert dseo_webhook._find_matching_item(items, "Beko", "DVN04X20W")["title"] == (
+        "Beko DVN04X20W Dishwasher"
+    )
+
+
+def test_no_match_when_only_the_make_is_present():
+    items = [_item("Beko DIN15C20 Dishwasher")]
+    assert dseo_webhook._find_matching_item(items, "Beko", "DVN04X20W") is None
+
+
+def test_an_incomplete_sku_matches_nothing():
+    """Neither half alone may enrich a SKU with an arbitrary first result."""
+    items = [_item("Beko DVN04X20W Dishwasher")]
+    assert dseo_webhook._find_matching_item(items, "", "DVN04X20W") is None
+    assert dseo_webhook._find_matching_item(items, "Beko", "") is None
+
+
+def test_matching_still_ignores_case_and_punctuation():
+    items = [_item("beko dvn-04-x20w dishwasher")]
+    assert dseo_webhook._find_matching_item(items, "BEKO", "DVN04X20W") is not None
+
+
+class _Tree:
+    """Stand in for the taxonomy lookup dseo_webhook imports."""
+
+    def __init__(self, floors):
+        self.floors = floors
+
+    def __call__(self, category, currency):
+        return (self.floors.get(category) or {}).get((currency or "").upper())
+
+
+@pytest.fixture
+def dishwasher_floor(monkeypatch):
+    monkeypatch.setattr(
+        dseo_webhook, "min_market_price", _Tree({"Dishwasher": {"GBP": 80.0}})
+    )
+
+
+def test_a_spare_part_price_is_rejected_for_the_category(dishwasher_floor):
+    reason = dseo_webhook._implausible_price(11.99, "GBP", "Dishwasher")
+    assert reason and "11.99" in reason and "Dishwasher" in reason
+
+
+def test_a_real_appliance_price_passes(dishwasher_floor):
+    assert dseo_webhook._implausible_price(449.99, "GBP", "Dishwasher") is None
+
+
+def test_a_price_exactly_on_the_floor_passes(dishwasher_floor):
+    assert dseo_webhook._implausible_price(80.0, "GBP", "Dishwasher") is None
+
+
+def test_a_category_with_no_floor_accepts_anything(dishwasher_floor):
+    """Most categories carry no floor; those must behave as they did before."""
+    assert dseo_webhook._implausible_price(11.99, "GBP", "Toaster") is None
+    assert dseo_webhook._implausible_price(11.99, "GBP", "") is None
+
+
+def test_a_currency_the_floor_does_not_cover_is_not_judged(dishwasher_floor):
+    """A GBP floor says nothing about a TRL price."""
+    assert dseo_webhook._implausible_price(11.99, "TRL", "Dishwasher") is None
+
+
+@pytest.mark.parametrize("price", [None, "11.99", True, {}])
+def test_an_unusable_price_is_not_reported_as_implausible(dishwasher_floor, price):
+    """Callers already drop these; blaming the category would mislead."""
+    assert dseo_webhook._implausible_price(price, "GBP", "Dishwasher") is None
+
+
+def test_a_legal_entity_make_still_matches_the_brand_in_a_listing():
+    """Icecat stores "LG Electronics"; the listing says "LG"."""
+    items = [_item("LG DSHD24U Dishwasher")]
+    assert dseo_webhook._find_matching_item(items, "LG Electronics", "DSHD24U") is not None
+
+
+def test_the_full_legal_entity_still_matches_when_a_title_carries_it():
+    items = [_item("LG Electronics DSHD24U Dishwasher")]
+    assert dseo_webhook._find_matching_item(items, "LG Electronics", "DSHD24U") is not None
+
+
+def test_a_generic_second_word_cannot_stand_in_for_the_brand():
+    """Otherwise "Electronics" alone would pass nearly every title."""
+    items = [_item("Hotpoint DSHD24U Electronics Dishwasher")]
+    assert dseo_webhook._find_matching_item(items, "LG Electronics", "DSHD24U") is None
+
+
+def test_a_single_letter_first_word_is_not_accepted_alone():
+    """One character means nothing once a title is stripped to alphanumerics."""
+    items = [_item("Hotpoint SMS6ZCI00G Dishwasher")]
+    assert dseo_webhook._find_matching_item(items, "B Bosch", "SMS6ZCI00G") is None
+
+
+# --- brand matching on word boundaries --------------------------------------
+
+
+def test_a_short_brand_does_not_match_inside_another_word():
+    """"GE" folds into "fridge", "range" and "storage" — half of appliance copy."""
+    items = [_item("Samsung ABC123 fridge")]
+    assert dseo_webhook._find_matching_item(items, "GE", "ABC123") is None
+
+
+def test_a_short_brand_still_matches_as_its_own_word():
+    items = [_item("GE ABC123 Refrigerator")]
+    assert dseo_webhook._find_matching_item(items, "GE", "ABC123") is not None
+
+
+def test_a_brand_does_not_match_as_the_tail_of_a_longer_word():
+    items = [_item("Hotpoint Beko-compatible DVN04X20W hose")]
+    assert dseo_webhook._find_matching_item(items, "Eko", "DVN04X20W") is None
+
+
+def test_a_punctuated_model_still_matches_loosely():
+    """Sellers punctuate model numbers freely; only the brand must be exact."""
+    items = [_item("Beko DVN-04-X20W Dishwasher")]
+    assert dseo_webhook._find_matching_item(items, "Beko", "DVN04X20W") is not None
+
+
+def test_a_spaced_legal_entity_matches_across_consecutive_words():
+    items = [_item("LG Electronics DSHD24U Dishwasher")]
+    assert dseo_webhook._find_matching_item(items, "LGElectronics", "DSHD24U") is not None
+
+
+# --- every match is returned, in order ---------------------------------------
+
+
+def test_all_matching_items_are_returned_in_page_order():
+    items = [
+        _item("Beko DVN04X20W drawer", price=11.99),
+        _item("Beko DVN04X20W Dishwasher", price=449.0),
+    ]
+    titles = [i["title"] for i in dseo_webhook._matching_items(items, "Beko", "DVN04X20W")]
+    assert titles == ["Beko DVN04X20W drawer", "Beko DVN04X20W Dishwasher"]
+
+
+def test_non_matching_items_are_left_out():
+    items = [_item("Hotpoint HDW1 Dishwasher"), _item("Beko DVN04X20W Dishwasher")]
+    assert len(dseo_webhook._matching_items(items, "Beko", "DVN04X20W")) == 1

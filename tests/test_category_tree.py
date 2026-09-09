@@ -223,3 +223,98 @@ def test_loaded_reports_an_unreadable_taxonomy(monkeypatch):
 
     seed(monkeypatch, TAXONOMY)
     assert category_tree.loaded() is True
+
+
+# --- min_market_price -------------------------------------------------------
+#
+# The optional sanity floor enrichment checks a matched price against. Absent
+# for most categories, so the default has to be "no opinion" rather than zero.
+#
+# These seed through ``_load`` against a fake collection rather than writing
+# cache entries directly: the floor is normalised on the way in, so a test that
+# hand-built the cache would be exercising its own fixture, not the module.
+
+
+class _FakeCollection:
+    def __init__(self, docs):
+        self._docs = docs
+
+    def find(self, _filter, _projection):
+        return list(self._docs)
+
+
+def seed_docs(monkeypatch, *docs):
+    monkeypatch.setattr(category_tree, "_collection", lambda: _FakeCollection(docs))
+
+
+DISHWASHER = {
+    "category": "Dishwasher",
+    "group": "Kitchen",
+    "sector": "Home Appliances",
+    "min_market_price": {"GBP": 80, "EUR": 95, "TRL": 3000},
+}
+KETTLE = {"category": "Kettle", "group": "Kitchen", "min_market_price": 10}
+TOASTER = {"category": "Toaster", "group": "Kitchen"}
+
+
+def test_a_currency_map_gives_each_locale_its_own_floor(monkeypatch):
+    seed_docs(monkeypatch, DISHWASHER)
+    assert category_tree.min_market_price("Dishwasher", "GBP") == 80.0
+    assert category_tree.min_market_price("Dishwasher", "EUR") == 95.0
+    assert category_tree.min_market_price("Dishwasher", "TRL") == 3000.0
+
+
+def test_a_currency_the_map_does_not_name_has_no_floor(monkeypatch):
+    """Adding a locale must not police its prices against another's scale."""
+    seed_docs(monkeypatch, DISHWASHER)
+    assert category_tree.min_market_price("Dishwasher", "USD") is None
+
+
+def test_a_bare_number_covers_every_currency(monkeypatch):
+    seed_docs(monkeypatch, KETTLE)
+    assert category_tree.min_market_price("Kettle", "GBP") == 10.0
+    assert category_tree.min_market_price("Kettle", "TRL") == 10.0
+
+
+def test_a_category_without_a_floor_has_no_opinion(monkeypatch):
+    seed_docs(monkeypatch, TOASTER)
+    assert category_tree.min_market_price("Toaster", "GBP") is None
+
+
+def test_an_unknown_category_has_no_floor(monkeypatch):
+    """A free-typed or classifier-guessed category must not reject every price."""
+    seed_docs(monkeypatch, DISHWASHER)
+    assert category_tree.min_market_price("Sous Vide Wand", "GBP") is None
+    assert category_tree.min_market_price("", "GBP") is None
+    assert category_tree.min_market_price(None, "GBP") is None
+
+
+def test_lookup_folds_case_and_punctuation_like_the_rest_of_the_module(monkeypatch):
+    seed_docs(monkeypatch, DISHWASHER)
+    assert category_tree.min_market_price("dish-washer", "gbp") == 80.0
+
+
+def test_a_floor_does_not_disturb_the_placement_fields(monkeypatch):
+    """resolve() is what rating matches on; it stays the same three keys."""
+    seed_docs(monkeypatch, DISHWASHER)
+    assert category_tree.resolve("Dishwasher") == {
+        "category": "Dishwasher", "group": "Kitchen", "sector": "Home Appliances",
+    }
+
+
+@pytest.mark.parametrize(
+    "value", [0, -5, "80", True, None, [], {"GBP": 0}, {"GBP": "80"}, {"": 80}, {"GBP": None}]
+)
+def test_an_unusable_floor_reads_as_no_floor(monkeypatch, value):
+    """A typo in the collection must not start rejecting every price."""
+    seed_docs(monkeypatch, {"category": "Dishwasher", "min_market_price": value})
+    assert category_tree.min_market_price("Dishwasher", "GBP") is None
+
+
+def test_one_bad_currency_entry_does_not_void_the_others(monkeypatch):
+    seed_docs(
+        monkeypatch,
+        {"category": "Dishwasher", "min_market_price": {"GBP": 80, "EUR": "ninety"}},
+    )
+    assert category_tree.min_market_price("Dishwasher", "GBP") == 80.0
+    assert category_tree.min_market_price("Dishwasher", "EUR") is None
