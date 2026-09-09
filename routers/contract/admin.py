@@ -11,6 +11,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import caller_client_key, verify_token
+from utils.tenant import client_id_for_key, device_ids_owned_by
 
 from routers.contract import contract_service as svc
 
@@ -267,7 +268,19 @@ def resend_documents(contract_id: str, scope: str | None = Depends(caller_client
             }]),
     }),
 )
-def customer_contracts(customer_id: str, scope: str | None = Depends(caller_client_key)):
+def customer_contracts(
+    customer_id: str,
+    clientkey: str | None = Query(
+        None,
+        description=(
+            "Restrict to contracts covering devices owned by this ClientKey's client. "
+            "Customer-facing callers (the customer hub, reached on a client's subdomain) "
+            "must send it: their OTP identifies the customer, not the tenant."
+        ),
+        examples=["acme_uk_live"],
+    ),
+    scope: str | None = Depends(caller_client_key),
+):
     """
     Every contract belonging to one customer, newest first — this powers the customer hub's
     *Contracts* tab.
@@ -275,10 +288,26 @@ def customer_contracts(customer_id: str, scope: str | None = Depends(caller_clie
     Path parameter `customer_id` is mandatory. Results are limited to the caller's tenant, and
     there is no limit or pagination: a customer's full history is returned. An unknown customer
     id is not an error — it returns an empty array.
+
+    `clientkey` narrows further, to the client that owns the covered devices. A customer who
+    bought from two clients has contracts under both; on a client's own storefront they must
+    only see that client's. Tenancy is read from the device document rather than the contract's
+    own `client_key`, because the device is where the owning `Client_ID` is recorded.
     """
-    docs = svc.contracts_collection.find(
+    docs = list(svc.contracts_collection.find(
         _scoped({"customer_id": customer_id}, scope)
-    ).sort("created_at", -1)
+    ).sort("created_at", -1))
+
+    if clientkey is not None:
+        client_id = client_id_for_key(clientkey)
+        if not client_id:
+            # Unknown key: return nothing rather than falling back to every tenant.
+            return []
+        owned = device_ids_owned_by(client_id, [d.get("device_id") for d in docs])
+        # A contract with no device, or one this client does not own, is dropped: an
+        # unattributable record must not surface on a client's storefront.
+        docs = [d for d in docs if d.get("device_id") in owned]
+
     return [_serialize(d) for d in docs]
 
 

@@ -12,6 +12,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from utils.dependencies import verify_token
 from utils.mongo import require_client
+from utils.tenant import client_id_for_key
 
 router = APIRouter(tags=['Devices'])
 client = require_client()
@@ -20,9 +21,22 @@ devices_collection = client['Activlink']['Devices']
 
 class MyRegistrationsRequest(BaseModel):
     phone: str = Field(pattern=r'^\+?[1-9]\d{6,14}$')
+    # The OTP proves who the customer is, never which storefront they are in, so the
+    # tenant is mandatory here. The trusted frontend resolves it from the request
+    # host (beko.registermyproduct.io), not from anything the browser can set.
+    clientkey: str = Field(min_length=1)
 
 
-def registration_owner_query(phone: str):
+def resolve_client_id(clientkey: str) -> str:
+    # Client_ID for a ClientKey, or 400. Never returns a falsy id: an unknown key
+    # must fail the request rather than fall through to an unscoped query.
+    client_id = client_id_for_key(clientkey)
+    if not client_id:
+        raise HTTPException(400, 'Invalid clientkey.')
+    return client_id
+
+
+def registration_owner_query(phone: str, client_id: str):
     # Trusted frontend supplies the phone exclusively from its signed OTP cookie.
     # Match formatting differences without matching suffixes or other country codes.
     digits = re.sub(r'\D', '', phone)
@@ -33,14 +47,19 @@ def registration_owner_query(phone: str):
         {'$or': [{field: phone_match} for field in ('telephone', 'phone', 'mobile')]},
         {'_id': 1}))
     customer_ids = [value for doc in customers for value in (doc['_id'], str(doc['_id']))]
-    return {'$or': [{'registrationPhone': phone_match},
+    # `client` is ANDed with the ownership clause: proving the phone is not enough,
+    # the device must also belong to the tenant whose storefront asked. Devices with
+    # no `client` stay hidden rather than surfacing on every subdomain.
+    return {'client': client_id,
+            '$or': [{'registrationPhone': phone_match},
                      {'registrationParameters.customerId': {'$in': customer_ids}}]}
 
 
 @router.post('/my-registrations')
 def my_registrations(body: MyRegistrationsRequest, _: None = Depends(verify_token)):
     db = client['Activlink']
-    docs = devices_collection.find(registration_owner_query(body.phone), {'receipt.data': 0}).sort('registeredAt', -1)
+    owner = registration_owner_query(body.phone, resolve_client_id(body.clientkey))
+    docs = devices_collection.find(owner, {'receipt.data': 0}).sort('registeredAt', -1)
     devices = []
     for doc in docs:
         master_id = doc.get('masterSkuId')
@@ -69,8 +88,9 @@ class RegistrationReceiptRequest(MyRegistrationsRequest):
 def registration_receipt(body: RegistrationReceiptRequest, _: None = Depends(verify_token)):
     if not ObjectId.is_valid(body.device_id):
         raise HTTPException(404, 'Receipt unavailable')
+    owner = registration_owner_query(body.phone, resolve_client_id(body.clientkey))
     doc = devices_collection.find_one(
-        {'_id': ObjectId(body.device_id), **registration_owner_query(body.phone)}, {'receipt': 1})
+        {'_id': ObjectId(body.device_id), **owner}, {'receipt': 1})
     receipt = (doc or {}).get('receipt') or {}
     content_type = receipt.get('contentType')
     if not receipt.get('data') or content_type not in ('image/jpeg', 'image/png', 'image/heic', 'image/heif', 'application/pdf'):
