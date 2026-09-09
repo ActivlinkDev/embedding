@@ -1,13 +1,13 @@
 from fastapi import APIRouter, Query, HTTPException
-from pymongo import MongoClient
 from bson import ObjectId
 import os
 
 from utils.api_docs import error, json_response
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Devices"])
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 devices_collection = db["Devices"]
 

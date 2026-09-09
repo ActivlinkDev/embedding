@@ -8,12 +8,13 @@ from typing import Optional
 
 from bson import ObjectId, Binary
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from pymongo import MongoClient
 from utils.dependencies import verify_token
+from utils.mongo import require_client
 
 router = APIRouter(tags=['Devices'])
-client = MongoClient(os.getenv('MONGO_URI'))
+client = require_client()
 devices_collection = client['Activlink']['Devices']
 
 
@@ -21,11 +22,10 @@ class MyRegistrationsRequest(BaseModel):
     phone: str = Field(pattern=r'^\+?[1-9]\d{6,14}$')
 
 
-@router.post('/my-registrations')
-def my_registrations(body: MyRegistrationsRequest, _: None = Depends(verify_token)):
+def registration_owner_query(phone: str):
     # Trusted frontend supplies the phone exclusively from its signed OTP cookie.
     # Match formatting differences without matching suffixes or other country codes.
-    digits = re.sub(r'\D', '', body.phone)
+    digits = re.sub(r'\D', '', phone)
     pattern = r'^\+?[\s().-]*' + r'[\s().-]*'.join(digits) + r'[\s().-]*$'
     phone_match = {'$regex': pattern}
     db = client['Activlink']
@@ -33,9 +33,14 @@ def my_registrations(body: MyRegistrationsRequest, _: None = Depends(verify_toke
         {'$or': [{field: phone_match} for field in ('telephone', 'phone', 'mobile')]},
         {'_id': 1}))
     customer_ids = [value for doc in customers for value in (doc['_id'], str(doc['_id']))]
-    query = {'$or': [{'registrationPhone': phone_match},
+    return {'$or': [{'registrationPhone': phone_match},
                      {'registrationParameters.customerId': {'$in': customer_ids}}]}
-    docs = devices_collection.find(query, {'receipt': 0}).sort('registeredAt', -1)
+
+
+@router.post('/my-registrations')
+def my_registrations(body: MyRegistrationsRequest, _: None = Depends(verify_token)):
+    db = client['Activlink']
+    docs = devices_collection.find(registration_owner_query(body.phone), {'receipt.data': 0}).sort('registeredAt', -1)
     devices = []
     for doc in docs:
         master_id = doc.get('masterSkuId')
@@ -51,8 +56,30 @@ def my_registrations(body: MyRegistrationsRequest, _: None = Depends(verify_toke
             'registeredAt': doc.get('registeredAt'),
             'imageUrl': image if isinstance(image, str) else None,
             'description': localized.get('description') if isinstance(localized.get('description'), str) else None,
+            'receipt': {key: doc['receipt'].get(key) for key in ('name', 'contentType', 'uploadedAt')} if doc.get('receipt') else None,
         })
     return {'devices': devices}
+
+
+class RegistrationReceiptRequest(MyRegistrationsRequest):
+    device_id: str
+
+
+@router.post('/my-registrations/receipt')
+def registration_receipt(body: RegistrationReceiptRequest, _: None = Depends(verify_token)):
+    if not ObjectId.is_valid(body.device_id):
+        raise HTTPException(404, 'Receipt unavailable')
+    doc = devices_collection.find_one(
+        {'_id': ObjectId(body.device_id), **registration_owner_query(body.phone)}, {'receipt': 1})
+    receipt = (doc or {}).get('receipt') or {}
+    content_type = receipt.get('contentType')
+    if not receipt.get('data') or content_type not in ('image/jpeg', 'image/png', 'image/heic', 'image/heif', 'application/pdf'):
+        raise HTTPException(404, 'Receipt unavailable')
+    from urllib.parse import quote
+    return Response(bytes(receipt['data']), media_type=content_type, headers={
+        'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff',
+        'Content-Disposition': "inline; filename*=UTF-8''" + quote(receipt.get('name') or 'receipt', safe=''),
+    })
 
 
 class Receipt(BaseModel):

@@ -2,15 +2,15 @@ from .currency import basket_currency
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional, Tuple
-from pymongo import MongoClient
 from bson import ObjectId
 import os
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Basket"])
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 basket_collection = db["Basket_Quotes"]
 rules_collection = db["BundleDiscountRules"]

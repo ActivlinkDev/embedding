@@ -3,7 +3,6 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import AliasChoices, BaseModel, Field, EmailStr
 from typing import Optional, Dict, Any, List
 from bson import ObjectId
-from pymongo import MongoClient
 import os
 
 from utils.api_docs import error, json_response, secured
@@ -13,10 +12,11 @@ from routers.generate_payment_link import (
     CheckoutSessionRequest,
     ModeEnum,
 )
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Basket"])
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 basket_collection = db["Basket_Quotes"]
 

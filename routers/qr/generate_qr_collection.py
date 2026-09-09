@@ -1,7 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
-from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
 import os
@@ -12,6 +11,7 @@ from datetime import datetime, timezone
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from routers.embedded_register_device import generate_qr_code
+from utils.mongo import require_client
 
 router = APIRouter(tags=["QR"])
 
@@ -20,7 +20,7 @@ _mongo_uri = os.getenv("MONGO_URI")
 if not _mongo_uri:
     raise RuntimeError("MONGO_URI not set in environment.")
 
-_client = MongoClient(_mongo_uri)
+_client = require_client()
 _db = _client["Activlink"]
 qr_collection = _db["QR_Collection"]
 clientkey_collection = _db["ClientKey"]

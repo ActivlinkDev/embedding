@@ -1,13 +1,13 @@
 from fastapi import APIRouter, Body
-from pymongo import MongoClient
 import os
 
 from utils.api_docs import json_response
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Customers"])
 
 # Setup Mongo client and collection
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 customer_collection = db["Customer"]
 

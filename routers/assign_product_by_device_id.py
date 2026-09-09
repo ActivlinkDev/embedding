@@ -1,16 +1,16 @@
 from fastapi import APIRouter, HTTPException, Depends
 from bson import ObjectId
-from pymongo import MongoClient
 import os
 from datetime import datetime
 
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from .product_assignment import assign_products, ProductAssignmentRequest
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Assignments"])
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 devices_collection = db["Devices"]
 error_log_collection = db["Error_Log_ProductAssignment"]

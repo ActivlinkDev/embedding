@@ -1,15 +1,15 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
-from pymongo import MongoClient
 from bson import ObjectId
 from datetime import datetime
 import os
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import caller_client_key, verify_token
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Quotes"])
 
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 quotes_collection = db["Quotes"]
 

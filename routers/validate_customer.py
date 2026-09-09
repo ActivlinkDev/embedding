@@ -1,8 +1,8 @@
 from fastapi import APIRouter, HTTPException, Query, Depends
 import httpx
 import os
-from pymongo import MongoClient
 from utils.dependencies import verify_token
+from utils.mongo import require_client
 
 router = APIRouter(tags=["CMS Validate Customer"])
 
@@ -13,7 +13,7 @@ if not STRAPI_BEARER_TOKEN:
     raise RuntimeError("STRAPI_BEARER_TOKEN environment variable must be set")
 
 # Mongo config (reuse locale mapping)
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 locale_params_collection = db["Locale_Params"]
 

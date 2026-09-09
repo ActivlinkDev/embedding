@@ -5,16 +5,16 @@ from typing import Any, Dict, List, Optional, Tuple
 from utils.api_docs import error, json_response, secured
 from utils.category_tree import resolve as resolve_category
 from utils.dependencies import verify_token
-from pymongo import MongoClient
 import logging
 import os
+from utils.mongo import require_client
 
 router = APIRouter(tags=["Assignments"])
 
 logger = logging.getLogger(__name__)
 
 # MongoDB setup
-client = MongoClient(os.getenv("MONGO_URI"))
+client = require_client()
 db = client["Activlink"]
 product_assignments = db["ProductAssignment"]
 error_log_collection = db["Error_Log_ProductAssignment"]
