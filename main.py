@@ -176,6 +176,7 @@ ROUTERS = {
     "locale_infos": "routers.locale_infos",
     "locales": "routers.locales",
     "otp": "routers.otp",
+    "registration_overview": "routers.registration_overview",
 
     # cms
     "props_lookup": "routers.cms.props_lookup",

@@ -83,7 +83,8 @@ def get_device_by_id(device_id: str = Query(..., alias="device_id")):
         objid = None
 
     query = {"_id": objid} if objid is not None else {"_id": device_id}
-    doc = devices_collection.find_one(query)
+    # Receipts and verified contact details are private to the registration session.
+    doc = devices_collection.find_one(query, {'receipt': 0, 'registrationPhone': 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Device not found")
     return {"data": _serialize(doc)}
