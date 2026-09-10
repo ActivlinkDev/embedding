@@ -169,6 +169,7 @@ ROUTERS = {
     "sms": "routers.sms",
     "create_customer": "routers.customer.create_customer",
     "pair_customer": "routers.customer.pair_customer",
+    "pair_customer_devices": "routers.customer.pair_customer_devices",
     "get_customer_by_id": "routers.customer.get_by_id",
     "authenticate_customer": "routers.customer.authenticate_customer",
     "mark_verified": "routers.customer.mark_verified",
