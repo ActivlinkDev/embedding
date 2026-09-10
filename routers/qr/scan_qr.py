@@ -13,8 +13,25 @@ from utils.api_docs import error
 
 router = APIRouter(tags=["QR"])
 
-FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").rstrip("/")
+DEFAULT_FRONTEND_BASE_URL = "https://www.activlink.io"
+FRONTEND_BASE_URL = (os.getenv("FRONTEND_BASE_URL") or DEFAULT_FRONTEND_BASE_URL).rstrip("/")
 _HEX_RE = re.compile(r"^[0-9A-F]{5}$")
+
+
+def _resolve_base_url(configured: str | None) -> str:
+    """
+    Pick the host the customer is redirected to.
+
+    The client's own ``redirect_base_url`` wins where set, then ``FRONTEND_BASE_URL``, then the
+    default. A value that isn't an absolute ``http(s)://`` URL is ignored: an empty or
+    scheme-less base makes the ``Location`` header relative, which sends the customer to a
+    non-existent page on the API host instead of the frontend.
+    """
+    for candidate in (configured, FRONTEND_BASE_URL, DEFAULT_FRONTEND_BASE_URL):
+        candidate = (candidate or "").strip().rstrip("/")
+        if candidate.startswith(("http://", "https://")):
+            return candidate
+    return DEFAULT_FRONTEND_BASE_URL
 
 
 @router.get(
@@ -91,7 +108,7 @@ def scan_qr(hex_key: str, request: Request):
 
     client_key = doc.get("client_key", "")
     client_doc = clientkey_collection.find_one({"ClientKey": client_key}) or {}
-    base_url = (client_doc.get("redirect_base_url") or FRONTEND_BASE_URL).rstrip("/")
+    base_url = _resolve_base_url(client_doc.get("redirect_base_url"))
 
     device_id = doc.get("device_id")
     custom_sku = doc.get("custom_sku")
