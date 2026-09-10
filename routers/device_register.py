@@ -4,6 +4,7 @@ from typing import Optional, List, Any
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from routers.sku.catalog_dependencies import catalog
+from routers.sku.category_validation import validate_category
 import os
 from datetime import datetime
 from utils.mongo import require_client
@@ -130,6 +131,20 @@ class DeviceModel(BaseModel):
     Identifiers: IdentifiersModel = Field(..., description="**Mandatory.** What the product is.")
     Unique_Parameters: UniqueParametersModel = Field(
         ..., description="**Mandatory.** Which individual unit this is."
+    )
+    allow_manual: bool = Field(
+        False,
+        description=(
+            "Store this device even when it matches no CustomSKU/MasterSKU, using "
+            "`Identifiers` exactly as supplied instead of catalogue enrichment. Requires "
+            "`Identifiers.category` to already be a category in the `Category` taxonomy — a "
+            "blank or unrecognised value is rejected for that device (`skuStatus: \"error\"`) "
+            "rather than falling back to catalogue matching, since rating and assignment match "
+            "on it and a free-typed category would silently price nothing. No CustomSKU or "
+            "MasterSKU is created for a device stored this way: its `customSkuId` and "
+            "`masterSkuId` are `null` and `skuStatus` reads `\"manual\"`. Ignored when the "
+            "device does resolve against the catalogue."
+        ),
     )
 
 
@@ -269,8 +284,9 @@ def price_is_missing(val):
                         "Unique_Parameters": {"serial": "SN-0000001", "price": 0},
                         "registeredAt": "2026-08-06T10:14:52.113000Z",
                     },
+                    {"deviceId": "6820f1c9a4b21d0f8c9e4472", "skuStatus": "manual"},
                 ],
-                "count": 3,
+                "count": 4,
             },
         ),
         400: error(
@@ -294,7 +310,13 @@ def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_tok
        `SKU`. Failing this returns `skuStatus: "error"` for that device only.
     3. **Enriches from the catalogue** — resolves a CustomSKU for this client and locale, then its
        MasterSKU, and back-fills any blank identifier (title, category, guarantees) from them. A
-       device that matches neither is **not stored** and comes back as `skuStatus: "error"`.
+       device that matches neither is **not stored** and comes back as `skuStatus: "error"` —
+       unless that device's `allow_manual` is `true`, in which case it is stored on its own
+       `Identifiers` as `skuStatus: "manual"`, with `customSkuId`/`masterSkuId` left `null` and
+       no CustomSKU or MasterSKU created. A manual device still needs `Identifiers.category` to
+       be a category already in the `Category` taxonomy (`GET /categories/` lists them) — an
+       unrecognised or blank category fails just that device, the same as a catalogue miss does
+       for a non-manual one.
     4. **Resolves the price** — the submitted `price`, else the catalogue resolver's effective
        price, else `0`. Currency always comes from `Locale_Params`, never the caller.
 
@@ -486,14 +508,49 @@ def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_tok
         matched_status = "matched" if resolved else "no match"
 
         if matched_status != "matched":
-            inserted.append({
-                "skuStatus": "error",
-                "detail": "Device enrichment did not find a matching CustomSKU or MasterSKU. No document created.",
-                "Identifiers": ids.dict(),
-                "Unique_Parameters": unique.dict(),
-                "registeredAt": datetime.utcnow().isoformat() + "Z"
-            })
-            continue
+            if not device.allow_manual:
+                inserted.append({
+                    "skuStatus": "error",
+                    "detail": "Device enrichment did not find a matching CustomSKU or MasterSKU. No document created.",
+                    "Identifiers": ids.dict(),
+                    "Unique_Parameters": unique.dict(),
+                    "registeredAt": datetime.utcnow().isoformat() + "Z"
+                })
+                continue
+
+            # allow_manual stores the device on the caller's own identifiers instead of a
+            # catalogue match. Category still has to be real: it is the only thing rating and
+            # assignment match on, and nothing here can derive it the way a catalogue match
+            # would, so a blank or invalid one fails this device rather than storing an
+            # unratable "no category" device.
+            try:
+                manual_category = validate_category(
+                    ids.category if valid_value(ids.category) else None,
+                    "Identifiers.category",
+                )
+            except HTTPException as exc:
+                inserted.append({
+                    "skuStatus": "error",
+                    "detail": exc.detail,
+                    "Identifiers": ids.dict(),
+                    "Unique_Parameters": unique.dict(),
+                    "registeredAt": datetime.utcnow().isoformat() + "Z"
+                })
+                continue
+            if not manual_category:
+                inserted.append({
+                    "skuStatus": "error",
+                    "detail": "allow_manual requires Identifiers.category to be a category in the Category taxonomy.",
+                    "Identifiers": ids.dict(),
+                    "Unique_Parameters": unique.dict(),
+                    "registeredAt": datetime.utcnow().isoformat() + "Z"
+                })
+                continue
+
+            # The taxonomy's own spelling, so downstream category matching compares equal
+            # regardless of how the caller capitalised or punctuated it.
+            identifiers["category"] = manual_category
+            matched_status = "manual"
 
         device_doc = {
             "client": client_id,
