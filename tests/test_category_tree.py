@@ -225,6 +225,45 @@ def test_loaded_reports_an_unreadable_taxonomy(monkeypatch):
     assert category_tree.loaded() is True
 
 
+# ── all_categories ──────────────────────────────────────────────────────────
+
+
+def test_all_categories_returns_one_entry_per_category(monkeypatch):
+    seed(monkeypatch, TAXONOMY)
+    categories = {entry["category"] for entry in category_tree.all_categories()}
+    assert categories == {"Washer Dryer", "Kettle", "LED Television"}
+
+
+def test_all_categories_carries_placement_and_locale_title(monkeypatch):
+    seed(monkeypatch, TAXONOMY)
+    entries = {entry["category"]: entry for entry in category_tree.all_categories("es_ES")}
+    assert entries["LED Television"] == {
+        "category": "LED Television",
+        "title": "Televisor LED",
+        "group": "Entertainment",
+        "sector": "Technology",
+    }
+    assert entries["Washer Dryer"]["group"] == "Laundry"
+    assert entries["Washer Dryer"]["sector"] == "Home Appliances"
+
+
+def test_all_categories_falls_back_to_the_taxonomy_spelling_with_no_titles(monkeypatch):
+    seed(monkeypatch, TAXONOMY)
+    entries = {entry["category"]: entry for entry in category_tree.all_categories("es_ES")}
+    assert entries["Kettle"]["title"] == "Kettle"
+
+
+def test_all_categories_is_sorted_by_title(monkeypatch):
+    seed(monkeypatch, TAXONOMY)
+    titles = [entry["title"] for entry in category_tree.all_categories("en_GB")]
+    assert titles == sorted(titles, key=str.lower)
+
+
+def test_all_categories_of_an_unreadable_taxonomy_is_empty(monkeypatch):
+    monkeypatch.setattr(category_tree, "_load", dict)
+    assert category_tree.all_categories() == []
+
+
 # --- min_market_price -------------------------------------------------------
 #
 # The optional sanity floor enrichment checks a matched price against. Absent

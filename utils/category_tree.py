@@ -23,7 +23,7 @@ import os
 import re
 import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import pymongo
 
@@ -272,6 +272,35 @@ def localized_title(category: Optional[str], locale: Optional[str]) -> str:
             if candidate.split("_")[0].lower() == language:
                 return titles[candidate]
     return titles.get("en_GB") or canonical
+
+
+def all_categories(locale: Optional[str] = None) -> List[Dict[str, Optional[str]]]:
+    """Every category in the taxonomy, ordered by its title in ``locale``.
+
+    Each entry is ``{"category": <taxonomy spelling>, "title": <locale-facing
+    name>, "group": ..., "sector": ...}``. ``title`` goes through
+    :func:`localized_title`'s existing fallback chain (same language, then
+    ``en_GB``, then the taxonomy spelling), so this needs no fallback logic
+    of its own.
+
+    Meant for populating a category picker where a device cannot be matched
+    against the catalogue (no GTIN, no vision match) and the category has to
+    be supplied explicitly instead of derived. An unreadable taxonomy reads
+    as no categories rather than raising, consistent with the rest of this
+    module.
+    """
+    entries = [
+        {
+            "category": known["category"],
+            "title": localized_title(known["category"], locale),
+            "group": known.get("group"),
+            "sector": known.get("sector"),
+        }
+        for known in _tree().values()
+        if known.get("category")
+    ]
+    entries.sort(key=lambda entry: (entry["title"] or entry["category"]).lower())
+    return entries
 
 
 def min_market_price(category: Optional[str], currency: Optional[str]) -> Optional[float]:
