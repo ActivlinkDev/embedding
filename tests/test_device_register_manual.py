@@ -6,6 +6,7 @@ import pytest
 from bson import ObjectId
 
 from routers import device_register as route
+from utils import category_tree
 
 TAXONOMY = {
     "Washer Dryer": {"category": "Washer Dryer", "group": "Laundry", "sector": "Home Appliances"},
@@ -64,8 +65,13 @@ def test_allow_manual_stores_the_device_without_a_catalogue_match(monkeypatch):
     seed_taxonomy(monkeypatch)
     devices = mock_collections(monkeypatch, resolved=None)
 
+    # Mirrors what the manual entry screen actually sends: the guarantee is asked
+    # for there because assignment rejects a device carrying none.
     payload = make_payload(
-        Identifiers={"make": "Beko", "model": "WTB1000X1W", "category": "washer-dryer"},
+        Identifiers={
+            "make": "Beko", "model": "WTB1000X1W", "category": "washer-dryer",
+            "gtee_labour": "24", "gtee_parts": "24",
+        },
         allow_manual=True,
     )
     result = route.device_register(payload)
@@ -82,6 +88,57 @@ def test_allow_manual_stores_the_device_without_a_catalogue_match(monkeypatch):
     assert stored["identifiers"]["category"] == "Washer Dryer"
     assert stored["identifiers"]["make"] == "Beko"
     assert stored["identifiers"]["model"] == "WTB1000X1W"
+    # The values assignment reads off the stored device, so it can be quoted.
+    assert stored["identifiers"]["gteeLabour"] == "24"
+    assert stored["identifiers"]["gteeParts"] == "24"
+    assert stored["registrationParameters"]["price"] == 449.99
+
+
+def test_allow_manual_accepts_a_device_with_no_guarantee(monkeypatch):
+    """Deliberate: registration is not quoting.
+
+    A device with no guarantee cannot be assigned cover (ProductAssignment
+    counts gtee 0 as missing), but refusing to register it would lose the
+    registration outright instead of merely declining cover — and a
+    catalogue-matched device whose MasterSKU carries no guarantee is accepted
+    on exactly the same terms.
+    """
+    seed_taxonomy(monkeypatch)
+    devices = mock_collections(monkeypatch, resolved=None)
+
+    payload = make_payload(
+        Identifiers={"make": "Beko", "model": "WTB1000X1W", "category": "Washer Dryer"},
+        allow_manual=True,
+    )
+    result = route.device_register(payload)
+
+    assert result["inserted"][0]["skuStatus"] == "manual"
+    assert devices.insert_one.call_args.args[0]["identifiers"]["gteeLabour"] == ""
+
+
+def test_allow_manual_fails_closed_when_the_taxonomy_is_unreadable(monkeypatch):
+    """`validate_category` fails open so a Mongo blip cannot block SKU creation.
+
+    A manual device is the opposite case: nothing else supplies its category, so
+    an unverifiable one must not be stored — it would match nothing in
+    assignment or rating, silently and permanently.
+    """
+    monkeypatch.setattr(category_tree, "_load", dict)
+    monkeypatch.setattr(category_tree, "_cache", {}, raising=False)
+    monkeypatch.setattr(category_tree, "_cache_loaded_at", 0.0, raising=False)
+    assert category_tree.loaded() is False
+
+    devices = mock_collections(monkeypatch, resolved=None)
+    payload = make_payload(
+        Identifiers={"make": "Beko", "model": "WTB1000X1W", "category": "Washer Dryer"},
+        allow_manual=True,
+    )
+    result = route.device_register(payload)
+
+    entry = result["inserted"][0]
+    assert entry["skuStatus"] == "error"
+    assert "deviceId" not in entry
+    devices.insert_one.assert_not_called()
 
 
 @pytest.mark.parametrize("category", ["", "Not A Real Category"])

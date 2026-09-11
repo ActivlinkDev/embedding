@@ -5,6 +5,7 @@ from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from routers.sku.catalog_dependencies import catalog
 from routers.sku.category_validation import validate_category
+from utils.category_tree import loaded as taxonomy_loaded
 import os
 from datetime import datetime
 from utils.mongo import require_client
@@ -523,6 +524,21 @@ def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_tok
             # assignment match on, and nothing here can derive it the way a catalogue match
             # would, so a blank or invalid one fails this device rather than storing an
             # unratable "no category" device.
+            #
+            # validate_category deliberately fails *open* when the taxonomy cannot be read, so
+            # a Mongo blip does not block SKU creation. A manual device is the opposite case:
+            # nothing else supplies its category, so one that cannot be verified must not be
+            # stored — it would silently match nothing, permanently.
+            if not taxonomy_loaded():
+                inserted.append({
+                    "skuStatus": "error",
+                    "detail": "The Category taxonomy is unavailable, so Identifiers.category cannot be verified. No document created.",
+                    "Identifiers": ids.dict(),
+                    "Unique_Parameters": unique.dict(),
+                    "registeredAt": datetime.utcnow().isoformat() + "Z"
+                })
+                continue
+
             try:
                 manual_category = validate_category(
                     ids.category if valid_value(ids.category) else None,
