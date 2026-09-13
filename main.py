@@ -131,6 +131,7 @@ ROUTERS = {
     "delete_custom_sku": "routers.sku.delete_custom_sku",
     "masked_asset_proxy": "routers.sku.masked_asset_proxy",
     "quick_search": "routers.sku.quick_search",
+    "master_search": "routers.sku.master_search",
 
     # enrich
     "ice_lookup": "routers.enrich.ice_lookup",
