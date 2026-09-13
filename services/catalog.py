@@ -231,6 +231,14 @@ class CatalogService:
             [("identifiers.makeNormalized", 1), ("identifiers.modelNormalized", 1)],
             name="master_make_model",
         )
+        # The compound index above cannot serve a model-only prefix (make is its
+        # leading field), and `/sku/master_search` searches on model alone from
+        # the portal's Model field. Without this the catalogue is scanned on
+        # every keystroke.
+        self.masters.create_index(
+            "identifiers.modelNormalized",
+            name="master_model",
+        )
         self.customs.create_index(
             [("clientId", 1), ("skuNormalized", 1)],
             unique=True,
