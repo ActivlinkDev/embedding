@@ -28,6 +28,9 @@ router = APIRouter(prefix="/service-requests", tags=["Service"])
 class FetchMediaRequest(BaseModel):
     clientkey: str = Field(min_length=1)
     serviceRequestId: str = Field(min_length=1)
+    # Mandatory, for the same reason as the write routes: the tenant alone does not
+    # separate one customer's service request from another's.
+    deviceId: str = Field(min_length=1)
     mediaId: str = Field(min_length=1)
 
 
@@ -54,7 +57,7 @@ def fetch_media(body: FetchMediaRequest, _: None = Depends(verify_token)):
     not exist.
     """
     client_id = resolve_client_id(body.clientkey)
-    request_doc = owned_request(body.serviceRequestId, client_id)
+    request_doc = owned_request(body.serviceRequestId, client_id, body.deviceId)
 
     doc = media_collection.find_one({
         "_id": object_id(body.mediaId, "mediaId"),

@@ -98,24 +98,24 @@ class CreateServiceRequest(BaseModel):
 class AddMediaRequest(BaseModel):
     clientkey: str = Field(min_length=1)
     serviceRequestId: str = Field(min_length=1)
+    # Mandatory: a request id alone only proves the record belongs to somebody at this
+    # client. See `owned_request` for why the pairing is enforced in the query.
+    deviceId: str = Field(min_length=1)
     media: MediaUpload
 
 
 class GetServiceRequest(BaseModel):
     clientkey: str = Field(min_length=1)
+    # The device is mandatory and scopes the read. `serviceRequestId` then narrows it to
+    # one record; without it, this lists that device's requests.
+    deviceId: str = Field(min_length=1)
     serviceRequestId: Optional[str] = None
-    deviceId: Optional[str] = None
-
-    @model_validator(mode="after")
-    def exactly_one(self):
-        if bool(self.serviceRequestId) == bool(self.deviceId):
-            raise ValueError("Supply exactly one of serviceRequestId or deviceId.")
-        return self
 
 
 class SetAppointmentRequest(BaseModel):
     clientkey: str = Field(min_length=1)
     serviceRequestId: str = Field(min_length=1)
+    deviceId: str = Field(min_length=1)
     slotId: Optional[str] = Field(default=None, max_length=200)
     date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     notes: Optional[str] = Field(default=None, max_length=1000)
@@ -292,7 +292,7 @@ def add_media(body: AddMediaRequest, _: None = Depends(verify_token)):
     and never a valid photo of a fault.
     """
     client_id = resolve_client_id(body.clientkey)
-    doc = owned_request(body.serviceRequestId, client_id)
+    doc = owned_request(body.serviceRequestId, client_id, body.deviceId)
 
     if doc.get("mediaCount", 0) >= MAX_MEDIA_PER_REQUEST:
         raise HTTPException(409, "This service request already has the maximum number of attachments.")
@@ -334,7 +334,8 @@ def get_service_request(body: GetServiceRequest, _: None = Depends(verify_token)
     """
     client_id = resolve_client_id(body.clientkey)
     if body.serviceRequestId:
-        return {"serviceRequests": [serialize_request(owned_request(body.serviceRequestId, client_id))]}
+        return {"serviceRequests": [
+            serialize_request(owned_request(body.serviceRequestId, client_id, body.deviceId))]}
 
     object_id(body.deviceId, "deviceId")  # reject a malformed id rather than scanning
     cursor = service_requests_collection.find(
@@ -370,7 +371,7 @@ def set_appointment(body: SetAppointmentRequest, _: None = Depends(verify_token)
     never from anything the browser typed — this endpoint cannot tell the difference.
     """
     client_id = resolve_client_id(body.clientkey)
-    doc = owned_request(body.serviceRequestId, client_id)
+    doc = owned_request(body.serviceRequestId, client_id, body.deviceId)
 
     if not can_transition(doc.get("status", REPORTED), SCHEDULED):
         raise HTTPException(409, "This service request can no longer be scheduled.")

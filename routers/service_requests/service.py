@@ -117,10 +117,25 @@ def owned_device(device_id: str, client_id: str) -> dict:
     return device
 
 
-def owned_request(service_request_id: str, client_id: str) -> dict:
-    """The service request, if this tenant owns it. 404 otherwise."""
-    doc = service_requests_collection.find_one(
-        {"_id": object_id(service_request_id, "serviceRequestId"), "client": client_id})
+def owned_request(service_request_id: str, client_id: str, device_id: Optional[str] = None) -> dict:
+    """The service request, if this tenant owns it. 404 otherwise.
+
+    ``device_id`` narrows it further, to a request opened against that specific device.
+    Tenant alone is not a tight enough boundary for the routes that take a caller-supplied
+    request id: every customer of a client shares one ``Client_ID``, so filtering on it
+    only means the id belongs to *somebody* at that client. A customer who obtained
+    another's request id could read their fault, attach a photo to it, or move their
+    engineer visit.
+
+    The trusted frontend proves the device is the caller's own — it must appear in a
+    signed, host-bound cookie — and passes it here. Enforcing the pairing in the query
+    rather than trusting that check means a caller who reaches this API directly gains
+    nothing by omitting it.
+    """
+    query = {"_id": object_id(service_request_id, "serviceRequestId"), "client": client_id}
+    if device_id:
+        query["deviceId"] = device_id
+    doc = service_requests_collection.find_one(query)
     if not doc:
         raise HTTPException(404, "Service request not found")
     return doc

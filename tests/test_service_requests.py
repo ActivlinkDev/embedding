@@ -23,6 +23,7 @@ from routers.service_requests import (
 
 JPEG = b"\xff\xd8\xff" + b"x" * 64
 PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 64
+DEVICE_ID = str(ObjectId())
 OWNER = "AO"
 OTHER_TENANT = "ARG"
 
@@ -140,7 +141,8 @@ def test_media_fetch_is_filtered_by_request_and_tenant_together(db):
     db["media"].find_one.return_value = None
     with pytest.raises(HTTPException) as error:
         media_route.fetch_media(media_route.FetchMediaRequest(
-            clientkey="AOPON12345", serviceRequestId=str(ObjectId()), mediaId=str(ObjectId())))
+            clientkey="AOPON12345", serviceRequestId=str(ObjectId()),
+            deviceId=DEVICE_ID, mediaId=str(ObjectId())))
     assert error.value.status_code == 404
     query = db["media"].find_one.call_args.args[0]
     assert query["client"] == OWNER and "serviceRequestId" in query
@@ -152,7 +154,8 @@ def test_media_with_an_unservable_content_type_is_never_echoed_into_a_header(db)
         "_id": ObjectId(), "contentType": "text/html", "data": Binary(b"<script>"), "name": "x"}
     with pytest.raises(HTTPException) as error:
         media_route.fetch_media(media_route.FetchMediaRequest(
-            clientkey="AOPON12345", serviceRequestId=str(ObjectId()), mediaId=str(ObjectId())))
+            clientkey="AOPON12345", serviceRequestId=str(ObjectId()),
+            deviceId=DEVICE_ID, mediaId=str(ObjectId())))
     assert error.value.status_code == 404
 
 
@@ -242,7 +245,8 @@ def test_a_fifth_photo_is_refused(db):
         "_id": ObjectId(), "client": OWNER, "mediaCount": svc.MAX_MEDIA_PER_REQUEST}
     with pytest.raises(HTTPException) as error:
         add_media(AddMediaRequest(
-            clientkey="AOPON12345", serviceRequestId=str(ObjectId()), media=photo()))
+            clientkey="AOPON12345", serviceRequestId=str(ObjectId()),
+            deviceId=DEVICE_ID, media=photo()))
     assert error.value.status_code == 409
     db["media"].insert_one.assert_not_called()
 
@@ -266,14 +270,16 @@ def test_a_date_before_tomorrow_is_refused(db, day, status):
     scheduled_request(db)
     with pytest.raises(HTTPException) as error:
         set_appointment(SetAppointmentRequest(
-            clientkey="AOPON12345", serviceRequestId=str(ObjectId()), date=day))
+            clientkey="AOPON12345", serviceRequestId=str(ObjectId()),
+            deviceId=DEVICE_ID, date=day))
     assert error.value.status_code == status
 
 
 def test_tomorrow_is_accepted_and_recorded(db):
     scheduled_request(db)
     set_appointment(SetAppointmentRequest(
-        clientkey="AOPON12345", serviceRequestId=str(ObjectId()), date=tomorrow()))
+        clientkey="AOPON12345", serviceRequestId=str(ObjectId()),
+        deviceId=DEVICE_ID, date=tomorrow()))
     update = db["requests"].find_one_and_update.call_args.args[1]
     assert update["$set"]["appointment"]["date"] == tomorrow()
     assert update["$set"]["status"] == svc.SCHEDULED
@@ -283,7 +289,8 @@ def test_an_unknown_slot_id_is_400_rather_than_a_guessed_date(db):
     scheduled_request(db)
     with pytest.raises(HTTPException) as error:
         set_appointment(SetAppointmentRequest(
-            clientkey="AOPON12345", serviceRequestId=str(ObjectId()), slotId="acme:whatever"))
+            clientkey="AOPON12345", serviceRequestId=str(ObjectId()),
+            deviceId=DEVICE_ID, slotId="acme:whatever"))
     assert error.value.status_code == 400
 
 
@@ -292,7 +299,8 @@ def test_rescheduling_keeps_the_previous_appointment(db):
     scheduled_request(db, status=svc.SCHEDULED, appointment=previous)
     later = (date.today() + timedelta(days=5)).isoformat()
     set_appointment(SetAppointmentRequest(
-        clientkey="AOPON12345", serviceRequestId=str(ObjectId()), date=later))
+        clientkey="AOPON12345", serviceRequestId=str(ObjectId()),
+        deviceId=DEVICE_ID, date=later))
     update = db["requests"].find_one_and_update.call_args.args[1]
     assert update["$push"]["appointmentHistory"] == previous
 
@@ -302,14 +310,16 @@ def test_a_finished_request_can_no_longer_be_scheduled(db, status):
     scheduled_request(db, status=status)
     with pytest.raises(HTTPException) as error:
         set_appointment(SetAppointmentRequest(
-            clientkey="AOPON12345", serviceRequestId=str(ObjectId()), date=tomorrow()))
+            clientkey="AOPON12345", serviceRequestId=str(ObjectId()),
+            deviceId=DEVICE_ID, date=tomorrow()))
     assert error.value.status_code == 409
 
 
 def test_supplying_both_or_neither_slot_and_date_is_rejected():
     for kwargs in ({}, {"slotId": "static:x", "date": tomorrow()}):
         with pytest.raises(ValueError):
-            SetAppointmentRequest(clientkey="k", serviceRequestId=str(ObjectId()), **kwargs)
+            SetAppointmentRequest(clientkey="k", serviceRequestId=str(ObjectId()),
+                                  deviceId=DEVICE_ID, **kwargs)
 
 
 # --- availability -----------------------------------------------------------------------
@@ -371,3 +381,60 @@ def test_a_basket_line_with_no_service_request_is_a_quiet_no_op(db, value):
     # paid checkout.
     assert svc.attach_contract_to_service_request(value, "ACT-1", "ORD-1", "b1") is False
     db["requests"].update_one.assert_not_called()
+
+
+# --- the device/request binding (PR #138, CRITICAL) ----------------------------------------
+
+def test_a_request_id_from_another_device_is_404(db):
+    """Tenant alone was not a tight enough filter.
+
+    Every customer of a client shares one Client_ID, so filtering on it only proved the
+    record belonged to *somebody* at that client. A customer holding another's request id
+    could read their fault, attach a photo to it, or move their engineer visit. The device
+    now has to match too, and a mismatch is a 404 like any other miss.
+    """
+    db["requests"].find_one.return_value = None
+    with pytest.raises(HTTPException) as error:
+        svc.owned_request(str(ObjectId()), OWNER, DEVICE_ID)
+    assert error.value.status_code == 404
+    query = db["requests"].find_one.call_args.args[0]
+    assert query["client"] == OWNER
+    assert query["deviceId"] == DEVICE_ID
+
+
+def test_the_device_filter_is_applied_in_the_query_not_after_it(db):
+    # Filtering in Mongo rather than comparing the returned document means a caller that
+    # reaches this API directly gains nothing by omitting the device.
+    db["requests"].find_one.return_value = {"_id": ObjectId(), "client": OWNER, "deviceId": DEVICE_ID}
+    svc.owned_request(str(ObjectId()), OWNER, DEVICE_ID)
+    assert "deviceId" in db["requests"].find_one.call_args.args[0]
+
+
+def test_omitting_the_device_still_scopes_to_the_tenant(db):
+    # `create` has no request id to pair with yet, so it calls without a device — that path
+    # must still be tenant-filtered.
+    db["requests"].find_one.return_value = {"_id": ObjectId(), "client": OWNER}
+    svc.owned_request(str(ObjectId()), OWNER)
+    query = db["requests"].find_one.call_args.args[0]
+    assert query["client"] == OWNER
+    assert "deviceId" not in query
+
+
+@pytest.mark.parametrize("model,extra", [
+    ("AddMediaRequest", {"media": None}),
+    ("SetAppointmentRequest", {"date": None}),
+    ("GetServiceRequest", {}),
+], ids=["media", "appointment", "get"])
+def test_every_request_id_route_requires_a_device(model, extra):
+    # If a route could be called without a device, the binding above would be optional in
+    # practice — so each model makes it mandatory.
+    import routers.service_requests as package
+    cls = getattr(package, model)
+    with pytest.raises(ValueError):
+        cls(clientkey="AOPON12345", serviceRequestId=str(ObjectId()))
+
+
+def test_media_fetch_requires_a_device():
+    with pytest.raises(ValueError):
+        media_route.FetchMediaRequest(
+            clientkey="AOPON12345", serviceRequestId=str(ObjectId()), mediaId=str(ObjectId()))
