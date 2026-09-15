@@ -105,6 +105,18 @@ def _extract_client(items: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _extract_service_request_ids(items: list[dict[str, Any]]) -> str:
+    """The repair bookings in this basket, for reconciliation from the Stripe dashboard.
+
+    Stripe metadata values are strings with a 500-character limit, hence the join and the
+    slice. This is a support convenience only — the basket, not Stripe metadata, is what
+    contract issuance reads, so a truncated value costs nothing.
+    """
+    found = sorted({str(it["service_request_id"]) for it in items
+                    if (it or {}).get("service_request_id")})
+    return ",".join(found)[:480]
+
+
 def _extract_source(items: list[dict[str, Any]]) -> str:
     for it in items:
         s = (it or {}).get("source")
@@ -274,6 +286,7 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
             "basket_id": str(basket["_id"]),
             "client": _extract_client(items),
             "source": _extract_source(items),
+            "service_request_ids": _extract_service_request_ids(items),
         },
         customer_email=req.email if req.email else None,
         customer_phone=req.customer_phone if req.customer_phone else None,

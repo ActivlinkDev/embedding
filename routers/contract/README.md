@@ -76,6 +76,8 @@ activates on the first paid invoice (see "Subscriptions" below).
   "device_id": "DEV-...",           // from basket item deviceId
   "offer_id": "EX1",                // from basket item product_id
   "quote_id": "Q-...", "basket_id": "BSK-...",
+  "service_request_id": "68b2...",  // repair journey only; "" on a cover-only line
+  "appointment_date": "2026-09-16", // repair journey only; null on a cover-only line
   "client_key": "Beko", "source": "POS",
   "status": "PENDING_ACTIVATION | ACTIVE | EXPIRED | CANCELLED | RENEWED | VOID",
   "cover_type": "Dishwasher",       // from basket item category
@@ -175,3 +177,23 @@ Set up on Railway: add a **Cron** service in the project with a schedule (e.g.
 - **Email sending** → `/resend` and `renewal_notifier` record `NOTIFIED` events only.
   Hook point: a `notifications.py` using the existing `BREVO_API_KEY` env var, called
   from `activate()` (policy docs) and `renewal_notifier()` (renewal notice).
+
+## Repair bookings
+
+A contract issued from the `/assistance` repair journey carries `service_request_id` and
+`appointment_date`, copied off the basket line like `device_id` and `quote_id` and so
+covered by the same `dedupe_key` idempotency. Once the contract is issued, the service
+request is moved to `CONFIRMED` and stamped with the contract reference. That call is
+wrapped: a failure to confirm the booking is logged and never unwinds an issued contract
+or makes the webhook retry a checkout that already succeeded. A basket line with no
+service request is the ordinary cover journey and no-ops.
+
+Both fields are absent on a cover-only line rather than null, so nothing downstream has to
+tell "no repair booking" apart from "a repair booking with no id".
+
+**Known gap:** `/basket/add` and `/basket/payment/create` take no `clientkey` and are not
+tenant-scoped, so a caller holding a valid token could attach any `service_request_id` to a
+basket. That is a pre-existing property of the basket surface rather than something the
+repair journey introduced, and the blast radius is a mislabelled contract — a service
+request's own contents are never returned through the basket, and every endpoint that does
+return them is tenant-filtered.

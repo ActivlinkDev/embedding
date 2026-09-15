@@ -239,6 +239,11 @@ def create_contract(session: dict, customer_id: str) -> list[dict]:
             "device_id": item.get("deviceId", ""),
             "offer_id": item.get("product_id", ""),
             "quote_id": item.get("quote_id", ""),
+            # Repair journey only: which service request this contract books an engineer
+            # for, and when. Sourced from the basket item like device_id and quote_id, so
+            # they inherit the dedupe_key idempotency below.
+            "service_request_id": item.get("service_request_id", ""),
+            "appointment_date": item.get("appointment_date"),
             "basket_id": basket_id or "",
             "client_key": item.get("client") or meta.get("client") or "",
             "source": item.get("source") or meta.get("source") or "",
@@ -271,6 +276,21 @@ def create_contract(session: dict, customer_id: str) -> list[dict]:
         print(f"[Contract] Issued {doc['reference']} (device {doc['device_id']}, "
               f"offer {doc['offer_id']}) under order {order['order_reference']}",
               file=sys.stderr)
+
+        # Confirm the repair booking now that it is paid for. Wrapped because this runs
+        # inside the Stripe webhook: a failure here must never unwind an issued contract
+        # or make the webhook retry a checkout that already succeeded. A line with no
+        # service request is the ordinary cover journey and no-ops.
+        try:
+            from routers.service_requests.service import attach_contract_to_service_request
+
+            attach_contract_to_service_request(
+                doc["service_request_id"], doc["reference"],
+                order["order_reference"], basket_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Contract] could not confirm service request for {doc['reference']}: {exc}",
+                  file=sys.stderr)
 
         # One-off checkouts arrive already paid -> activate immediately.
         if billing == "ONE_OFF" and paid:
