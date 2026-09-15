@@ -30,6 +30,7 @@ OPENAPI_TAGS = [
     {"name": "QA", "description": "Quality assurance utilities."},
     {"name": "Portal", "description": "Portal admin login and user management."},
     {"name": "QR", "description": "QR code collection generation, scanning, and pairing."},
+    {"name": "Service", "description": "Repair booking: fault reports, attachments, availability, and appointments."},
 ]
 
 docs_enabled = os.getenv("ENABLE_API_DOCS", "false").lower() == "true"
@@ -54,6 +55,16 @@ def ensure_catalog_indexes() -> None:
         "expires_at",
         expireAfterSeconds=0,
     )
+
+    # This hook runs outside _include_router's safe-import wrapper, so an index failure
+    # here would stop the app booting. The repair journey works without its indexes —
+    # only more slowly — so a failure is logged rather than raised.
+    try:
+        from routers.service_requests.service import ensure_service_request_indexes
+
+        ensure_service_request_indexes()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[STARTUP] service request index setup skipped: {exc}")
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -179,6 +190,12 @@ ROUTERS = {
     "locales": "routers.locales",
     "otp": "routers.otp",
     "registration_overview": "routers.registration_overview",
+
+    # service / repairs
+    "fault_catalogue": "routers.faults.catalogue",
+    "service_requests": "routers.service_requests",
+    "service_request_media": "routers.service_requests.media",
+    "service_availability": "routers.service_requests.availability",
 
     # cms
     "props_lookup": "routers.cms.props_lookup",

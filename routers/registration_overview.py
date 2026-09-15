@@ -1,16 +1,15 @@
 """Registration-session scoped overview and receipt storage (trusted frontend only)."""
-import base64
-import binascii
 import os
 import re
 from datetime import datetime, timezone
 from typing import Optional
 
-from bson import ObjectId, Binary
+from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from utils.dependencies import verify_token
+from utils.media import RECEIPT_TYPES, decode_upload
 from utils.mongo import require_client
 from utils.tenant import client_id_for_key
 
@@ -116,23 +115,13 @@ class OverviewRequest(BaseModel):
 
 
 def decode_receipt(receipt: Receipt):
-    try:
-        data = base64.b64decode(receipt.data, validate=True)
-    except (ValueError, binascii.Error):
-        raise HTTPException(400, 'Invalid receipt file')
-    if not data or len(data) > 5 * 1024 * 1024:
-        raise HTTPException(413, 'Receipt must be 5 MB or smaller.')
-    signatures = {
-        'image/jpeg': data.startswith(b'\xff\xd8\xff'),
-        'image/png': data.startswith(b'\x89PNG\r\n\x1a\n'),
-        'application/pdf': data.startswith(b'%PDF-'),
-        'image/heic': data[4:8] == b'ftyp' and data[8:12] in (b'heic', b'heix', b'hevc', b'hevx'),
-        'image/heif': data[4:8] == b'ftyp' and data[8:12] in (b'mif1', b'msf1'),
-    }
-    if not signatures.get(receipt.contentType):
-        raise HTTPException(415, 'Choose a JPEG, PNG, HEIC or PDF receipt.')
-    return {'name': receipt.name, 'contentType': receipt.contentType, 'size': len(data),
-            'uploadedAt': datetime.now(timezone.utc).isoformat(), 'data': Binary(data)}
+    """Validate an uploaded receipt. Shares its checks with the fault-photo upload."""
+    return decode_upload(
+        receipt.name, receipt.contentType, receipt.data, RECEIPT_TYPES,
+        invalid_message='Invalid receipt file',
+        too_large_message='Receipt must be 5 MB or smaller.',
+        wrong_type_message='Choose a JPEG, PNG, HEIC or PDF receipt.',
+    )
 
 
 @router.post('/registration-overview')
