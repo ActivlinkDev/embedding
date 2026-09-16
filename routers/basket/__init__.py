@@ -94,6 +94,24 @@ class AddToBasketRequest(BaseModel):
         description="Promotion id to attach to this line or skipped entry.",
         examples=["10YP"],
     )
+    service_request_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Service request this line books an engineer for, from `POST /service-requests`. "
+            "Set on the repair journey only; absent on the ordinary cover journey."
+        ),
+        examples=["68b2d1f0a4b21d0f8c9e8801"],
+    )
+    appointment_date: Optional[str] = Field(
+        default=None,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description=(
+            "The appointment booked on that service request, denormalised onto the line so "
+            "checkout and the issued contract can show it without a second lookup. The service "
+            "request remains the source of truth."
+        ),
+        examples=["2026-09-16"],
+    )
     add_to_basket: Optional[bool] = Field(
         default=True,
         description=(
@@ -345,6 +363,12 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
         # Per-line unique id to allow precise deletes
         "line_id": str(ObjectId()),
         }
+        if payload.promo_id:
+            skipped_item["promo_id"] = payload.promo_id
+        if payload.service_request_id:
+            skipped_item["service_request_id"] = payload.service_request_id
+        if payload.appointment_date:
+            skipped_item["appointment_date"] = payload.appointment_date
     else:
         # Validate requirements for adding to basket
         if not payload.product_id:
@@ -393,12 +417,14 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
             # Per-line unique id to allow precise deletes
             "line_id": str(ObjectId()),
         }
-        # Attach promo_id if provided
-        if payload.promo_id:
-            skipped_item["promo_id"] = payload.promo_id
-        # Attach promo_id if provided
         if payload.promo_id:
             basket_item["promo_id"] = payload.promo_id
+        # Carried from the repair journey so checkout and contract issuance can see the
+        # booking without re-reading the service request.
+        if payload.service_request_id:
+            basket_item["service_request_id"] = payload.service_request_id
+        if payload.appointment_date:
+            basket_item["appointment_date"] = payload.appointment_date
 
     # 3) Create or append to Basket_Quotes by _id (basket_id)
     if payload.basket_id:
