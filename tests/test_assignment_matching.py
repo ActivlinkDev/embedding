@@ -187,3 +187,99 @@ def test_no_match_reports_every_rejection():
     assert won is None
     assert {r["rule_id"] for r in rejected} == {"R1", "R2"}
     assert all(r["failure_reasons"] for r in rejected)
+
+
+# ---- when.deviceWorking ----
+
+def test_a_rule_that_ignores_device_working_covers_both_states():
+    """Every rule written before this condition existed keeps matching what it matched."""
+    assert pa.when_failure_reasons(rule(), req(device_working=False), 6) == []
+    assert pa.when_failure_reasons(rule(), req(device_working=True), 6) == []
+
+
+@pytest.mark.parametrize("stated", [None, True])
+def test_unstated_or_true_reads_as_working(stated):
+    working_only = rule(when={**rule()["when"], "deviceWorking": [True]})
+    assert pa.when_failure_reasons(working_only, req(device_working=stated), 6) == []
+
+
+def test_a_working_device_does_not_match_a_faulty_device_rule():
+    faulty_only = rule(when={**rule()["when"], "deviceWorking": [False]})
+    reasons = pa.when_failure_reasons(faulty_only, req(), 6)
+    assert any("device_working" in r for r in reasons), reasons
+
+
+def test_a_faulty_device_does_not_match_a_working_device_rule():
+    working_only = rule(when={**rule()["when"], "deviceWorking": [True]})
+    reasons = pa.when_failure_reasons(working_only, req(device_working=False), 6)
+    assert any("device_working" in r for r in reasons), reasons
+
+
+def test_a_faulty_device_matches_the_faulty_device_rule():
+    faulty_only = rule(when={**rule()["when"], "deviceWorking": [False]})
+    assert pa.when_failure_reasons(faulty_only, req(device_working=False), 6) == []
+
+
+@pytest.mark.parametrize("spelling", [False, [False], "false", "no", "Faulty"])
+def test_a_rule_may_spell_the_condition_as_a_bare_value_or_a_list(spelling):
+    faulty_only = rule(when={**rule()["when"], "deviceWorking": spelling})
+    assert pa.when_failure_reasons(faulty_only, req(device_working=False), 6) == []
+    assert pa.when_failure_reasons(faulty_only, req(), 6) != []
+
+
+def test_both_states_listed_means_any():
+    either = rule(when={**rule()["when"], "deviceWorking": [True, False]})
+    assert pa.when_failure_reasons(either, req(device_working=False), 6) == []
+    assert pa.when_failure_reasons(either, req(device_working=True), 6) == []
+
+
+def test_an_unusable_condition_value_is_ignored_not_guessed(caplog):
+    """A typo must not silently turn a rule into 'faulty devices only'."""
+    nonsense = rule(when={**rule()["when"], "deviceWorking": ["maybe"]})
+    with caplog.at_level("WARNING"):
+        assert pa.rule_device_working(nonsense) == []
+    assert pa.when_failure_reasons(nonsense, req(device_working=False), 6) == []
+
+
+@pytest.mark.parametrize("value,expected", [
+    (None, None), ("", None), (" ", None),
+    (True, True), ("true", True), ("Yes", True),
+    (False, False), ("false", False), ("broken", False),
+    ("nonsense", None),
+])
+def test_stored_values_coerce_to_the_state_they_state(value, expected):
+    assert pa.coerce_device_working(value) is expected
+
+
+def test_a_faulty_request_reaching_a_working_device_rule_is_reported_in_the_payload():
+    """`device_working` survives model_dump, so the quote records what was matched."""
+    assert req(device_working=False).model_dump()["device_working"] is False
+    assert req().model_dump()["device_working"] is None
+
+
+# ---- deviceWorking and ordering ----
+
+def test_the_rule_naming_device_working_beats_the_rule_that_ignores_it():
+    """A faulty-device rule can be added without rewriting the rule already in place."""
+    legacy = rule(_id="aaa", ruleId="ANY-STATE", priority=100)
+    faulty = rule(_id="zzz", ruleId="FAULTY", priority=100,
+                  when={**rule()["when"], "deviceWorking": [False]})
+    assert pick([legacy, faulty], device_working=False) == "FAULTY"
+    assert pick([faulty, legacy], device_working=False) == "FAULTY"
+    # ...and the working device still gets the rule it always got.
+    assert pick([legacy, faulty]) == "ANY-STATE"
+
+
+def test_priority_still_beats_naming_device_working():
+    legacy = rule(_id="aaa", ruleId="ANY-STATE", priority=500)
+    faulty = rule(_id="zzz", ruleId="FAULTY", priority=100,
+                  when={**rule()["when"], "deviceWorking": [False]})
+    assert pick([legacy, faulty], device_working=False) == "ANY-STATE"
+
+
+def test_category_precision_still_beats_naming_device_working():
+    narrow = rule(_id="aaa", ruleId="CATEGORY", priority=100)
+    broad_faulty = rule(_id="zzz", ruleId="SECTOR-FAULTY", priority=100,
+                        what={"sector": ["Home Appliances"], "group": [], "category": []},
+                        when={**rule()["when"], "deviceWorking": [False]})
+    assert pick([narrow, broad_faulty], device_working=False) == "CATEGORY"

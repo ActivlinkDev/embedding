@@ -32,6 +32,62 @@ MATCH_DIAGNOSTICS = os.getenv("PRODUCT_ASSIGNMENT_DIAGNOSTICS", "").lower() in (
 # "Home Appliances at 1.0, except Kettles at 0.75" needs no exclusion list.
 SPECIFICITY = {"category": 3, "group": 2, "sector": 1}
 
+# How a stored `deviceWorking` reads when it arrives as text rather than a boolean —
+# Mongo documents and CMS-authored rules both do that.
+_TRUE_TEXT = {"true", "1", "yes", "y", "working"}
+_FALSE_TEXT = {"false", "0", "no", "n", "faulty", "broken", "not working"}
+
+
+def coerce_device_working(value: Any) -> Optional[bool]:
+    """A stored/supplied `deviceWorking` as a boolean, or None when it says nothing.
+
+    Blank strings and `None` are "not stated", which the caller reads as working —
+    see `ProductAssignmentRequest.working`. An unrecognised value is also treated as
+    not stated rather than guessed at, because guessing it wrong offers the customer
+    the wrong cover.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if not text:
+            return None
+        if text in _TRUE_TEXT:
+            return True
+        if text in _FALSE_TEXT:
+            return False
+    logger.warning("[assignment] unrecognised deviceWorking value %r; treating it as unstated", value)
+    return None
+
+
+def rule_device_working(rule: Dict[str, Any]) -> List[bool]:
+    """The `deviceWorking` states this rule accepts. Empty means it does not test it.
+
+    `when.deviceWorking` may be a bare boolean (`false`) or a list (`[false]`), and
+    either spelling means the same thing. Values that are neither are dropped with a
+    warning rather than silently narrowing or widening the rule.
+    """
+    raw = (rule.get("when") or {}).get("deviceWorking")
+    if raw is None or raw == []:
+        return []
+    values = raw if isinstance(raw, (list, tuple)) else [raw]
+    accepted: List[bool] = []
+    for value in values:
+        coerced = coerce_device_working(value)
+        if coerced is None:
+            logger.warning(
+                "[assignment] rule %s has an unusable when.deviceWorking value %r; ignoring it",
+                rule.get("ruleId") or rule.get("_id"), value,
+            )
+            continue
+        if coerced not in accepted:
+            accepted.append(coerced)
+    return accepted
+
 
 _indexes_ready = False
 
@@ -170,6 +226,15 @@ def when_failure_reasons(rule: Dict[str, Any], payload, age_in_months: int) -> L
             f"[{price.get('min', 0)}, {price.get('max', 'any')}]"
         )
 
+    # A rule that says nothing about deviceWorking covers both states, exactly as an
+    # empty list does above — which is what keeps every rule written before this
+    # condition existed matching the devices it always matched.
+    working_states = rule_device_working(rule)
+    if working_states and payload.working not in working_states:
+        reasons.append(
+            f"device_working {payload.working} not in {working_states}"
+        )
+
     return reasons
 
 
@@ -194,7 +259,7 @@ def find_matching_rule(payload, age_in_months: int) -> Tuple[Optional[Dict[str, 
     debug_print("CATEGORY PLACEMENT:", placement)
 
     today = _today()
-    matches: List[Tuple[int, int, str, Dict[str, Any]]] = []
+    matches: List[Tuple[int, int, int, str, Dict[str, Any]]] = []
     rejected: List[Dict[str, Any]] = []
 
     for rule in _candidate_rules(payload):
@@ -225,24 +290,32 @@ def find_matching_rule(payload, age_in_months: int) -> Tuple[Optional[Dict[str, 
             continue
 
         debug_print(f"--- rule {rule_id} matched (specificity {specificity})")
-        matches.append((int(rule.get("priority", 0)), specificity, str(rule.get("_id")), rule))
+        # A rule that names deviceWorking is answering a narrower question than one that
+        # ignores it, so at equal priority and category precision it wins. That is what
+        # lets a "faulty device" rule be added alongside an existing rule for the same
+        # category without the existing rule having to be rewritten to exclude it.
+        names_working = 1 if rule_device_working(rule) else 0
+        matches.append(
+            (int(rule.get("priority", 0)), specificity, names_working, str(rule.get("_id")), rule)
+        )
 
     if not matches:
         return None, rejected
 
-    # Highest priority first, then most specific, then a stable id tiebreak.
-    matches.sort(key=lambda m: (-m[0], -m[1], m[2]))
+    # Highest priority first, then most specific, then the rule that tested
+    # deviceWorking, then a stable id tiebreak.
+    matches.sort(key=lambda m: (-m[0], -m[1], -m[2], m[3]))
 
-    if len(matches) > 1 and matches[0][:2] == matches[1][:2]:
+    if len(matches) > 1 and matches[0][:3] == matches[1][:3]:
         logger.warning(
             "[assignment] rules %s and %s tie on priority %s and specificity %s for "
             "client=%s source=%s category=%s; resolving by _id",
-            matches[0][3].get("ruleId"), matches[1][3].get("ruleId"),
+            matches[0][4].get("ruleId"), matches[1][4].get("ruleId"),
             matches[0][0], matches[0][1],
             payload.client, payload.source, payload.category,
         )
 
-    return matches[0][3], rejected
+    return matches[0][4], rejected
 
 
 def build_match_diagnostics(payload, age_in_months: int) -> Dict[str, Any]:
@@ -340,6 +413,17 @@ class ProductAssignmentRequest(BaseModel):
         description="**Mandatory.** Exactly three upper-case letters (ISO 4217), e.g. `GBP`.",
         examples=["GBP"],
     )
+    device_working: Optional[bool] = Field(
+        None,
+        description=(
+            "**Optional.** Whether the device is in working order. Omitted, `null` or `true` "
+            "all mean working — a device already broken when it is quoted is the exception, "
+            "so it is the one that has to be stated. Matched against each rule's "
+            "`when.deviceWorking`; a rule that does not name that condition covers both "
+            "states, so existing rules are unaffected."
+        ),
+        examples=[True],
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -352,9 +436,20 @@ class ProductAssignmentRequest(BaseModel):
                 "purchase_date": "2025-05-01",
                 "gtee": 12,
                 "currency": "GBP",
+                "device_working": True,
             }
         }
     }
+
+    @field_validator("device_working", mode="before")
+    def coerce_working(cls, v):
+        """Accept the textual spellings a stored device or a form post can carry."""
+        return coerce_device_working(v)
+
+    @property
+    def working(self) -> bool:
+        """The state the rules are matched on. Unstated reads as working."""
+        return True if self.device_working is None else bool(self.device_working)
 
     @field_validator("purchase_date")
     def validate_purchase_date_format(cls, v):
@@ -457,6 +552,7 @@ def assign_products(payload: ProductAssignmentRequest) -> Dict[str, Any]:
                     "purchase_date": "2025-05-01",
                     "gtee": 12,
                     "currency": "GBP",
+                    "device_working": True,
                 },
                 "doc_id": "681bd53fad4ba559bc92f41b",
                 "rule_id": "GBP-POS-EX1-WF1-150PLUS",
@@ -488,11 +584,22 @@ def product_assignment(payload: ProductAssignmentRequest, _: None = Depends(veri
        sector *Home Appliances* also covers a Dishwasher without naming it. A level with an
        empty list is not tested.
     2. **`when`** accepts the `locale`, the `currency`, the `gtee`, the derived
-       `age_in_months` and the `price`. An empty list means "any".
+       `age_in_months`, the `price` and — when the rule names it — `deviceWorking`. An
+       empty list means "any".
+
+    **`when.deviceWorking`** is how a client offers different products for a device that is
+    already broken. It takes `true`, `false`, or a list of both, and a rule that omits it
+    covers either state. The request's `device_working` is optional: omitted, `null` or
+    `true` all read as working, so only a faulty device has to say so. Because a rule that
+    names the condition is answering a narrower question, it beats one that ignores it when
+    priority and category precision are equal — a `deviceWorking: false` rule can therefore
+    be added next to an existing rule for the same category without that rule being
+    rewritten to exclude faulty devices.
 
     When several rules match, the winner is the one with the highest `priority`; ties go to
-    the rule that named the category most precisely (category beats group beats sector), and
-    any remaining tie is broken by `_id`. That makes exceptions easy to write: a broad rule
+    the rule that named the category most precisely (category beats group beats sector), then
+    to the rule that tested `deviceWorking` over one that ignored it, and any remaining tie is
+    broken by `_id`. That makes exceptions easy to write: a broad rule
     on a sector plus a narrow rule on one category, and the narrow one wins for that
     category without the broad one needing an exclusion list.
 

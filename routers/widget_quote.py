@@ -86,6 +86,16 @@ class WidgetPriceRequest(BaseModel):
         description="Guarantee duration override in months. Otherwise the SKU's labour guarantee, falling back to parts.",
         examples=[12],
     )
+    deviceWorking: Optional[bool] = Field(
+        None,
+        description=(
+            "Whether the product is in working order. Omitted or `null` means working, which "
+            "is what a storefront widget pricing a new purchase always is. Passed to the "
+            "assignment rules as `device_working` and part of the cache key, so a faulty "
+            "device is never served the working-device options."
+        ),
+        examples=[True],
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -97,6 +107,7 @@ class WidgetPriceRequest(BaseModel):
                 "currency": "GBP",
                 "purchaseDate": None,
                 "gtee": None,
+                "deviceWorking": None,
             }
         }
     }
@@ -201,6 +212,7 @@ def resolve_widget_inputs(payload: WidgetPriceRequest):
         purchase_date=purchase_date,
         gtee=gtee,
         currency=currency,
+        device_working=payload.deviceWorking,
     )
     try:
         age_in_months = calculate_age_in_months(purchase_date)
@@ -247,13 +259,19 @@ def _compute_options_from_assignment(assignment_request, age_in_months):
 
 # ---------- Cache ----------
 
-def _cache_read(custom_sku_id, locale, age, price, gtee, currency):
+def _cache_read(custom_sku_id, locale, age, price, gtee, currency, device_working=True):
     doc = widget_cache_collection.find_one({
         "customSkuId": custom_sku_id,
         "locale": locale,
         "age": age,
         "gtee": gtee,
         "currency": currency,
+        # Entries cached before deviceWorking became an assignment condition carry no such
+        # field, and what they hold is what a working device gets — a faulty-device rule
+        # cannot change the working-device answer. So the working query accepts them
+        # (Mongo matches a missing field against null) and only the faulty query misses,
+        # which keeps a deploy from rebuilding every cached entry at once.
+        "deviceWorking": {"$in": [True, None]} if device_working else False,
         "priceLow": {"$lte": price},
         "priceHigh": {"$gte": price},
     })
@@ -272,7 +290,8 @@ def _cache_invalidate(custom_sku_id, locale=None):
     widget_cache_collection.delete_many(query)
 
 
-def _cache_write(custom_sku_id, locale, age, price, gtee, bracket, currency, grouped):
+def _cache_write(custom_sku_id, locale, age, price, gtee, bracket, currency, grouped,
+                 device_working=True):
     low, high = bracket if bracket else (price, price)
     widget_cache_collection.update_one(
         {
@@ -281,6 +300,7 @@ def _cache_write(custom_sku_id, locale, age, price, gtee, bracket, currency, gro
             "age": age,
             "gtee": gtee,
             "currency": currency,
+            "deviceWorking": device_working,
             "priceLow": low,
             "priceHigh": high,
         },
@@ -292,6 +312,7 @@ def _cache_write(custom_sku_id, locale, age, price, gtee, bracket, currency, gro
             "priceLow": low,
             "priceHigh": high,
             "currency": currency,
+            "deviceWorking": device_working,
             "options": grouped,
             "generatedAt": datetime.utcnow(),
         }},
@@ -307,6 +328,7 @@ def _priced_options(payload: WidgetPriceRequest):
     cached = _cache_read(
         payload.customSkuId, payload.locale, age_in_months, price,
         assignment_request.gtee, assignment_request.currency,
+        assignment_request.working,
     )
     if cached:
         return cached.get("options", []), cached.get("currency")
@@ -316,6 +338,7 @@ def _priced_options(payload: WidgetPriceRequest):
         _cache_write(
             payload.customSkuId, payload.locale, age_in_months, price,
             assignment_request.gtee, bracket, currency, grouped,
+            assignment_request.working,
         )
     return grouped, currency
 
@@ -489,6 +512,7 @@ def widget_quote_refresh(payload: WidgetPriceRequest, _: None = Depends(verify_t
     _cache_write(
         payload.customSkuId, payload.locale, age_in_months, assignment_request.price,
         assignment_request.gtee, bracket, currency, grouped,
+        assignment_request.working,
     )
     return {"status": "ok", "cached_options": len(grouped)}
 
@@ -524,6 +548,7 @@ def warm_widget_cache(client_key: str, custom_sku_id: str, locale: str, price: O
             _cache_write(
                 custom_sku_id, locale, age_in_months, assignment_request.price,
                 assignment_request.gtee, bracket, currency, grouped,
+                assignment_request.working,
             )
             print(f"[WIDGET-CACHE] warmed {custom_sku_id} / {locale}")
         else:
