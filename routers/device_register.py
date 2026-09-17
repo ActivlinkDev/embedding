@@ -123,6 +123,18 @@ class UniqueParametersModel(BaseModel):
         description="Your own reference for this registration (order number, line id, …).",
         examples=["ORD-2026-00918"],
     )
+    device_working: Optional[bool] = Field(
+        True,
+        description=(
+            "Whether the unit is in working order at the point of registration. `false` is the "
+            "repair journey, where the customer reports a fault before anything is priced. It "
+            "is stored as `registrationParameters.deviceWorking` and carried into product "
+            "assignment, where a rule's `when.deviceWorking` can offer a different product set "
+            "to a broken device. Omitting it registers a working device, so existing callers "
+            "keep their present behaviour."
+        ),
+        examples=[True],
+    )
 
 
 class DeviceModel(BaseModel):
@@ -208,6 +220,7 @@ class SimpleRegisterRequest(BaseModel):
                             "purchase_date": "2025-05-01",
                             "price": 449.99,
                             "client_ref": "ORD-2026-00918",
+                            "device_working": True,
                         },
                     }
                 ],
@@ -503,6 +516,11 @@ def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_tok
             "price": price,
             "currency": locale_doc.get("currency", ""),   # currency comes from Locale_Params
             "clientRef": unique.client_ref or "",
+            # A device is working unless the caller says otherwise, so every registration made
+            # before this field existed — and every caller that still omits it — reads as
+            # working rather than unknown. Assignment reads this stored value, never a request
+            # body, so the flag cannot be changed after the fact by re-quoting.
+            "deviceWorking": True if unique.device_working is None else bool(unique.device_working),
             "registrationStatus": "unassigned"
         }
 

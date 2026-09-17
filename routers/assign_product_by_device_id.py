@@ -33,6 +33,7 @@ error_log_collection = db["Error_Log_ProductAssignment"]
                     "purchase_date": "2025-05-01",
                     "gtee": 12,
                     "currency": "GBP",
+                    "device_working": True,
                 },
                 "Products": [
                     {
@@ -91,8 +92,8 @@ def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
 
     This is the convenience wrapper around `POST /product_assignment`: instead of assembling the
     assignment inputs yourself, pass a `device_id` and they are read off the stored device —
-    `client`, `source`, `locale`, `currency`, category, price, purchase date, and the longer of
-    the labour/parts guarantee.
+    `client`, `source`, `locale`, `currency`, category, price, purchase date, whether it was
+    registered in working order, and the longer of the labour/parts guarantee.
 
     The result is **flattened**: the underlying assignment returns each product with a list of
     cover terms, and this endpoint expands that into one entry per `product_id` × `poc`
@@ -148,6 +149,12 @@ def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
         if not currency or not currency.strip():
             raise HTTPException(status_code=400, detail="Device 'currency' is missing or blank.")
 
+        # Devices registered before this field existed have no `deviceWorking`, and they were
+        # all registered through journeys that sell cover for a working device, so absent
+        # reads as working rather than unknown.
+        device_working = device.get("registrationParameters", {}).get("deviceWorking")
+        device_working = True if device_working is None else bool(device_working)
+
     except KeyError as e:
         raise HTTPException(status_code=400, detail=f"Missing required field: {str(e)}")
     except Exception as e:
@@ -162,7 +169,8 @@ def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
         locale=locale,
         purchase_date=purchase_date,
         gtee=gtee,
-        currency=currency
+        currency=currency,
+        device_working=device_working
     )
 
     # 4. Call the assignment logic

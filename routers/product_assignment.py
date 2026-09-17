@@ -170,6 +170,13 @@ def when_failure_reasons(rule: Dict[str, Any], payload, age_in_months: int) -> L
             f"[{price.get('min', 0)}, {price.get('max', 'any')}]"
         )
 
+    # Presence is the test, not truthiness: `deviceWorking: false` is a rule that only wants
+    # broken devices, and `or {}` style defaulting would read it as "any" and hand repair
+    # products to every working device the rule otherwise covers.
+    working = when.get("deviceWorking")
+    if working is not None and bool(working) != bool(payload.device_working):
+        reasons.append(f"deviceWorking {payload.device_working} != {bool(working)}")
+
     return reasons
 
 
@@ -284,8 +291,8 @@ def log_and_raise_error(error_type, error_detail, payload, status=404):
 class ProductAssignmentRequest(BaseModel):
     """The facts about a device that decide which cover products it qualifies for.
 
-    **Every field is mandatory**, and beyond mere presence the endpoint rejects blank strings
-    and — for `price` and `gtee` — the value `0`, with `422`.
+    **Every field is mandatory except `device_working`**, and beyond mere presence the endpoint
+    rejects blank strings and — for `price` and `gtee` — the value `0`, with `422`.
     """
 
     client: str = Field(
@@ -340,6 +347,17 @@ class ProductAssignmentRequest(BaseModel):
         description="**Mandatory.** Exactly three upper-case letters (ISO 4217), e.g. `GBP`.",
         examples=["GBP"],
     )
+    device_working: bool = Field(
+        True,
+        description=(
+            "Whether the device is in working order. Optional, and `true` when omitted, so a "
+            "rule that says nothing about it behaves exactly as it did before this field "
+            "existed. A rule that sets `when.deviceWorking` is only considered for devices in "
+            "that state — which is how a broken device reaches repair products rather than "
+            "cover."
+        ),
+        examples=[True],
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -352,6 +370,7 @@ class ProductAssignmentRequest(BaseModel):
                 "purchase_date": "2025-05-01",
                 "gtee": 12,
                 "currency": "GBP",
+                "device_working": True,
             }
         }
     }
@@ -488,7 +507,8 @@ def product_assignment(payload: ProductAssignmentRequest, _: None = Depends(veri
        sector *Home Appliances* also covers a Dishwasher without naming it. A level with an
        empty list is not tested.
     2. **`when`** accepts the `locale`, the `currency`, the `gtee`, the derived
-       `age_in_months` and the `price`. An empty list means "any".
+       `age_in_months`, the `price` and — where the rule sets it — `deviceWorking`. An empty
+       list means "any", as does an absent `deviceWorking`.
 
     When several rules match, the winner is the one with the highest `priority`; ties go to
     the rule that named the category most precisely (category beats group beats sector), and
