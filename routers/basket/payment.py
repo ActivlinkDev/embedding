@@ -1,7 +1,7 @@
 from .currency import basket_currency
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import AliasChoices, BaseModel, Field, EmailStr
-from typing import Optional, Dict, Any, List
+from typing import Literal, Optional, Dict, Any, List
 from bson import ObjectId
 import os
 
@@ -69,6 +69,16 @@ class BasketPaymentRequest(BaseModel):
         None,
         description="Where Stripe sends the customer if they abandon checkout.",
         examples=["https://shop.example.com/cover/cancel"],
+    )
+    checkout_channel: Optional[Literal["basket", "apple_pay"]] = Field(
+        None,
+        description=(
+            "How the customer reached checkout: `basket` (the default — basket page after phone "
+            "validation) or `apple_pay` (express purchase from the offer page, which skips "
+            "validation because the wallet supplies the customer's details). Recorded in the "
+            "Stripe metadata for reconciliation; it does not change the amount or mode."
+        ),
+        examples=["apple_pay"],
     )
 
     model_config = {
@@ -287,6 +297,7 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
             "client": _extract_client(items),
             "source": _extract_source(items),
             "service_request_ids": _extract_service_request_ids(items),
+            "checkout_channel": req.checkout_channel or "basket",
         },
         customer_email=req.email if req.email else None,
         customer_phone=req.customer_phone if req.customer_phone else None,
