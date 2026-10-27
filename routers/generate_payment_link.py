@@ -116,9 +116,13 @@ class CheckoutSessionRequest(BaseModel):
         examples=["quote-68a1c2d3e4b21d0f8c9e7712"],
     )
     payment_method_types: Optional[List[str]] = Field(
-        default=["card"],
-        description="Stripe payment method types to offer. Defaults to card only.",
-        examples=[["card"]],
+        default=None,
+        description=(
+            "Leave unset. Stripe now manages payment methods from the Dashboard (dynamic payment "
+            "methods) and rejects sessions that list them; when unset, the session offers whatever "
+            "the account has enabled — card, Apple Pay, Google Pay and so on. Only sent when given."
+        ),
+        examples=[None],
     )
     mode: ModeEnum = Field(
         ...,
@@ -291,7 +295,6 @@ def generate_checkout_session(request: CheckoutSessionRequest):
     """
     try:
         session_params = {
-            "payment_method_types": request.payment_method_types or ["card"],
             "line_items": build_line_items(request),
             "mode": request.mode.value,  # Enum to string
             "allow_promotion_codes": request.allow_promotion_codes,
@@ -301,6 +304,10 @@ def generate_checkout_session(request: CheckoutSessionRequest):
             "metadata": {**(request.metadata or {}), "internal_reference": request.internal_reference},
             "locale": request.locale if request.locale else None
         }
+        # Stripe rejects `payment_method_types` on this account ("Payment methods are now
+        # managed from your Dashboard settings"), so it is only sent when a caller asks for it.
+        if request.payment_method_types:
+            session_params["payment_method_types"] = request.payment_method_types
         customer_phone = (request.customer_phone or "").strip()
         if customer_phone:
             try:
