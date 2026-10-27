@@ -1,8 +1,8 @@
-"""A link-shortener failure must not fail a checkout.
+"""Checkout session creation.
 
-`generate_checkout_session` creates the Stripe session first and shortens its URL
-second. The short link is only an SMS convenience, so when TinyURL is down or its key
-is rejected the customer should still get the Stripe URL rather than an error.
+A link-shortener failure must not fail a checkout (the short link is only an SMS
+convenience), and `payment_method_types` is only sent to Stripe when a caller sets
+it: Stripe rejects it on accounts with Dashboard-managed payment methods.
 """
 
 from types import SimpleNamespace
@@ -68,3 +68,35 @@ def test_a_stripe_rejection_still_fails(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         gpl.generate_checkout_session(_request())
     assert exc.value.status_code == 400
+
+
+def test_payment_method_types_is_not_sent_by_default(monkeypatch):
+    # Stripe now rejects `payment_method_types` on accounts using Dashboard-managed
+    # (dynamic) payment methods, which failed every checkout. Leave it out unless asked.
+    seen = {}
+
+    def create(**params):
+        seen.update(params)
+        return SimpleNamespace(url="https://checkout.stripe.com/c/pay/cs_test_2", id="cs_test_2",
+                               expires_at=1, status="open", customer=None)
+    monkeypatch.setattr(gpl.stripe.checkout.Session, "create", create)
+    monkeypatch.setattr(gpl, "shorten_with_tinyurl", lambda _url: "https://tinyurl.com/x")
+
+    gpl.generate_checkout_session(_request())
+    assert "payment_method_types" not in seen
+
+
+def test_payment_method_types_is_sent_when_a_caller_sets_it(monkeypatch):
+    seen = {}
+
+    def create(**params):
+        seen.update(params)
+        return SimpleNamespace(url="https://checkout.stripe.com/c/pay/cs_test_3", id="cs_test_3",
+                               expires_at=1, status="open", customer=None)
+    monkeypatch.setattr(gpl.stripe.checkout.Session, "create", create)
+    monkeypatch.setattr(gpl, "shorten_with_tinyurl", lambda _url: "https://tinyurl.com/x")
+
+    req = _request()
+    req.payment_method_types = ["card"]
+    gpl.generate_checkout_session(req)
+    assert seen["payment_method_types"] == ["card"]
