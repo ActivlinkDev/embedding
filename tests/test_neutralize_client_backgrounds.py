@@ -96,6 +96,34 @@ def test_already_neutral_values_are_skipped_whatever_their_case_or_spacing():
 def test_missing_styles_gets_the_full_set_and_non_object_styles_is_skipped():
     assert len(script.plan_client({"ClientKey": "X"})) == len(NEUTRAL)
     assert script.plan_client({"ClientKey": "X", "Styles": "oops"}) == []
+    # MongoDB cannot $set Styles.<field> beneath an explicit null, so it is skipped too.
+    assert script.plan_client({"ClientKey": "X", "Styles": None}) == []
+
+
+def test_apply_skips_null_styles_and_still_updates_the_rest(monkeypatch, tmp_path):
+    null_client = {"_id": "z1", "ClientKey": "NULLSTYLES", "Styles": None}
+    col = FakeCollection([null_client, AO])
+    monkeypatch.setattr(script, "_connect", lambda db: col)
+    assert script.run_neutralize(_args(apply=True, backup_dir=str(tmp_path))) == 0
+    assert [flt["ClientKey"] for flt, _ in col.updates] == ["AO12345"]
+    assert col.find_one({"ClientKey": "NULLSTYLES"})["Styles"] is None
+
+
+def test_a_second_run_never_overwrites_an_earlier_backup(monkeypatch, tmp_path):
+    # Force both runs onto the same timestamp, as two runs in one instant would get.
+    monkeypatch.setattr(script, "_backup_stamp", lambda: "20261027T000000000000Z")
+    other = {"_id": "o1", "ClientKey": "OTHER", "Styles": {"CardBackground": "#000000"}}
+    col = FakeCollection([AO, other])
+    monkeypatch.setattr(script, "_connect", lambda db: col)
+    assert script.run_neutralize(_args(apply=True, client_key=["AO12345"], backup_dir=str(tmp_path))) == 0
+    assert script.run_neutralize(_args(apply=True, client_key=["OTHER"], backup_dir=str(tmp_path))) == 0
+
+    saved = sorted(
+        c["ClientKey"]
+        for f in tmp_path.glob("client_styles_*.json")
+        for c in json.loads(f.read_text())["clients"]
+    )
+    assert saved == ["AO12345", "OTHER"]
 
 
 def test_dry_run_writes_nothing(monkeypatch, tmp_path):

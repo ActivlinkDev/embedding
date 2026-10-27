@@ -99,14 +99,15 @@ def _same_colour(a: Any, b: Any) -> bool:
 def plan_client(doc: dict, only_existing: bool = False) -> list[tuple[str, Any, str]]:
     """The writes one client needs, as `(field, current, proposed)`. Pure; touches no database.
 
-    A document whose `Styles` is missing gets the full set (written as
+    A document with no `Styles` field gets the full set (written as
     `Styles.<field>`, which creates the object). One whose `Styles` is present
-    but not an object is skipped — writing into it would fail — and is
-    reported by the caller.
+    but not an object — including an explicit null, which MongoDB cannot
+    `$set` a dotted path beneath — is skipped and reported by the caller.
     """
-    styles = doc.get("Styles")
-    if styles is None:
-        styles = {}
+    if "Styles" not in doc:
+        styles: Any = {}
+    else:
+        styles = doc["Styles"]
     if not isinstance(styles, dict):
         return []
     changes: list[tuple[str, Any, str]] = []
@@ -142,6 +143,27 @@ def _describe(value: Any) -> str:
     return "(unset)" if value is None else repr(value)
 
 
+def _backup_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def _create_backup_file(backup_dir: Path, stamp: str):
+    """Open a new backup file for writing, never an existing one.
+
+    Two runs in the same instant would otherwise share a name, and the second
+    would truncate the first run's backup — losing the only copy of the
+    styles it changed.
+    """
+    for attempt in range(1000):
+        suffix = f"_{attempt}" if attempt else ""
+        path = backup_dir / f"client_styles_{stamp}{suffix}.json"
+        try:
+            return open(path, "x", encoding="utf-8"), path
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"could not find a free backup filename in {backup_dir}")
+
+
 def _connect(db_name: str):
     from utils.mongo import require_db
 
@@ -163,8 +185,9 @@ def run_neutralize(args: argparse.Namespace) -> int:
     planned: list[tuple[dict, list[tuple[str, Any, str]]]] = []
     for doc in sorted(docs, key=lambda d: str(d.get("ClientKey"))):
         key = doc.get("ClientKey") or f"<no ClientKey, _id {doc.get('_id')}>"
-        if doc.get("Styles") is not None and not isinstance(doc.get("Styles"), dict):
-            print(f"! {key}: Styles is a {type(doc['Styles']).__name__}, not an object — skipped")
+        if "Styles" in doc and not isinstance(doc["Styles"], dict):
+            kind = "null" if doc["Styles"] is None else f"a {type(doc['Styles']).__name__}"
+            print(f"! {key}: Styles is {kind}, not an object — skipped")
             continue
         changes = plan_client(doc, only_existing=args.only_existing)
         if not changes:
@@ -185,14 +208,15 @@ def run_neutralize(args: argparse.Namespace) -> int:
 
     backup_dir = Path(args.backup_dir)
     backup_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup_path = backup_dir / f"client_styles_{stamp}.json"
+    stamp = _backup_stamp()
     backup = [
         {"_id": str(doc["_id"]), "ClientKey": doc.get("ClientKey"), "Styles": doc.get("Styles")}
         for doc, _ in planned
     ]
     # Written and flushed before the first update; if this fails the run stops here.
-    with open(backup_path, "w", encoding="utf-8") as fh:
+    # Created exclusively, so a second run cannot overwrite an earlier run's backup.
+    fh, backup_path = _create_backup_file(backup_dir, stamp)
+    with fh:
         json.dump({"taken_at": stamp, "db": args.db, "clients": backup}, fh, indent=2, default=str)
         fh.flush()
         os.fsync(fh.fileno())
