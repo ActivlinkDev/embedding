@@ -123,6 +123,17 @@ class UniqueParametersModel(BaseModel):
         description="Your own reference for this registration (order number, line id, …).",
         examples=["ORD-2026-00918"],
     )
+    device_working: Optional[bool] = Field(
+        None,
+        description=(
+            "Whether the unit is in working order at registration. Omitted or `null` means "
+            "working, so only a device registered already faulty — a repair booking, say — "
+            "needs to send `false`. Stored as `registrationParameters.deviceWorking` and "
+            "matched against each assignment rule's `when.deviceWorking`, which is what lets "
+            "a faulty device be offered different products."
+        ),
+        examples=[True],
+    )
 
 
 class DeviceModel(BaseModel):
@@ -208,6 +219,7 @@ class SimpleRegisterRequest(BaseModel):
                             "purchase_date": "2025-05-01",
                             "price": 449.99,
                             "client_ref": "ORD-2026-00918",
+                            "device_working": True,
                         },
                     }
                 ],
@@ -503,7 +515,11 @@ def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_tok
             "price": price,
             "currency": locale_doc.get("currency", ""),   # currency comes from Locale_Params
             "clientRef": unique.client_ref or "",
-            "registrationStatus": "unassigned"
+            "registrationStatus": "unassigned",
+            # Stored even when unstated, so a later read can tell "nobody said" from
+            # "said working" — both assign the same products, but only one of them is
+            # an answer the customer actually gave.
+            "deviceWorking": unique.device_working,
         }
 
         matched_status = "matched" if resolved else "no match"

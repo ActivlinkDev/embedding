@@ -1,11 +1,12 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from bson import ObjectId
 import os
 from datetime import datetime
+from typing import Optional
 
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
-from .product_assignment import assign_products, ProductAssignmentRequest
+from .product_assignment import assign_products, coerce_device_working, ProductAssignmentRequest
 from utils.mongo import require_client
 
 router = APIRouter(tags=["Assignments"])
@@ -33,6 +34,7 @@ error_log_collection = db["Error_Log_ProductAssignment"]
                     "purchase_date": "2025-05-01",
                     "gtee": 12,
                     "currency": "GBP",
+                    "device_working": True,
                 },
                 "Products": [
                     {
@@ -85,7 +87,20 @@ error_log_collection = db["Error_Log_ProductAssignment"]
         500: error("The device document is malformed in a way this endpoint cannot recover from.", "Device document missing required fields: ..."),
     }),
 )
-def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
+def assign_product_for_device(
+    device_id: str,
+    device_working: Optional[bool] = Query(
+        None,
+        description=(
+            "Override the device's stored `deviceWorking` for this call. Use it when the "
+            "device has broken since it was registered — a repair booking, say — so the "
+            "faulty-device rules are matched without the stored device being rewritten. "
+            "Omitted, the stored value is used, and that in turn reads as working when it "
+            "is unset."
+        ),
+    ),
+    _: None = Depends(verify_token),
+):
     """
     Work out which cover products a **already-registered** device qualifies for.
 
@@ -101,6 +116,11 @@ def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
 
     Path parameter `device_id` is mandatory. Defaults applied while reading the device:
     a missing `purchaseDate` becomes today, and a missing/​unparseable guarantee becomes `0`.
+
+    The device's stored `registrationParameters.deviceWorking` is passed to the assignment as
+    `device_working`, so a device registered as faulty matches the client's faulty-device
+    rules. Pass `?device_working=false` to override it for a device that has broken since it
+    was registered; unset in both places reads as working.
     """
     # 1. Lookup device by ObjectId
     try:
@@ -148,6 +168,13 @@ def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
         if not currency or not currency.strip():
             raise HTTPException(status_code=400, detail="Device 'currency' is missing or blank.")
 
+        # The caller knows the device's condition now; the stored value only knows what it
+        # was at registration. Neither one stated means working — see ProductAssignmentRequest.
+        if device_working is None:
+            device_working = coerce_device_working(
+                device.get("registrationParameters", {}).get("deviceWorking")
+            )
+
     except KeyError as e:
         raise HTTPException(status_code=400, detail=f"Missing required field: {str(e)}")
     except Exception as e:
@@ -162,7 +189,8 @@ def assign_product_for_device(device_id: str, _: None = Depends(verify_token)):
         locale=locale,
         purchase_date=purchase_date,
         gtee=gtee,
-        currency=currency
+        currency=currency,
+        device_working=device_working,
     )
 
     # 4. Call the assignment logic

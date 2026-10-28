@@ -33,9 +33,25 @@ class EmbeddedQuoteRequest(BaseModel):
         examples=["acme_uk_live"],
     )
 
+    device_working: Optional[bool] = Field(
+        None,
+        description=(
+            "Whether the device is in working order right now. Omitted or `null` falls back "
+            "to the device's stored `registrationParameters.deviceWorking`, and that in turn "
+            "reads as working when it is unset — so only a faulty device has to say so. "
+            "`false` matches the client's `when.deviceWorking: false` assignment rules, which "
+            "is how a broken device is offered repair cover rather than a warranty."
+        ),
+        examples=[True],
+    )
+
     model_config = {
         "json_schema_extra": {
-            "example": {"device_id": "6820f1c9a4b21d0f8c9e4471", "clientKey": "acme_uk_live"}
+            "example": {
+                "device_id": "6820f1c9a4b21d0f8c9e4471",
+                "clientKey": "acme_uk_live",
+                "device_working": True,
+            }
         }
     }
 
@@ -96,13 +112,15 @@ async def embedded_quote(payload: EmbeddedQuoteRequest, _: None = Depends(verify
     returns `400`. Unlike `/rate_request`, which reports per-line failures inside a `200`, this
     endpoint has nothing to return if assignment itself fails.
 
-    Only `device_id` is mandatory.
+    Only `device_id` is mandatory. `device_working` is the one input the stored device may not
+    know: send `false` when the customer is quoting a device that is already broken, and the
+    assignment matches the client's faulty-device rules instead of the working-device ones.
     """
     device_id = payload.device_id
 
     # 1) Run product assignment for the device (this will raise HTTPException on failure)
     try:
-        assignment_result = assign_product_for_device(device_id)
+        assignment_result = assign_product_for_device(device_id, device_working=payload.device_working)
     except HTTPException:
         # Re-raise to propagate proper status
         raise
