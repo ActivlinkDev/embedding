@@ -116,9 +116,13 @@ class CheckoutSessionRequest(BaseModel):
         examples=["quote-68a1c2d3e4b21d0f8c9e7712"],
     )
     payment_method_types: Optional[List[str]] = Field(
-        default=["card"],
-        description="Stripe payment method types to offer. Defaults to card only.",
-        examples=[["card"]],
+        default=None,
+        description=(
+            "Leave unset. Stripe now manages payment methods from the Dashboard (dynamic payment "
+            "methods) and rejects sessions that list them; when unset, the session offers whatever "
+            "the account has enabled — card, Apple Pay, Google Pay and so on. Only sent when given."
+        ),
+        examples=[None],
     )
     mode: ModeEnum = Field(
         ...,
@@ -245,7 +249,7 @@ def shorten_with_tinyurl(long_url: str) -> str:
     response_description="The checkout URL, a shortened link, the session id, and pre-fill diagnostics.",
     responses={
         200: json_response(
-            "The session was created and the link shortened.",
+            "The session was created. `checkout_url_short` is the TinyURL link, or the full Stripe URL if shortening failed.",
             {
                 "checkout_url": "https://checkout.stripe.com/c/pay/cs_test_a1B2c3D4e5F6",
                 "checkout_url_short": "https://tinyurl.com/2p8kd4xr",
@@ -258,8 +262,7 @@ def shorten_with_tinyurl(long_url: str) -> str:
             },
         ),
         400: error("Stripe rejected the session — bad currency, amount, or URL.", "Stripe error: Invalid currency: xyz"),
-        500: error("The session could not be created, or the link shortener failed.", "TinyURL API error: ..."),
-        502: error("TinyURL accepted the request but returned no shortened URL.", "No shortened URL returned from TinyURL"),
+        500: error("The session could not be created.", "Error creating Stripe checkout session: ..."),
     },
 )
 def generate_checkout_session(request: CheckoutSessionRequest):
@@ -287,11 +290,11 @@ def generate_checkout_session(request: CheckoutSessionRequest):
     browser. To create a link from a stored quote instead, use `POST /generate_payment_link`.
 
     Both a full `checkout_url` and a shortened `checkout_url_short` (via TinyURL) are returned;
-    the short form is the one to put in an SMS.
+    the short form is the one to put in an SMS. If TinyURL fails, `checkout_url_short` is the
+    full Stripe URL instead, so a shortener outage never blocks checkout.
     """
     try:
         session_params = {
-            "payment_method_types": request.payment_method_types or ["card"],
             "line_items": build_line_items(request),
             "mode": request.mode.value,  # Enum to string
             "allow_promotion_codes": request.allow_promotion_codes,
@@ -301,6 +304,10 @@ def generate_checkout_session(request: CheckoutSessionRequest):
             "metadata": {**(request.metadata or {}), "internal_reference": request.internal_reference},
             "locale": request.locale if request.locale else None
         }
+        # Stripe rejects `payment_method_types` on this account ("Payment methods are now
+        # managed from your Dashboard settings"), so it is only sent when a caller asks for it.
+        if request.payment_method_types:
+            session_params["payment_method_types"] = request.payment_method_types
         customer_phone = (request.customer_phone or "").strip()
         if customer_phone:
             try:
@@ -325,7 +332,17 @@ def generate_checkout_session(request: CheckoutSessionRequest):
 
         session = stripe.checkout.Session.create(**session_params)
         checkout_url = session.url
-        short_url = shorten_with_tinyurl(checkout_url)
+        # The short link is a convenience for SMS. The session already exists, so a
+        # shortener failure (bad key, quota, outage) must not fail the checkout: fall
+        # back to Stripe's own URL, which works everywhere the short one would.
+        try:
+            short_url = shorten_with_tinyurl(checkout_url)
+        except Exception as e:
+            logger.warning(
+                "checkout: TinyURL shortening failed (ref=%s), returning the Stripe URL instead: %s",
+                request.internal_reference, getattr(e, "detail", e),
+            )
+            short_url = checkout_url
         return {
             "checkout_url": checkout_url,
             "checkout_url_short": short_url,
@@ -338,6 +355,10 @@ def generate_checkout_session(request: CheckoutSessionRequest):
             "prefill_email": str(request.customer_email) if request.customer_email else None,
         }
     except stripe.error.StripeError as se:
+        # Logged as well as returned: callers show customers a generic message, so the
+        # log is the only place the reason survives.
+        logger.error("checkout: Stripe rejected the session (ref=%s): %s", request.internal_reference, se)
         raise HTTPException(status_code=400, detail=f"Stripe error: {se.user_message or str(se)}")
     except Exception as e:
+        logger.exception("checkout: session creation failed (ref=%s)", request.internal_reference)
         raise HTTPException(status_code=500, detail=f"Error creating Stripe checkout session: {str(e)}")
