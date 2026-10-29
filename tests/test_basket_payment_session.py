@@ -5,7 +5,6 @@ payment it is the page, not Stripe, that navigates there. It must not become a w
 arbitrary Stripe sessions, so only sessions created for a basket are answered.
 """
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,12 +13,17 @@ from fastapi import HTTPException
 from routers.basket import payment
 
 
+def _session(**fields):
+    """A real Stripe Session, not a dict: current stripe-python objects have no `.get`."""
+    return payment.stripe.checkout.Session.construct_from(fields, "sk_test")
+
+
 def _retrieve_returning(monkeypatch, session):
     monkeypatch.setattr(payment.stripe.checkout.Session, "retrieve", lambda _id: session)
 
 
 def test_a_paid_basket_session_reports_paid(monkeypatch):
-    _retrieve_returning(monkeypatch, SimpleNamespace(
+    _retrieve_returning(monkeypatch, _session(
         id="cs_test_1", status="complete", payment_status="paid",
         metadata={"basket_id": "68b2d1f0a4b21d0f8c9e8801", "client": "acme"}))
     out = payment.get_basket_payment_session("cs_test_1", scope=None)
@@ -28,7 +32,7 @@ def test_a_paid_basket_session_reports_paid(monkeypatch):
 
 
 def test_a_session_not_made_for_a_basket_is_not_found(monkeypatch):
-    _retrieve_returning(monkeypatch, SimpleNamespace(
+    _retrieve_returning(monkeypatch, _session(
         id="cs_test_2", status="complete", payment_status="paid", metadata={}))
     with pytest.raises(HTTPException) as exc:
         payment.get_basket_payment_session("cs_test_2", scope=None)
@@ -57,7 +61,7 @@ BASKET_ID = "68b2d1f0a4b21d0f8c9e8801"
 
 
 def _owned_by(monkeypatch, client):
-    _retrieve_returning(monkeypatch, SimpleNamespace(
+    _retrieve_returning(monkeypatch, _session(
         id="cs_test_5", status="complete", payment_status="paid",
         # The metadata claims acme; ownership must come from the stored basket regardless.
         metadata={"basket_id": BASKET_ID, "client": "acme"}))
