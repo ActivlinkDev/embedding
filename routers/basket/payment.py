@@ -358,8 +358,10 @@ def get_basket_payment_session(
         raise HTTPException(status_code=404, detail="Session not found")
     except stripe.error.StripeError as e:
         raise HTTPException(status_code=502, detail=f"Stripe error: {e.user_message or str(e)}")
-    metadata = getattr(session, "metadata", None) or {}
-    basket_id = metadata.get("basket_id") if hasattr(metadata, "get") else None
+    # Stripe objects are not dicts in current stripe-python (no `.get`), so read the
+    # metadata key as an attribute.
+    metadata = getattr(session, "metadata", None)
+    basket_id = getattr(metadata, "basket_id", None) if metadata is not None else None
     if not basket_id:
         raise HTTPException(status_code=404, detail="Session not found")
     if scope:
