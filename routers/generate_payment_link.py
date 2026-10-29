@@ -220,27 +220,29 @@ def _resolve_stripe_customer_id(email: Optional[str], phone: str) -> str:
         except stripe.error.StripeError:
             customer = None
     if customer is not None:
+        # Stripe objects are not dicts in current stripe-python (`.get` raises), so read
+        # fields as attributes.
         updates = {}
-        if customer.get("phone") != phone:
+        if getattr(customer, "phone", None) != phone:
             updates["phone"] = phone
-        if email and customer.get("email") != email:
+        if email and getattr(customer, "email", None) != email:
             updates["email"] = email
         if updates:
-            customer = stripe.Customer.modify(customer["id"], **updates)
+            customer = stripe.Customer.modify(customer.id, **updates)
         logger.info(
             "checkout prefill: reusing customer %s (phone=%s, email=%s)",
-            customer["id"], customer.get("phone"), customer.get("email"),
+            customer.id, getattr(customer, "phone", None), getattr(customer, "email", None),
         )
-        return customer["id"]
+        return customer.id
     create_params = {"phone": phone}
     if email:
         create_params["email"] = email
     created = stripe.Customer.create(**create_params)
     logger.info(
         "checkout prefill: created customer %s (phone=%s, email=%s)",
-        created["id"], created.get("phone"), created.get("email"),
+        created.id, getattr(created, "phone", None), getattr(created, "email", None),
     )
-    return created["id"]
+    return created.id
 
 def _with_session_id(url: str) -> str:
     """`url` with Stripe's session-id placeholder added as a query parameter."""
