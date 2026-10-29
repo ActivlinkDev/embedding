@@ -6,12 +6,14 @@ from bson import ObjectId
 import os
 
 from utils.api_docs import error, json_response, secured
-from utils.dependencies import verify_token
+from utils.dependencies import caller_client_key, verify_token
 from routers.generate_payment_link import (
     generate_checkout_session,
     CheckoutSessionRequest,
     ModeEnum,
+    UiModeEnum,
 )
+import stripe
 from utils.mongo import require_client
 
 router = APIRouter(tags=["Basket"])
@@ -69,6 +71,15 @@ class BasketPaymentRequest(BaseModel):
         None,
         description="Where Stripe sends the customer if they abandon checkout.",
         examples=["https://shop.example.com/cover/cancel"],
+    )
+    ui_mode: UiModeEnum = Field(
+        UiModeEnum.hosted_page,
+        description=(
+            "`hosted_page` (default) returns `checkout_url` to redirect to. `elements` returns "
+            "`client_secret` for paying on the caller's page with Stripe Elements; the customer is "
+            "only sent to `success_url` when their payment method needs a redirect."
+        ),
+        examples=["elements"],
     )
 
     model_config = {
@@ -290,6 +301,7 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
         },
         customer_email=req.email if req.email else None,
         customer_phone=req.customer_phone if req.customer_phone else None,
+        ui_mode=req.ui_mode,
     )
 
     # 5) Create session via shared helper
@@ -297,3 +309,70 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
         return generate_checkout_session(req_checkout)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal error during Stripe session creation: {e}")
+
+
+@router.get(
+    "/basket/payment/session/{session_id}",
+    summary="Read whether a basket's Stripe checkout session has been paid",
+    response_description="The session's status and payment status, and the basket it charged.",
+    responses=secured({
+        200: json_response(
+            "The session was found.",
+            {
+                "session_id": "cs_test_a1B2c3D4e5F6",
+                "status": "complete",
+                "payment_status": "paid",
+                "basket_id": "68b2d1f0a4b21d0f8c9e8801",
+            },
+        ),
+        400: error("`session_id` is not a Checkout Session id.", "Invalid session_id"),
+        404: error("No session with this id, or it was not created for a basket.", "Session not found"),
+    }),
+)
+def get_basket_payment_session(
+    session_id: str,
+    _: None = Depends(verify_token),
+    scope: Optional[str] = Depends(caller_client_key),
+):
+    """
+    What the confirmation page checks before telling a customer they have paid.
+
+    With in-page payment (`ui_mode: elements`) the page navigates to its success screen itself,
+    so reaching that screen no longer proves Stripe took the money. `payment_status` is `paid`
+    once it has; `unpaid` with `status: complete` means a delayed payment method is still
+    settling. Contract issuance still runs from the `checkout.session.completed` webhook, not
+    from this read.
+
+    Only sessions created for a basket are returned, and only the fields above.
+
+    **Tenant-scoped.** Every tenant's sessions live in the one Stripe account, so a caller pinned
+    to a ClientKey only sees sessions whose basket belongs to that client; anything else returns
+    `404` rather than `403`, so a pinned caller cannot discover that another tenant's session
+    exists. Ownership is read from the stored basket, not from the session's own metadata.
+    """
+    if not session_id.startswith("cs_"):
+        raise HTTPException(status_code=400, detail="Invalid session_id")
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+    except stripe.error.InvalidRequestError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {e.user_message or str(e)}")
+    metadata = getattr(session, "metadata", None) or {}
+    basket_id = metadata.get("basket_id") if hasattr(metadata, "get") else None
+    if not basket_id:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if scope:
+        try:
+            basket = basket_collection.find_one({"_id": ObjectId(str(basket_id))}, {"Basket.client": 1})
+        except Exception:
+            basket = None
+        # A basket with no owner on its lines does not belong to a pinned caller either.
+        if not basket or _extract_client(basket.get("Basket", []) or []) != scope:
+            raise HTTPException(status_code=404, detail="Session not found")
+    return {
+        "session_id": session.id,
+        "status": session.status,
+        "payment_status": session.payment_status,
+        "basket_id": str(basket_id),
+    }
