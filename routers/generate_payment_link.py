@@ -23,6 +23,13 @@ class ModeEnum(str, Enum):
     payment = "payment"
     subscription = "subscription"
 
+class UiModeEnum(str, Enum):
+    """`hosted_page` sends the customer to checkout.stripe.com; `elements` returns a
+    `client_secret` for Stripe Elements to take payment on the caller's own page."""
+
+    hosted_page = "hosted_page"
+    elements = "elements"
+
 class CheckoutSessionRequest(BaseModel):
     """Everything needed to build a Stripe Checkout Session.
 
@@ -139,6 +146,16 @@ class CheckoutSessionRequest(BaseModel):
         description="Stripe Checkout display language, e.g. `en`, `fr`. Stripe auto-detects when omitted.",
         examples=["en"],
     )
+    ui_mode: UiModeEnum = Field(
+        default=UiModeEnum.hosted_page,
+        description=(
+            "`hosted_page` (default) returns a Checkout URL to redirect to. `elements` returns a "
+            "`client_secret` instead, for paying in place with Stripe Elements (Apple Pay sheet, "
+            "card form). With `elements`, Stripe returns the customer to `success_url` only when a "
+            "payment method needs a redirect, and `cancel_url` is not used."
+        ),
+        examples=["hosted_page"],
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -225,6 +242,11 @@ def _resolve_stripe_customer_id(email: Optional[str], phone: str) -> str:
     )
     return created["id"]
 
+def _with_session_id(url: str) -> str:
+    """`url` with Stripe's session-id placeholder added as a query parameter."""
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}session_id={{CHECKOUT_SESSION_ID}}"
+
 def shorten_with_tinyurl(long_url: str) -> str:
     headers = {
         "Authorization": f"Bearer {TINYURL_API_KEY}",
@@ -298,12 +320,19 @@ def generate_checkout_session(request: CheckoutSessionRequest):
             "line_items": build_line_items(request),
             "mode": request.mode.value,  # Enum to string
             "allow_promotion_codes": request.allow_promotion_codes,
-            "success_url": request.success_url + "?session_id={CHECKOUT_SESSION_ID}",
-            "cancel_url": request.cancel_url,
             "phone_number_collection": {"enabled": request.phone_number_collection},
             "metadata": {**(request.metadata or {}), "internal_reference": request.internal_reference},
             "locale": request.locale if request.locale else None
         }
+        if request.ui_mode == UiModeEnum.elements:
+            # Elements sessions have no success/cancel pages: the customer stays on the
+            # caller's page and only leaves (and comes back to return_url) for payment
+            # methods that need a redirect, such as some bank authentications.
+            session_params["ui_mode"] = "elements"
+            session_params["return_url"] = _with_session_id(request.success_url)
+        else:
+            session_params["success_url"] = _with_session_id(request.success_url)
+            session_params["cancel_url"] = request.cancel_url
         # Stripe rejects `payment_method_types` on this account ("Payment methods are now
         # managed from your Dashboard settings"), so it is only sent when a caller asks for it.
         if request.payment_method_types:
@@ -331,6 +360,17 @@ def generate_checkout_session(request: CheckoutSessionRequest):
             session_params["customer_email"] = request.customer_email
 
         session = stripe.checkout.Session.create(**session_params)
+        if request.ui_mode == UiModeEnum.elements:
+            # No URL to shorten or send anywhere: the page mounts Elements with the secret.
+            return {
+                "client_secret": session.client_secret,
+                "session_id": session.id,
+                "expires_at": session.expires_at,
+                "status": session.status,
+                "customer": getattr(session, "customer", None),
+                "prefill_phone": customer_phone or None,
+                "prefill_email": str(request.customer_email) if request.customer_email else None,
+            }
         checkout_url = session.url
         # The short link is a convenience for SMS. The session already exists, so a
         # shortener failure (bad key, quota, outage) must not fail the checkout: fall
