@@ -6,7 +6,7 @@ from bson import ObjectId
 import os
 
 from utils.api_docs import error, json_response, secured
-from utils.dependencies import verify_token
+from utils.dependencies import caller_client_key, verify_token
 from routers.generate_payment_link import (
     generate_checkout_session,
     CheckoutSessionRequest,
@@ -329,7 +329,11 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
         404: error("No session with this id, or it was not created for a basket.", "Session not found"),
     }),
 )
-def get_basket_payment_session(session_id: str, _: None = Depends(verify_token)):
+def get_basket_payment_session(
+    session_id: str,
+    _: None = Depends(verify_token),
+    scope: Optional[str] = Depends(caller_client_key),
+):
     """
     What the confirmation page checks before telling a customer they have paid.
 
@@ -340,6 +344,11 @@ def get_basket_payment_session(session_id: str, _: None = Depends(verify_token))
     from this read.
 
     Only sessions created for a basket are returned, and only the fields above.
+
+    **Tenant-scoped.** Every tenant's sessions live in the one Stripe account, so a caller pinned
+    to a ClientKey only sees sessions whose basket belongs to that client; anything else returns
+    `404` rather than `403`, so a pinned caller cannot discover that another tenant's session
+    exists. Ownership is read from the stored basket, not from the session's own metadata.
     """
     if not session_id.startswith("cs_"):
         raise HTTPException(status_code=400, detail="Invalid session_id")
@@ -353,6 +362,14 @@ def get_basket_payment_session(session_id: str, _: None = Depends(verify_token))
     basket_id = metadata.get("basket_id") if hasattr(metadata, "get") else None
     if not basket_id:
         raise HTTPException(status_code=404, detail="Session not found")
+    if scope:
+        try:
+            basket = basket_collection.find_one({"_id": ObjectId(str(basket_id))}, {"Basket.client": 1})
+        except Exception:
+            basket = None
+        # A basket with no owner on its lines does not belong to a pinned caller either.
+        if not basket or _extract_client(basket.get("Basket", []) or []) != scope:
+            raise HTTPException(status_code=404, detail="Session not found")
     return {
         "session_id": session.id,
         "status": session.status,
