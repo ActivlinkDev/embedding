@@ -90,3 +90,45 @@ def test_a_basket_with_no_owner_is_not_a_pinned_callers(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         payment.get_basket_payment_session("cs_test_5", scope="acme")
     assert exc.value.status_code == 404
+
+
+QUOTE_A = "6ae35e26d134320b5e6afc48"
+QUOTE_B = "6ae35e26d134320b5e6afc49"
+
+
+def _quoted(monkeypatch, quote_ids, owners):
+    """A basket whose lines carry only quote ids, as `POST /basket/add` stores them, with
+    `owners` mapping each quote id to the ClientKey its quote was stored under."""
+    _retrieve_returning(monkeypatch, SimpleNamespace(
+        id="cs_test_6", status="complete", payment_status="paid",
+        metadata={"basket_id": BASKET_ID, "client": ""}))
+    baskets = MagicMock()
+    baskets.find_one.return_value = {"Basket": [{"quote_id": q} for q in quote_ids]}
+    monkeypatch.setattr(payment, "basket_collection", baskets)
+    quotes = MagicMock()
+
+    def count(q):
+        ids = {str(i) for i in q["_id"]["$in"]}
+        return sum(1 for qid, owner in owners.items() if qid in ids and owner == q["clientKey"])
+
+    quotes.count_documents.side_effect = count
+    monkeypatch.setattr(payment, "quotes_collection", quotes)
+
+
+def test_a_pinned_caller_reads_a_session_for_a_basket_quoted_under_its_key(monkeypatch):
+    _quoted(monkeypatch, [QUOTE_A], {QUOTE_A: "AO12345"})
+    assert payment.get_basket_payment_session("cs_test_6", scope="AO12345")["payment_status"] == "paid"
+
+
+def test_a_basket_quoted_under_another_key_is_not_found(monkeypatch):
+    _quoted(monkeypatch, [QUOTE_A], {QUOTE_A: "OTHER999"})
+    with pytest.raises(HTTPException) as exc:
+        payment.get_basket_payment_session("cs_test_6", scope="AO12345")
+    assert exc.value.status_code == 404
+
+
+def test_a_basket_only_partly_quoted_under_the_key_is_not_found(monkeypatch):
+    _quoted(monkeypatch, [QUOTE_A, QUOTE_B], {QUOTE_A: "AO12345", QUOTE_B: "OTHER999"})
+    with pytest.raises(HTTPException) as exc:
+        payment.get_basket_payment_session("cs_test_6", scope="AO12345")
+    assert exc.value.status_code == 404

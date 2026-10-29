@@ -21,6 +21,7 @@ router = APIRouter(tags=["Basket"])
 client = require_client()
 db = client["Activlink"]
 basket_collection = db["Basket_Quotes"]
+quotes_collection = db["Quotes"]
 
 
 class BasketPaymentRequest(BaseModel):
@@ -114,6 +115,31 @@ def _extract_client(items: list[dict[str, Any]]) -> str:
         if c:
             return str(c)
     return ""
+
+
+def _basket_belongs_to(items: list[dict[str, Any]], client_key: str) -> bool:
+    """Whether every line of a basket was quoted for `client_key`.
+
+    Basket lines don't record the ClientKey (`client` on a line or the basket root is the
+    client id, e.g. `AO`, when it is set at all), but each line keeps the `quote_id` it was
+    priced from, and the quote stores its owner as `clientKey`. A line whose own `client`
+    already equals the key also counts. Any line that can't be tied to the key fails the
+    whole basket, so a pinned caller never reads a session for a basket it only partly owns.
+    """
+    if not items:
+        return False
+    quote_ids = set()
+    for it in items:
+        if str((it or {}).get("client") or "") == client_key:
+            continue
+        try:
+            quote_ids.add(ObjectId(str((it or {}).get("quote_id"))))
+        except Exception:
+            return False
+    if not quote_ids:
+        return True
+    owned = quotes_collection.count_documents({"_id": {"$in": list(quote_ids)}, "clientKey": client_key})
+    return owned == len(quote_ids)
 
 
 def _extract_service_request_ids(items: list[dict[str, Any]]) -> str:
@@ -364,11 +390,13 @@ def get_basket_payment_session(
         raise HTTPException(status_code=404, detail="Session not found")
     if scope:
         try:
-            basket = basket_collection.find_one({"_id": ObjectId(str(basket_id))}, {"Basket.client": 1})
+            basket = basket_collection.find_one(
+                {"_id": ObjectId(str(basket_id))}, {"Basket.client": 1, "Basket.quote_id": 1}
+            )
         except Exception:
             basket = None
         # A basket with no owner on its lines does not belong to a pinned caller either.
-        if not basket or _extract_client(basket.get("Basket", []) or []) != scope:
+        if not basket or not _basket_belongs_to(basket.get("Basket", []) or [], scope):
             raise HTTPException(status_code=404, detail="Session not found")
     return {
         "session_id": session.id,
