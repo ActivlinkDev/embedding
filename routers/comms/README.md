@@ -79,4 +79,5 @@ Each email item links to `/cloud/{token}`.
 - A link is bound to the sending tenant. Opened on another client's host, it returns 404.
 - The summary shows product and cover only.
 - Full details need a 6-digit code emailed to the link's address. The code lasts 10 minutes, allows 5 attempts, and at most 5 codes can be requested per hour. A correct code gives a 30-minute grant that the frontend keeps in an httpOnly cookie.
+- The frontend sends the token to the backend in the `X-Cloud-Token` header, so it stays out of backend access logs.
 - To revoke a link, set `revoked: true` on its `CloudLinks` row.

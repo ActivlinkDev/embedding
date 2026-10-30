@@ -3,10 +3,13 @@
 Called only by the trusted frontend, which resolves ``clientkey`` from the request host — never
 from the browser — and keeps the access grant in an httpOnly cookie.
 
-- ``GET /cloud/{token}``: non-personal summary (product, cover, dates, masked email).
-- ``POST /cloud/{token}/otp/request``: email a 6-digit code to the address the link was sent to.
-- ``POST /cloud/{token}/otp/verify``: exchange a correct code for a 30-minute grant.
-- ``GET /cloud/{token}/detail``: personal details, with ``X-Cloud-Grant``.
+- ``GET /cloud/summary``: non-personal summary (product, cover, dates, masked email).
+- ``POST /cloud/otp/request``: email a 6-digit code to the address the link was sent to.
+- ``POST /cloud/otp/verify``: exchange a correct code for a 30-minute grant.
+- ``GET /cloud/detail``: personal details, with ``X-Cloud-Grant``.
+
+The link token travels in the ``X-Cloud-Token`` header, not the path, so it stays out of
+access logs.
 
 Every route answers 404 for an unknown, revoked or other-tenant token, so a token opened on
 another client's storefront reveals nothing — not even that it exists.
@@ -30,6 +33,7 @@ cloud_links._secret()
 router = APIRouter(prefix="/cloud", tags=["Customers"])
 
 _CLIENTKEY = Query(..., description="**Mandatory.** The tenant, resolved by the frontend from the request host.")
+_TOKEN = Header(..., alias="X-Cloud-Token", description="**Mandatory.** The token from the email link.")
 
 
 def _link(token: str, clientkey: str) -> dict:
@@ -132,7 +136,7 @@ def _customer_name(customer_id) -> Optional[str]:
 
 
 @router.get(
-    "/{token}",
+    "/summary",
     summary="Non-personal summary of the record behind a confirmation-email link",
     responses=secured({
         200: json_response("The link is live for this tenant.", {
@@ -144,7 +148,7 @@ def _customer_name(customer_id) -> Optional[str]:
         404: error("Unknown, revoked or another tenant's link.", "Not found"),
     }),
 )
-def cloud_summary(token: str, clientkey: str = _CLIENTKEY, _: None = Depends(verify_token)):
+def cloud_summary(token: str = _TOKEN, clientkey: str = _CLIENTKEY, _: None = Depends(verify_token)):
     """The summary never includes names, contact details, identifiers or prices."""
     link = _link(token, clientkey)
     items = [summary for summary, _detail in _load(link)]
@@ -160,7 +164,7 @@ class OtpVerifyBody(BaseModel):
 
 
 @router.post(
-    "/{token}/otp/request",
+    "/otp/request",
     summary="Email a verification code for a Cloud ID link",
     responses=secured({
         200: json_response("A code was sent to the link's email address.", {"sent": True, "maskedEmail": "p***@g***.com"}),
@@ -170,7 +174,7 @@ class OtpVerifyBody(BaseModel):
         502: error("The email could not be sent.", "send_failed"),
     }),
 )
-async def cloud_otp_request(token: str, clientkey: str = _CLIENTKEY, _: None = Depends(verify_token)):
+async def cloud_otp_request(token: str = _TOKEN, clientkey: str = _CLIENTKEY, _: None = Depends(verify_token)):
     link = _link(token, clientkey)
     email = store.deliverable_email(link.get("email"))
     if not email:
@@ -186,7 +190,7 @@ async def cloud_otp_request(token: str, clientkey: str = _CLIENTKEY, _: None = D
 
 
 @router.post(
-    "/{token}/otp/verify",
+    "/otp/verify",
     summary="Exchange a verification code for a short-lived access grant",
     responses=secured({
         200: json_response("Correct code. Forward `grant` as `X-Cloud-Grant` until `expiresAt` (epoch seconds).",
@@ -196,7 +200,7 @@ async def cloud_otp_request(token: str, clientkey: str = _CLIENTKEY, _: None = D
         429: error("Five wrong attempts; request a new code.", "too_many_attempts"),
     }),
 )
-def cloud_otp_verify(token: str, body: OtpVerifyBody, clientkey: str = _CLIENTKEY,
+def cloud_otp_verify(body: OtpVerifyBody, token: str = _TOKEN, clientkey: str = _CLIENTKEY,
                      _: None = Depends(verify_token)):
     link = _link(token, clientkey)
     try:
@@ -208,7 +212,7 @@ def cloud_otp_verify(token: str, body: OtpVerifyBody, clientkey: str = _CLIENTKE
 
 
 @router.get(
-    "/{token}/detail",
+    "/detail",
     summary="Personal details behind a Cloud ID link (after email verification)",
     responses=secured({
         200: json_response("Identifiers are masked to their last four characters.", {
@@ -222,7 +226,7 @@ def cloud_otp_verify(token: str, body: OtpVerifyBody, clientkey: str = _CLIENTKE
         404: error("Unknown, revoked or another tenant's link.", "Not found"),
     }),
 )
-def cloud_detail(token: str, clientkey: str = _CLIENTKEY,
+def cloud_detail(token: str = _TOKEN, clientkey: str = _CLIENTKEY,
                  x_cloud_grant: Optional[str] = Header(None),
                  _: None = Depends(verify_token)):
     link = _link(token, clientkey)

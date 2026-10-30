@@ -25,7 +25,7 @@ def db(monkeypatch):
         "client_keys": FakeCollection([
             {"ClientKey": CLIENT_KEY, "Client_ID": CLIENT_ID, "Client_Name": "AO.com", "Source": "web",
              "redirect_base_url": "https://ao.registermyproduct.io",
-             "Styles": {"primaryColour": "#112233", "logoUrl": "https://cdn.example.com/ao.png"}},
+             "Styles": {"Accent": "#112233", "Logo_URL": "https://cdn.example.com/ao.png"}},
             {"ClientKey": "BEKO1", "Client_ID": "BEKO", "Client_Name": "Beko", "Source": "web"},
         ]),
         "email_config": FakeCollection([{"client_key": CLIENT_KEY, "settings": {
@@ -94,6 +94,7 @@ def test_registration_email_is_sent_once_with_cloud_links_and_no_identifiers(db,
     params = payload["params"]
     assert params["clientName"] == "AO.com"
     assert params["primaryColour"] == "#112233"
+    assert params["logoUrl"] == "https://cdn.example.com/ao.png"
     assert params["copy"]["greeting"] == "Hi Paul,"
     item = params["items"][0]
     assert item["cloudUrl"].startswith("https://ao.registermyproduct.io/cloud/")

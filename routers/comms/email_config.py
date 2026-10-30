@@ -250,7 +250,8 @@ class EmailContext(BaseModel):
 def client_key_doc(client_key: str) -> Optional[dict]:
     return store.client_keys.find_one(
         {"ClientKey": client_key},
-        {"_id": 0, "ClientKey": 1, "Client_ID": 1, "Client_Name": 1, "Styles": 1, "redirect_base_url": 1})
+        {"_id": 0, "ClientKey": 1, "Client_ID": 1, "Client_Name": 1, "Styles": 1, "Logo_URL": 1,
+         "redirect_base_url": 1})
 
 
 def client_key_for(client_id: Optional[str], source: Optional[str]) -> Optional[str]:
@@ -284,11 +285,17 @@ async def resolve_email_context(client_key: str, locale: Optional[str]) -> Optio
         sender_email = settings.senderEmail
     client_name = doc.get("Client_Name") or doc.get("Client_ID")
 
-    style_logo = styles.get("logoUrl") if isinstance(styles.get("logoUrl"), str) else None
-    logo = settings.logoUrl or (style_logo if style_logo and style_logo.lower().startswith("https://") else None)
+    # Client Styles tokens as the portal's Client Styles tab writes them (Logo_URL, Accent,
+    # ButtonBackground), plus the older camelCase spellings some tenants still carry.
+    style_logo = next((styles[k] for k in ("Logo_URL", "StylesLogo_URL", "logoUrl")
+                       if isinstance(styles.get(k), str) and styles[k].lower().startswith("https://")), None)
+    logo = settings.logoUrl or style_logo or (
+        doc.get("Logo_URL") if isinstance(doc.get("Logo_URL"), str) and doc["Logo_URL"].lower().startswith("https://") else None)
     primary = settings.primaryColour or next(
-        (styles[k] for k in ("primaryColour", "PrimaryColour", "primaryColor") if store.is_hex_colour(styles.get(k))),
+        (styles[k] for k in ("Accent", "primaryColour", "HeaderAccent") if store.is_hex_colour(styles.get(k))),
         DEFAULT_PRIMARY)
+    button = settings.buttonColour or next(
+        (styles[k] for k in ("ButtonBackground",) if store.is_hex_colour(styles.get(k))), primary)
 
     return EmailContext(
         client_key=client_key,
@@ -300,7 +307,7 @@ async def resolve_email_context(client_key: str, locale: Optional[str]) -> Optio
         sender_name=settings.senderName or client_name or MAIL_FROM_NAME,
         logo_url=logo,
         primary_colour=primary,
-        button_colour=settings.buttonColour or primary,
+        button_colour=button,
         link_base=_link_base(doc),
         copy_text=await load_copy(locale),
     )

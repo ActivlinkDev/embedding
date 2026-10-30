@@ -99,34 +99,34 @@ def test_detail_requires_a_valid_grant(db):
 
 def test_correct_code_issues_a_grant_once(db):
     code = cloud_links.issue_code(_link())
-    out = cloud.cloud_otp_verify(db["token"], cloud.OtpVerifyBody(code=code), clientkey="AO12345")
+    out = cloud.cloud_otp_verify(cloud.OtpVerifyBody(code=code), db["token"], clientkey="AO12345")
     assert cloud_links.grant_valid(_link(), out["grant"], int(time.time()))
     # The same code cannot be replayed.
-    assert _status(cloud.cloud_otp_verify, db["token"], cloud.OtpVerifyBody(code=code), clientkey="AO12345") == 400
+    assert _status(cloud.cloud_otp_verify, cloud.OtpVerifyBody(code=code), db["token"], clientkey="AO12345") == 400
 
 
 def test_wrong_codes_lock_out_after_five_attempts(db):
     code = cloud_links.issue_code(_link())
     wrong = "000000" if code != "000000" else "111111"
-    statuses = [_status(cloud.cloud_otp_verify, db["token"], cloud.OtpVerifyBody(code=wrong), clientkey="AO12345")
+    statuses = [_status(cloud.cloud_otp_verify, cloud.OtpVerifyBody(code=wrong), db["token"], clientkey="AO12345")
                 for _ in range(5)]
     assert statuses == [400, 400, 400, 400, 429]
     # Even the right code is refused once locked.
-    assert _status(cloud.cloud_otp_verify, db["token"], cloud.OtpVerifyBody(code=code), clientkey="AO12345") == 429
+    assert _status(cloud.cloud_otp_verify, cloud.OtpVerifyBody(code=code), db["token"], clientkey="AO12345") == 429
 
 
 def test_expired_code_is_refused(db):
     code = cloud_links.issue_code(_link())
     store.cloud_otp.docs[-1]["expires_at"] = store.now() - timedelta(seconds=1)
-    assert _status(cloud.cloud_otp_verify, db["token"], cloud.OtpVerifyBody(code=code), clientkey="AO12345") == 400
+    assert _status(cloud.cloud_otp_verify, cloud.OtpVerifyBody(code=code), db["token"], clientkey="AO12345") == 400
 
 
 def test_new_code_supersedes_the_old_one(db):
     old = cloud_links.issue_code(_link())
     new = cloud_links.issue_code(_link())
     if old != new:
-        assert _status(cloud.cloud_otp_verify, db["token"], cloud.OtpVerifyBody(code=old), clientkey="AO12345") == 400
-    cloud.cloud_otp_verify(db["token"], cloud.OtpVerifyBody(code=new), clientkey="AO12345")
+        assert _status(cloud.cloud_otp_verify, cloud.OtpVerifyBody(code=old), db["token"], clientkey="AO12345") == 400
+    cloud.cloud_otp_verify(cloud.OtpVerifyBody(code=new), db["token"], clientkey="AO12345")
 
 
 def test_sixth_code_request_in_an_hour_is_rate_limited(db):
