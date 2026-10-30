@@ -66,6 +66,15 @@ def ensure_catalog_indexes() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"[STARTUP] service request index setup skipped: {exc}")
 
+    # Same reasoning: without the unique EmailLog index a webhook replay could send twice,
+    # so the senders still claim before sending, but the failure is worth seeing.
+    try:
+        from routers.comms.store import ensure_indexes as ensure_email_indexes
+
+        ensure_email_indexes()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[STARTUP] email index setup skipped: {exc}")
+
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
@@ -214,6 +223,10 @@ ROUTERS = {
 
     # portal admin
     "portal": "routers.portal",
+    "portal_email": "routers.portal_email",
+
+    # confirmation-email links (Cloud ID page)
+    "cloud": "routers.cloud",
 
     # email ingest 
     "email_ingest": "routers.email_ingest",

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Any
 from utils.api_docs import error, json_response, secured
@@ -253,7 +253,8 @@ def fallback_value(input_val, *fallbacks):
         ),
     }),
 )
-def register(payload: RegisterRequest, _: None = Depends(verify_token)):
+def register(payload: RegisterRequest, background_tasks: BackgroundTasks = None,
+             _: None = Depends(verify_token)):
     """
     Register devices from an embedded/widget journey and return everything needed to complete
     activation: a registration id, a short activation code, a landing URL, and a QR image.
@@ -414,6 +415,11 @@ def register(payload: RegisterRequest, _: None = Depends(verify_token)):
             {"_id": result.inserted_id},
             {"$set": update_fields}
         )
+
+    if any_matched and background_tasks is not None:
+        from routers.comms.confirmation import send_embedded_registration_confirmation
+
+        background_tasks.add_task(send_embedded_registration_confirmation, registration_id)
 
     # --- Return response (activation fields at root, not per-device) ---
     return {

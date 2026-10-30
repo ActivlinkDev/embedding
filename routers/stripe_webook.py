@@ -52,6 +52,12 @@ except Exception:
         create_contract = None
         contract_svc = None
 
+try:
+    from routers.comms import confirmation as email_confirmation
+except Exception as e:  # noqa: BLE001 — email is optional; payments must still process
+    print(f"[Stripe Webhook] confirmation emails unavailable: {e}", file=sys.stderr)
+    email_confirmation = None
+
 @router.post(
     "/stripe/webhook",
     summary="Stripe webhook receiver (called by Stripe, not by you)",
@@ -200,7 +206,17 @@ async def stripe_webhook(
                                   f"({contract.get('status')}) for customer {customer_id}",
                                   file=sys.stderr)
                     except Exception as c_err:
+                        contracts = []
                         print(f"[Stripe Webhook] Failed to issue contract: {c_err}", file=sys.stderr)
+                    # Confirmation email, in the background so Stripe gets its 200 promptly.
+                    # Deduplicated on the order reference, so a replayed event sends nothing.
+                    if contracts and email_confirmation:
+                        try:
+                            email_confirmation.schedule(
+                                email_confirmation.send_plan_confirmation(list(contracts), customer_id))
+                        except Exception as mail_exc:  # noqa: BLE001
+                            print(f"[Stripe Webhook] Could not schedule confirmation email: {mail_exc}",
+                                  file=sys.stderr)
                     # After customer exists/updated, attempt to pair customer to basket if metadata present
                     try:
                         metadata = getattr(data, "metadata", None)
