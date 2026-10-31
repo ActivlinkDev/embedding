@@ -13,6 +13,8 @@ import os
 import secrets
 from datetime import timedelta
 
+from pymongo import ReturnDocument
+
 from routers.comms import store
 
 OTP_TTL = timedelta(minutes=10)
@@ -82,14 +84,17 @@ def check_code(subject: str, code: str) -> None:
         expires = expires.replace(tzinfo=store.now().tzinfo)
     if expires < store.now():
         raise OtpError(400, "expired")
-    if row.get("attempts", 0) >= OTP_MAX_ATTEMPTS:
+    # Reserve an attempt atomically *before* comparing. Without this, parallel requests
+    # could all read attempts < limit and each compare a guess, so a burst could test far
+    # more than OTP_MAX_ATTEMPTS codes. Only a request that wins a reservation compares.
+    reserved = store.email_otp.find_one_and_update(
+        {"_id": row["_id"], "used": False, "attempts": {"$lt": OTP_MAX_ATTEMPTS}},
+        {"$inc": {"attempts": 1}},
+        return_document=ReturnDocument.AFTER)
+    if not reserved:
         raise OtpError(429, "too_many_attempts")
-    if not hmac.compare_digest(row["code_hash"], _code_hash(subject, code)):
-        # Counted atomically and only while under the limit, so parallel guesses cannot
-        # each see attempts=4 and all get a try.
-        result = store.email_otp.update_one(
-            {"_id": row["_id"], "attempts": {"$lt": OTP_MAX_ATTEMPTS}}, {"$inc": {"attempts": 1}})
-        if not result.modified_count or row.get("attempts", 0) + 1 >= OTP_MAX_ATTEMPTS:
+    if not hmac.compare_digest(reserved["code_hash"], _code_hash(subject, code)):
+        if reserved.get("attempts", 0) >= OTP_MAX_ATTEMPTS:
             raise OtpError(429, "too_many_attempts")
         raise OtpError(400, "incorrect")
     used = store.email_otp.update_one({"_id": row["_id"], "used": False}, {"$set": {"used": True}})

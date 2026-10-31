@@ -167,6 +167,16 @@ def test_wrong_codes_lock_out_after_five_attempts(db):
     assert err.value.status_code == 429
 
 
+def test_a_correct_code_is_refused_once_the_attempts_are_spent(db):
+    """Every comparison spends an attempt first, so a burst of parallel guesses (simulated
+    by attempts already at the limit when the right code arrives) cannot get a sixth try."""
+    request_code(email=EMAIL)
+    store.email_otp.docs[-1]["attempts"] = otp_codes.OTP_MAX_ATTEMPTS
+    with pytest.raises(HTTPException) as err:
+        verify(db["sent"][0]["code"], email=EMAIL)
+    assert err.value.status_code == 429
+
+
 def test_expired_code_is_refused(db):
     request_code(email=EMAIL)
     store.email_otp.docs[-1]["expires_at"] = store.now() - timedelta(seconds=1)

@@ -134,6 +134,14 @@ class FakeCollection:
             self.insert_one(doc)
         return Result(0, 0)
 
+    def find_one_and_update(self, query, update, return_document=None, **kwargs):
+        for doc in self.docs:
+            if _matches(doc, query):
+                before = copy.deepcopy(doc)
+                self._apply(doc, update)
+                return copy.deepcopy(doc) if return_document else before
+        return None
+
     def update_many(self, query, update):
         n = 0
         for doc in self.docs:
