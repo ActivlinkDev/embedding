@@ -9,7 +9,7 @@ Every send follows the same steps:
 3. **Claim** ``EmailLog.dedupe_key`` before calling Brevo. A replayed Stripe webhook or a
    repeated pairing call finds the claim and sends nothing. Only a claim whose send *failed*
    can be re-claimed.
-4. Create one Cloud ID link per item and send. Brevo is called once: a timeout is recorded as
+4. Create one deep link per item and send. Brevo is called once: a timeout is recorded as
    failed rather than retried, because Brevo may already have accepted it.
 
 These functions never raise: they run after the customer's registration or payment has
@@ -27,7 +27,7 @@ from typing import Iterable, Optional
 from bson import ObjectId
 from pymongo.errors import DuplicateKeyError
 
-from routers.comms import cloud_links, store
+from routers.comms import links, store
 from routers.comms.brevo_client import BrevoEmailClient
 from routers.comms.email_config import (
     EmailContext, build_params, client_key_for, render_fallback_html, resolve_email_context,
@@ -191,56 +191,15 @@ async def send_registration_confirmation(customer_id: str, device_ids: Iterable[
 
         items = []
         for device in found:
-            token = cloud_links.create_link("device", str(device["_id"]), ctx.client_id, client_key,
-                                            to_email, ctx.locale)
+            token = links.create_link("device", str(device["_id"]), ctx.client_id, client_key,
+                                      to_email, ctx.locale)
             items.append({**device_summary(device),
-                          "cloudUrl": cloud_links.link_url(ctx.link_base, token, ctx.locale)})
+                          "linkUrl": links.link_url(ctx.link_base, "device", token, ctx.locale)})
         params = build_params(ctx, "registration", name=customer.get("name") or "", items=items)
         return await deliver(ctx, "registration", to_email=to_email, to_name=customer.get("name") or "",
                              dedupe_key=dedupe_key, params=params)
     except Exception as exc:  # noqa: BLE001
         _log(f"registration confirmation for {ref} errored: {type(exc).__name__}: {exc}")
-        return {"status": "error"}
-
-
-async def send_embedded_registration_confirmation(registration_id: str) -> dict:
-    """After the embedded ``/register`` call, whose customer details live on the
-    ``Registrations`` document rather than on ``Customer``."""
-    dedupe_key = f"registration:embedded:{registration_id}"
-    try:
-        reg = store.registrations.find_one({"_id": _oid(registration_id)},
-                                           {"clientkey": 1, "locale": 1, "customer": 1, "devices": 1})
-        if not reg:
-            return _skip(dedupe_key, "registration", None, registration_id, "registration not found")
-        client_key = reg.get("clientkey")
-        ctx = await resolve_email_context(client_key, reg.get("locale")) if client_key else None
-        if not ctx:
-            return _skip(dedupe_key, "registration", client_key, registration_id, "unknown ClientKey")
-        if not ctx.enabled_for("registration"):
-            return _skip(dedupe_key, "registration", client_key, registration_id, "disabled for client")
-        customer = reg.get("customer") or {}
-        to_email = store.deliverable_email(customer.get("email"))
-        if not to_email:
-            return _skip(dedupe_key, "registration", client_key, registration_id, "no deliverable email")
-        if not ctx.link_base:
-            return _skip(dedupe_key, "registration", client_key, registration_id, "no link base URL for client")
-        if not _claim(dedupe_key, "registration", client_key, registration_id):
-            return {"status": "duplicate"}
-
-        token = cloud_links.create_link("registration", registration_id, ctx.client_id, client_key,
-                                        to_email, ctx.locale)
-        url = cloud_links.link_url(ctx.link_base, token, ctx.locale)
-        items = []
-        for device in reg.get("devices") or []:
-            ids = device.get("Identifiers") or {}
-            items.append({"title": ids.get("title") or "", "make": ids.get("make") or "",
-                          "model": ids.get("model") or "", "category": ids.get("category") or "",
-                          "cloudUrl": url})
-        params = build_params(ctx, "registration", name=customer.get("name") or "", items=items)
-        return await deliver(ctx, "registration", to_email=to_email, to_name=customer.get("name") or "",
-                             dedupe_key=dedupe_key, params=params)
-    except Exception as exc:  # noqa: BLE001
-        _log(f"embedded registration confirmation for {registration_id} errored: {type(exc).__name__}: {exc}")
         return {"status": "error"}
 
 
@@ -285,15 +244,15 @@ async def send_plan_confirmation(contracts: list[dict], customer_id: str) -> dic
             device = devices.get(contract.get("device_id")) or {}
             if device and device.get("client") != ctx.client_id:
                 continue
-            token = cloud_links.create_link("contract", str(contract["_id"]), ctx.client_id, client_key,
-                                            to_email, ctx.locale)
+            token = links.create_link("contract", str(contract["_id"]), ctx.client_id, client_key,
+                                      to_email, ctx.locale)
             items.append({**device_summary(device),
                           "coverName": _cover_name(contract, basket),
                           "reference": contract.get("reference") or "",
                           "status": contract.get("status") or "",
                           "startDate": _date(contract.get("start_date")),
                           "endDate": _date(contract.get("end_date")),
-                          "cloudUrl": cloud_links.link_url(ctx.link_base, token, ctx.locale)})
+                          "linkUrl": links.link_url(ctx.link_base, "contract", token, ctx.locale)})
         params = build_params(ctx, "plan", name=customer.get("name") or "", items=items)
         params["orderReference"] = order_reference
         return await deliver(ctx, "plan", to_email=to_email, to_name=customer.get("name") or "",
@@ -303,13 +262,14 @@ async def send_plan_confirmation(contracts: list[dict], customer_id: str) -> dic
         return {"status": "error"}
 
 
-async def send_otp_email(link: dict, code: str) -> dict:
-    dedupe_key = f"otp:{link['_id']}:{uuid.uuid4().hex}"
-    ctx = await resolve_email_context(link.get("client_key"), link.get("locale"))
-    to_email = store.deliverable_email(link.get("email"))
+async def send_otp_email(client_key: str, locale: Optional[str], email: str, code: str) -> dict:
+    """A verification code for /my-registrations or /my-contracts, in the client's branding."""
+    dedupe_key = f"otp:{client_key}:{uuid.uuid4().hex}"
+    ctx = await resolve_email_context(client_key, locale)
+    to_email = store.deliverable_email(email)
     if not ctx or not to_email:
         return {"status": "skipped"}
-    _claim(dedupe_key, "otp", ctx.client_key, str(link["_id"]))
+    _claim(dedupe_key, "otp", ctx.client_key, "verification")
     params = build_params(ctx, "otp", code=code)
     return await deliver(ctx, "otp", to_email=to_email, to_name="", dedupe_key=dedupe_key, params=params)
 
@@ -331,7 +291,8 @@ async def send_test_email(client_key: str, kind: str, to_email: str, locale: Opt
         return {"status": "skipped", "reason": "unknown ClientKey"}
     dedupe_key = f"test:{client_key}:{uuid.uuid4().hex}"
     _claim(dedupe_key, "test", client_key, kind)
-    sample_url = f"{ctx.link_base or 'https://example.com'}/cloud/sample"
-    items = [] if kind == "otp" else [{**SAMPLE_ITEMS[0], "cloudUrl": sample_url}]
+    page = "my-contracts" if kind == "plan" else "my-registrations"
+    sample_url = f"{ctx.link_base or 'https://example.com'}/{page}"
+    items = [] if kind == "otp" else [{**SAMPLE_ITEMS[0], "linkUrl": sample_url}]
     params = build_params(ctx, kind, name="Alex Sample", items=items, code="123456" if kind == "otp" else None)
     return await deliver(ctx, kind, to_email=to_email, to_name="", dedupe_key=dedupe_key, params=params)

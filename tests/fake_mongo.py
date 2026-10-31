@@ -1,10 +1,11 @@
 """A tiny in-memory stand-in for the pymongo collection calls the email modules make.
 
-Supports equality (including dotted paths), $in, $gte, $lt, $lte, $exists, unique indexes and
-$set / $inc / $setOnInsert updates — enough to exercise claim/dedupe, OTP counting and
+Supports equality (including dotted paths), $in, $gte, $lt, $lte, $exists, $ne, $regex, unique indexes and
+$set / $inc / $push / $setOnInsert updates — enough to exercise claim/dedupe, OTP counting and
 tenant-scoped lookups without a database.
 """
 import copy
+import re
 from datetime import datetime
 
 from bson import ObjectId
@@ -42,6 +43,12 @@ def _matches(doc, query):
                     return False
                 if op == "$exists" and (value is not _MISSING) != bool(arg):
                     return False
+                if op == "$ne" and value is not _MISSING and value == arg:
+                    return False
+                if op == "$regex":
+                    flags = re.IGNORECASE if "i" in cond.get("$options", "") else 0
+                    if not isinstance(value, str) or not re.search(arg, value, flags):
+                        return False
                 if op in ("$gte", "$lt", "$lte"):
                     if value is _MISSING:
                         return False
@@ -101,12 +108,15 @@ class FakeCollection:
             found.sort(key=lambda d: _get(d, key), reverse=direction < 0)
         return found[0] if found else None
 
-    def count_documents(self, query):
+    def count_documents(self, query, **kwargs):
         return len(self.find(query))
 
     def _apply(self, doc, update):
         for path, value in (update.get("$set") or {}).items():
             _set(doc, path, value)
+        for path, value in (update.get("$push") or {}).items():
+            current = _get(doc, path)
+            _set(doc, path, ([] if current is _MISSING else current) + [value])
         for path, value in (update.get("$inc") or {}).items():
             current = _get(doc, path)
             _set(doc, path, (0 if current is _MISSING else current) + value)

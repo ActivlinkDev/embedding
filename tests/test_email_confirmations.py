@@ -6,7 +6,7 @@ import httpx
 import pytest
 from bson import ObjectId
 
-from routers.comms import brevo_client, cloud_links, confirmation, email_config, store
+from routers.comms import brevo_client, confirmation, email_config, store
 from tests.fake_mongo import FakeCollection
 
 CLIENT_ID = "AO"
@@ -15,7 +15,6 @@ CLIENT_KEY = "AO12345"
 
 @pytest.fixture
 def db(monkeypatch):
-    monkeypatch.setenv("CLOUD_ACCESS_SECRET", "s" * 40)
     monkeypatch.setenv("BREVO_TEMPLATE_PLAN", "")
     monkeypatch.setattr(email_config, "STRAPI_BASE", "")
     customer_id = ObjectId()
@@ -42,10 +41,9 @@ def db(monkeypatch):
         ]),
         "contracts": FakeCollection(),
         "baskets": FakeCollection(),
-        "registrations": FakeCollection(),
         "email_log": FakeCollection(unique=["dedupe_key"]),
-        "cloud_links": FakeCollection(unique=["token_hash"]),
-        "cloud_otp": FakeCollection(),
+        "links": FakeCollection(unique=["token_hash"]),
+        "email_otp": FakeCollection(),
     }
     for name, col in cols.items():
         monkeypatch.setattr(store, name, col)
@@ -79,7 +77,7 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def test_registration_email_is_sent_once_with_cloud_links_and_no_identifiers(db, brevo):
+def test_registration_email_is_sent_once_with_deep_links_and_no_identifiers(db, brevo):
     calls, _ = brevo
 
     first = run(confirmation.send_registration_confirmation(db["customer_id"], [db["device_id"]]))
@@ -97,13 +95,13 @@ def test_registration_email_is_sent_once_with_cloud_links_and_no_identifiers(db,
     assert params["logoUrl"] == "https://cdn.example.com/ao.png"
     assert params["copy"]["greeting"] == "Hi Paul,"
     item = params["items"][0]
-    assert item["cloudUrl"].startswith("https://ao.registermyproduct.io/cloud/")
+    assert item["linkUrl"].startswith("https://ao.registermyproduct.io/my-registrations?link=")
     body = json.dumps(payload)
     for secret in ("SN-8841203", "356938035643809", "449.99"):
         assert secret not in body
     # The token in the email is not stored; only its hash is.
-    token = item["cloudUrl"].split("/cloud/")[1].split("?")[0]
-    link = store.cloud_links.docs[0]
+    token = item["linkUrl"].split("?link=")[1].split("&")[0]
+    link = store.links.docs[0]
     assert link["token_hash"] == store.token_hash(token) and token not in json.dumps(link, default=str)
     assert link["client_id"] == CLIENT_ID
     log = store.email_log.docs[0]
@@ -130,7 +128,7 @@ def test_no_deliverable_address_is_skipped_without_calling_brevo(db, brevo, emai
 
     assert result["status"] == "skipped"
     assert calls == []
-    assert store.cloud_links.docs == []
+    assert store.links.docs == []
 
 
 def test_disabled_client_is_skipped(db, brevo):
@@ -173,6 +171,7 @@ def test_plan_email_uses_client_template_and_replay_sends_nothing(db, brevo):
     assert calls[0]["templateId"] == 42 and "htmlContent" not in calls[0]
     item = calls[0]["params"]["items"][0]
     assert item["reference"] == "ACT-2026-000001"
+    assert "/my-contracts?link=" in item["linkUrl"]
     assert "89" not in json.dumps(calls[0]["params"])
 
 
@@ -238,7 +237,7 @@ def test_fallback_html_escapes_customer_data():
     ctx_params = {"copy": {"heading": "<b>h</b>", "greeting": "Hi <script>", "intro": "i", "footer": "f",
                            "cta": "Go", "labels": {"reference": "R", "cover": "C", "startDate": "S", "endDate": "E"}},
                   "primaryColour": "red;background:url(x)", "buttonColour": "#123456", "logoUrl": "",
-                  "clientName": "AO", "items": [{"title": "<img src=x>", "cloudUrl": "https://x/\"><script>"}]}
+                  "clientName": "AO", "items": [{"title": "<img src=x>", "linkUrl": "https://x/\"><script>"}]}
     out = email_config.render_fallback_html(ctx_params)
     assert "<script>" not in out and "<img src=x>" not in out
     assert "url(x)" not in out
@@ -246,5 +245,4 @@ def test_fallback_html_escapes_customer_data():
 
 def test_masking_helpers():
     assert store.mask_email("paul.smith@gmail.com") == "p***@g***.com"
-    assert store.mask_identifier("356938035643809") == "••••••••3809"
     assert store.deliverable_email("User_1@Placeholder.Local") is None

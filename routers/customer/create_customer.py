@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -76,6 +77,23 @@ def upsert_marketing_preferences(
             return
 
 # --- Reusable Function ---
+def email_match(email: str) -> dict:
+    """Case-insensitive exact match on `email`. Escaped: an address is not a pattern, and an
+    unescaped `.` or `+` would match other customers' addresses."""
+    return {"$regex": f"^{re.escape(email.strip())}$", "$options": "i"}
+
+
+def customer_ids_for_email(email: str, collection=None) -> list:
+    """Every Customer id carrying ``email``, as both ObjectId and str: devices store
+    ``registrationParameters.customerId`` as a string, contracts ``customer_id`` likewise,
+    but older records may hold the ObjectId."""
+    if not email or not email.strip():
+        return []
+    col = collection if collection is not None else customer_collection
+    docs = col.find({"email": email_match(email)}, {"_id": 1})
+    return [value for doc in docs for value in (doc["_id"], str(doc["_id"]))]
+
+
 def get_or_create_customer(
     collection,
     name: str,
@@ -86,14 +104,16 @@ def get_or_create_customer(
     Checks if a customer exists by telephone or email (case-insensitive).
     Returns (customer_id, existing: bool).
     If not found, creates and returns new id.
+
+    A blank telephone or email is not used for matching: it would otherwise match every
+    customer stored with that field blank.
     """
-    query = {
-        "$or": [
-            {"telephone": telephone},
-            {"email": {"$regex": f"^{email}$", "$options": "i"}}
-        ]
-    }
-    existing = collection.find_one(query)
+    clauses = []
+    if telephone and telephone.strip():
+        clauses.append({"telephone": telephone})
+    if email and email.strip():
+        clauses.append({"email": email_match(email)})
+    existing = collection.find_one({"$or": clauses}) if clauses else None
     if existing:
         return str(existing["_id"]), True
     customer_doc = {"name": name, "telephone": telephone, "email": email}

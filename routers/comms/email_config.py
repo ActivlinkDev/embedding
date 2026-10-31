@@ -240,7 +240,7 @@ class EmailContext(BaseModel):
 
     def enabled_for(self, kind: str) -> bool:
         if kind == "otp":
-            return True  # verification codes are part of the Cloud ID page, not optional mail
+            return True  # verification codes are how customers sign in, not optional mail
         return bool(getattr(self.settings.enabled, kind, False))
 
     def template_id(self, kind: str) -> Optional[int]:
@@ -376,9 +376,9 @@ def render_fallback_html(params: dict) -> str:
             lines.append(f'<div>{e(labels["startDate"])}: {e(item["startDate"])}</div>')
         if item.get("endDate"):
             lines.append(f'<div>{e(labels["endDate"])}: {e(item["endDate"])}</div>')
-        if item.get("cloudUrl") and copy.get("cta"):
+        if item.get("linkUrl") and copy.get("cta"):
             lines.append(
-                f'<div style="margin-top:12px"><a href="{e(item["cloudUrl"])}" '
+                f'<div style="margin-top:12px"><a href="{e(item["linkUrl"])}" '
                 f'style="background:{button};color:#ffffff;padding:10px 18px;border-radius:6px;'
                 f'text-decoration:none;display:inline-block">{e(copy["cta"])}</a></div>')
         rows.append('<div style="border:1px solid #E5E7EB;border-radius:8px;padding:16px;margin:12px 0">'

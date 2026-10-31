@@ -1,4 +1,4 @@
-"""Collections and small helpers shared by confirmation emails and the Cloud ID page.
+"""Collections and small helpers shared by confirmation emails and email verification.
 
 - ``EmailLog``: one row per email we intend to send, keyed by ``dedupe_key`` (unique). A row is
   claimed *before* calling Brevo, so a Stripe webhook replay or a double-submitted form finds
@@ -7,9 +7,10 @@
 - ``ClientEmailConfig``: per-ClientKey email settings edited in the admin portal. Kept out of
   the ``ClientKey`` document on purpose: ``/get-client`` returns that document whole and the
   frontend caches it in the browser.
-- ``CloudLinks``: the unguessable links in confirmation emails. Only a SHA-256 of the token is
+- ``EmailLinks``: the deep-link tokens in confirmation emails. Only a SHA-256 of the token is
   stored, so a database read does not hand out working links.
-- ``CloudOtp``: email verification codes for those links, hashed, with a TTL purge.
+- ``EmailOtp``: email verification codes for /my-registrations and /my-contracts, hashed, with
+  a TTL purge.
 """
 import hashlib
 import re
@@ -23,14 +24,13 @@ from utils.mongo import require_client
 _db = require_client()["Activlink"]
 email_log = _db["EmailLog"]
 email_config = _db["ClientEmailConfig"]
-cloud_links = _db["CloudLinks"]
-cloud_otp = _db["CloudOtp"]
+links = _db["EmailLinks"]
+email_otp = _db["EmailOtp"]
 client_keys = _db["ClientKey"]
 customers = _db["Customer"]
 devices = _db["Devices"]
 contracts = _db["Contracts"]
 baskets = _db["Basket_Quotes"]
-registrations = _db["Registrations"]
 
 # The customer step invents this address when someone gives no email
 # (frontend app/validate_customer). Sending to it would only bounce.
@@ -41,9 +41,9 @@ def ensure_indexes() -> None:
     email_log.create_index("dedupe_key", unique=True)
     email_log.create_index([("client_key", 1), ("kind", 1), ("created_at", -1)])
     email_config.create_index("client_key", unique=True)
-    cloud_links.create_index("token_hash", unique=True)
-    cloud_otp.create_index([("link_id", 1), ("created_at", -1)])
-    cloud_otp.create_index("purge_at", expireAfterSeconds=0)
+    links.create_index("token_hash", unique=True)
+    email_otp.create_index([("subject", 1), ("created_at", -1)])
+    email_otp.create_index("purge_at", expireAfterSeconds=0)
 
 
 def now() -> datetime:
@@ -76,18 +76,6 @@ def mask_email(value: Optional[str]) -> str:
     if not host:
         host, dot, tld = domain, "", ""
     return f"{local[:1]}***@{host[:1]}***{dot}{tld}"
-
-
-def mask_identifier(value) -> Optional[str]:
-    """Keep the last four characters of a serial / IMEI / MAC."""
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    if len(text) <= 4:
-        return text
-    return "•" * min(len(text) - 4, 8) + text[-4:]
 
 
 def first_name(name) -> str:

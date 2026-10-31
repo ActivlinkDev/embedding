@@ -225,8 +225,8 @@ ROUTERS = {
     "portal": "routers.portal",
     "portal_email": "routers.portal_email",
 
-    # confirmation-email links (Cloud ID page)
-    "cloud": "routers.cloud",
+    # email verification codes for /my-registrations and /my-contracts
+    "email_otp": "routers.email_otp",
 
     # email ingest 
     "email_ingest": "routers.email_ingest",
