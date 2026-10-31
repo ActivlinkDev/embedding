@@ -6,6 +6,7 @@ from utils.dependencies import verify_token
 from routers.sku.catalog_dependencies import catalog
 from routers.sku.category_validation import validate_category
 from utils.category_tree import loaded as taxonomy_loaded
+from routers.devices.registration_core import build_device_doc, find_duplicate, unique_parameters as build_unique_parameters, valid_value
 import os
 from datetime import datetime
 from utils.mongo import require_client
@@ -227,9 +228,6 @@ class SimpleRegisterRequest(BaseModel):
         }
     }
 
-def valid_value(val):
-    return val is not None and str(val).strip() != "" and str(val).strip().lower() != "string"
-
 def validate_purchase_date(date_str):
     if not date_str:
         return True
@@ -365,51 +363,16 @@ def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_tok
         ids = device.Identifiers
         unique = device.Unique_Parameters
 
-        duplicate_query = []
-        if valid_value(unique.imei):
-            duplicate_query.append({"uniqueParameters.imei": unique.imei})
-        if valid_value(unique.MAC):
-            duplicate_query.append({"uniqueParameters.MAC": unique.MAC})
-        if valid_value(ids.make) and valid_value(ids.model) and valid_value(unique.serial):
-            duplicate_query.append({
-                "identifiers.make": ids.make,
-                "identifiers.model": ids.model,
-                "uniqueParameters.serial": unique.serial
-            })
-        if valid_value(ids.GTIN) and valid_value(unique.serial):
-            duplicate_query.append({
-                "identifiers.GTIN": ids.GTIN,
-                "uniqueParameters.serial": unique.serial
-            })
+        duplicate = find_duplicate(
+            devices_collection, gtin=ids.GTIN, make=ids.make, model=ids.model,
+            serial=unique.serial, imei=unique.imei, mac=unique.MAC)
 
-        duplicate_device = None
-        matched_field = None
-        matched_value = None
-
-        for query in duplicate_query:
-            found = devices_collection.find_one(query)
-            if found:
-                duplicate_device = found
-                if "uniqueParameters.imei" in query:
-                    matched_field = "imei"
-                    matched_value = unique.imei
-                elif "uniqueParameters.MAC" in query:
-                    matched_field = "MAC"
-                    matched_value = unique.MAC
-                elif "identifiers.GTIN" in query:
-                    matched_field = "GTIN/serial"
-                    matched_value = f"{ids.GTIN} / {unique.serial}"
-                else:
-                    matched_field = "make/model/serial"
-                    matched_value = f"{ids.make} / {ids.model} / {unique.serial}"
-                break
-
-        if duplicate_device:
+        if duplicate:
             inserted.append({
-                "deviceId": str(duplicate_device["_id"]),
+                "deviceId": str(duplicate["device"]["_id"]),
                 "skuStatus": "duplicate record found",
-                "matched_field": matched_field,
-                "matched_value": matched_value
+                "matched_field": duplicate["matched_field"],
+                "matched_value": duplicate["matched_value"]
             })
             continue
 
@@ -497,11 +460,7 @@ def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_tok
             )
         }
 
-        unique_parameters = {
-            "MAC": unique.MAC or "",
-            "serial": unique.serial or "",
-            "imei": unique.imei if unique.imei and unique.imei != "string" else ""
-        }
+        unique_parameters = build_unique_parameters(unique.MAC, unique.serial, unique.imei)
 
         # ---- PRICE FALLBACK LOGIC ----
         if price_is_missing(unique.price):
@@ -584,18 +543,11 @@ def device_register(payload: SimpleRegisterRequest, _: None = Depends(verify_tok
             identifiers["category"] = manual_category
             matched_status = "manual"
 
-        device_doc = {
-            "client": client_id,
-            "locale": payload.locale,
-            "source": payload.source,
-            "identifiers": identifiers,
-            "uniqueParameters": unique_parameters,
-            "registrationParameters": registration_parameters,
-            "customSkuId": customsku_id,
-            "masterSkuId": mastersku_id,
-            "skuStatus": matched_status,
-            "registeredAt": datetime.utcnow().isoformat() + "Z"
-        }
+        device_doc = build_device_doc(
+            client_id=client_id, locale=payload.locale, source=payload.source,
+            identifiers=identifiers, unique=unique_parameters,
+            registration_parameters=registration_parameters, custom_sku_id=customsku_id,
+            master_sku_id=mastersku_id, sku_status=matched_status)
 
         result = devices_collection.insert_one(device_doc)
         device_doc["_id"] = str(result.inserted_id)

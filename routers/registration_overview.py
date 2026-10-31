@@ -7,7 +7,9 @@ from typing import Optional
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+from routers.comms import links
+from routers.customer.create_customer import customer_ids_for_email
 from utils.dependencies import verify_token
 from utils.media import RECEIPT_TYPES, decode_upload
 from utils.mongo import require_client
@@ -19,11 +21,23 @@ devices_collection = client['Activlink']['Devices']
 
 
 class MyRegistrationsRequest(BaseModel):
-    phone: str = Field(pattern=r'^\+?[1-9]\d{6,14}$')
+    # Exactly one identity, each supplied by the trusted frontend from its signed session
+    # cookie after an SMS or email code — never from browser JSON.
+    phone: Optional[str] = Field(None, pattern=r'^\+?[1-9]\d{6,14}$')
+    email: Optional[str] = Field(None, min_length=3, max_length=254)
     # The OTP proves who the customer is, never which storefront they are in, so the
     # tenant is mandatory here. The trusted frontend resolves it from the request
     # host (beko.registermyproduct.io), not from anything the browser can set.
     clientkey: str = Field(min_length=1)
+    # Optional deep-link token from a confirmation email; only used to highlight a device
+    # the verified customer already owns.
+    link: Optional[str] = Field(None, max_length=128)
+
+    @model_validator(mode='after')
+    def _one_identity(self):
+        if bool(self.phone) == bool(self.email):
+            raise ValueError('Send exactly one of phone or email')
+        return self
 
 
 def resolve_client_id(clientkey: str) -> str:
@@ -33,6 +47,19 @@ def resolve_client_id(clientkey: str) -> str:
     if not client_id:
         raise HTTPException(400, 'Invalid clientkey.')
     return client_id
+
+
+def owner_query(body: 'MyRegistrationsRequest', client_id: str) -> dict:
+    if body.email:
+        return registration_owner_query_by_email(body.email, client_id)
+    return registration_owner_query(body.phone, client_id)
+
+
+def registration_owner_query_by_email(email: str, client_id: str) -> dict:
+    # Email-verified customers own devices through their Customer record only: devices
+    # carry no registration email of their own. A device with no `client` stays hidden.
+    return {'client': client_id,
+            'registrationParameters.customerId': {'$in': customer_ids_for_email(email)}}
 
 
 def registration_owner_query(phone: str, client_id: str):
@@ -57,7 +84,8 @@ def registration_owner_query(phone: str, client_id: str):
 @router.post('/my-registrations')
 def my_registrations(body: MyRegistrationsRequest, _: None = Depends(verify_token)):
     db = client['Activlink']
-    owner = registration_owner_query(body.phone, resolve_client_id(body.clientkey))
+    client_id = resolve_client_id(body.clientkey)
+    owner = owner_query(body, client_id)
     docs = devices_collection.find(owner, {'receipt.data': 0}).sort('registeredAt', -1)
     devices = []
     for doc in docs:
@@ -76,7 +104,8 @@ def my_registrations(body: MyRegistrationsRequest, _: None = Depends(verify_toke
             'description': localized.get('description') if isinstance(localized.get('description'), str) else None,
             'receipt': {key: doc['receipt'].get(key) for key in ('name', 'contentType', 'uploadedAt')} if doc.get('receipt') else None,
         })
-    return {'devices': devices}
+    highlight = links.highlight_id(body.link, client_id, 'device', {d['deviceId'] for d in devices})
+    return {'devices': devices, 'highlightId': highlight}
 
 
 class RegistrationReceiptRequest(MyRegistrationsRequest):
@@ -87,7 +116,7 @@ class RegistrationReceiptRequest(MyRegistrationsRequest):
 def registration_receipt(body: RegistrationReceiptRequest, _: None = Depends(verify_token)):
     if not ObjectId.is_valid(body.device_id):
         raise HTTPException(404, 'Receipt unavailable')
-    owner = registration_owner_query(body.phone, resolve_client_id(body.clientkey))
+    owner = owner_query(body, resolve_client_id(body.clientkey))
     doc = devices_collection.find_one(
         {'_id': ObjectId(body.device_id), **owner}, {'receipt': 1})
     receipt = (doc or {}).get('receipt') or {}
