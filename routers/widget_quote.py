@@ -31,7 +31,13 @@ from .product_assignment import (
     ProductAssignmentRequest,
     calculate_age_in_months,
 )
-from .rate_request import RateRequest as RateReqModel, price_and_group, store_quote
+from .rate_request import (
+    RateRequest as RateReqModel,
+    price_and_group,
+    require_regional_postcode,
+    store_quote,
+)
+from utils.postcode import normalise_postcode
 from utils.mongo import require_client
 
 router = APIRouter(tags=["Quotes"])
@@ -96,6 +102,16 @@ class WidgetPriceRequest(BaseModel):
         ),
         examples=[True],
     )
+    postcode: Optional[str] = Field(
+        None,
+        max_length=16,
+        description=(
+            "Where the product will be, for products whose assignment rule sets "
+            "`when.regionalPricing: true`. Required for those — `422` with "
+            "`detail.code: \"postcode_required\"` without it — and ignored otherwise."
+        ),
+        examples=[None],
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -108,6 +124,7 @@ class WidgetPriceRequest(BaseModel):
                 "purchaseDate": None,
                 "gtee": None,
                 "deviceWorking": None,
+                "postcode": None,
             }
         }
     }
@@ -222,17 +239,28 @@ def resolve_widget_inputs(payload: WidgetPriceRequest):
 
 
 def compute_options(payload: WidgetPriceRequest):
-    """Run assignment + rating for a widget request. Returns (grouped, bracket, currency)."""
+    """Run assignment + rating for a widget request. Returns (grouped, bracket, currency, postcode)."""
     assignment_request, age_in_months, _client_doc, _sku, _lsd = resolve_widget_inputs(payload)
-    return _compute_options_from_assignment(assignment_request, age_in_months)
+    return _compute_options_from_assignment(assignment_request, age_in_months, payload.postcode)
 
 
-def _compute_options_from_assignment(assignment_request, age_in_months):
-    """Run assignment + rating from already-resolved inputs. Returns (grouped, bracket, currency)."""
+def _compute_options_from_assignment(assignment_request, age_in_months, postcode=None):
+    """Run assignment + rating from already-resolved inputs.
+
+    Returns ``(grouped, bracket, currency, regional_postcode)``. The last is the
+    normalised postcode when the matched rule is regionally priced, else None — and a
+    regionally-priced rule with no usable postcode raises the 422 from
+    ``require_regional_postcode`` before anything is priced.
+    """
     assignment_result = assign_products(assignment_request)
     products = assignment_result.get("products") or []
     if not products:
-        return [], None, assignment_request.currency
+        return [], None, assignment_request.currency, None
+
+    regional = bool(assignment_result.get("regional_pricing"))
+    regional_postcode = (
+        require_regional_postcode(postcode, assignment_request.locale) if regional else None
+    )
 
     requests: List[RateReqModel] = []
     for prod in products:
@@ -251,15 +279,18 @@ def _compute_options_from_assignment(assignment_request, age_in_months):
                 client=assignment_request.client,
                 source=assignment_request.source,
                 mode=mode or "live",
+                regional_pricing=regional,
+                postcode=regional_postcode,
             ))
 
     grouped, bracket = price_and_group(requests)
-    return grouped, bracket, assignment_request.currency
+    return grouped, bracket, assignment_request.currency, regional_postcode
 
 
 # ---------- Cache ----------
 
-def _cache_read(custom_sku_id, locale, age, price, gtee, currency, device_working=True):
+def _cache_read(custom_sku_id, locale, age, price, gtee, currency, device_working=True,
+                postcode=None):
     doc = widget_cache_collection.find_one({
         "customSkuId": custom_sku_id,
         "locale": locale,
@@ -272,6 +303,10 @@ def _cache_read(custom_sku_id, locale, age, price, gtee, currency, device_workin
         # (Mongo matches a missing field against null) and only the faulty query misses,
         # which keeps a deploy from rebuilding every cached entry at once.
         "deviceWorking": {"$in": [True, None]} if device_working else False,
+        # Regionally-priced options are cached per postcode, everything else under None.
+        # An entry written before this field existed reads as None, which is right: no
+        # regionally-priced option was ever cached without one.
+        "postcode": postcode,
         "priceLow": {"$lte": price},
         "priceHigh": {"$gte": price},
     })
@@ -291,7 +326,7 @@ def _cache_invalidate(custom_sku_id, locale=None):
 
 
 def _cache_write(custom_sku_id, locale, age, price, gtee, bracket, currency, grouped,
-                 device_working=True):
+                 device_working=True, postcode=None):
     low, high = bracket if bracket else (price, price)
     widget_cache_collection.update_one(
         {
@@ -301,6 +336,7 @@ def _cache_write(custom_sku_id, locale, age, price, gtee, bracket, currency, gro
             "gtee": gtee,
             "currency": currency,
             "deviceWorking": device_working,
+            "postcode": postcode,
             "priceLow": low,
             "priceHigh": high,
         },
@@ -313,6 +349,7 @@ def _cache_write(custom_sku_id, locale, age, price, gtee, bracket, currency, gro
             "priceHigh": high,
             "currency": currency,
             "deviceWorking": device_working,
+            "postcode": postcode,
             "options": grouped,
             "generatedAt": datetime.utcnow(),
         }},
@@ -321,26 +358,39 @@ def _cache_write(custom_sku_id, locale, age, price, gtee, bracket, currency, gro
 
 
 def _priced_options(payload: WidgetPriceRequest):
-    """Return (grouped, currency), using the cache when fresh."""
+    """Return (grouped, currency, regional_postcode), using the cache when fresh.
+
+    The cache is read twice at most. Options that are not regionally priced are cached
+    under no postcode, so that is tried first and serves every postcode, or none. Only
+    on a miss is the entry for this postcode tried — those exist only for products whose
+    rule is regionally priced, and are never served to a different postcode.
+    """
     assignment_request, age_in_months, _client_doc, _sku, _lsd = resolve_widget_inputs(payload)
     price = assignment_request.price
-
-    cached = _cache_read(
+    key = (
         payload.customSkuId, payload.locale, age_in_months, price,
         assignment_request.gtee, assignment_request.currency,
         assignment_request.working,
     )
-    if cached:
-        return cached.get("options", []), cached.get("currency")
 
-    grouped, bracket, currency = _compute_options_from_assignment(assignment_request, age_in_months)
+    cached = _cache_read(*key, postcode=None)
+    if cached:
+        return cached.get("options", []), cached.get("currency"), None
+    normalised = normalise_postcode(payload.postcode, payload.locale)
+    if normalised:
+        cached = _cache_read(*key, postcode=normalised)
+        if cached:
+            return cached.get("options", []), cached.get("currency"), normalised
+
+    grouped, bracket, currency, regional_postcode = _compute_options_from_assignment(
+        assignment_request, age_in_months, payload.postcode)
     if grouped:
         _cache_write(
             payload.customSkuId, payload.locale, age_in_months, price,
             assignment_request.gtee, bracket, currency, grouped,
-            assignment_request.working,
+            assignment_request.working, postcode=regional_postcode,
         )
-    return grouped, currency
+    return grouped, currency, regional_postcode
 
 
 # ---------- Origin allowlist ----------
@@ -418,7 +468,7 @@ def widget_price(payload: WidgetPriceRequest, request: Request, _: None = Depend
     client_doc = clientkey_collection.find_one({"ClientKey": payload.clientKey})
     _enforce_origin(request, client_doc)
 
-    grouped, currency = _priced_options(payload)
+    grouped, currency, _postcode = _priced_options(payload)
     if not grouped:
         raise HTTPException(status_code=404, detail="No protection options available for this product")
 
@@ -459,7 +509,7 @@ def widget_quote(payload: WidgetQuoteRequest, request: Request, _: None = Depend
     client_doc = clientkey_collection.find_one({"ClientKey": payload.clientKey})
     _enforce_origin(request, client_doc)
 
-    grouped, currency = _priced_options(payload)
+    grouped, currency, regional_postcode = _priced_options(payload)
     if not grouped:
         raise HTTPException(status_code=404, detail="No protection options available for this product")
 
@@ -473,6 +523,7 @@ def widget_quote(payload: WidgetQuoteRequest, request: Request, _: None = Depend
             "currency": currency,
             "source": "widget",
             "selected": {"productId": payload.productId, "optionId": payload.optionId},
+            **({"postcode": regional_postcode, "regionalPricing": True} if regional_postcode else {}),
         },
     )
     return {"quote_id": quote_id}
@@ -506,13 +557,14 @@ def widget_quote_refresh(payload: WidgetPriceRequest, _: None = Depends(verify_t
     called from a browser.
     """
     assignment_request, age_in_months, _client_doc, _sku, _lsd = resolve_widget_inputs(payload)
-    grouped, bracket, currency = _compute_options_from_assignment(assignment_request, age_in_months)
+    grouped, bracket, currency, regional_postcode = _compute_options_from_assignment(
+        assignment_request, age_in_months, payload.postcode)
     if not grouped:
         raise HTTPException(status_code=404, detail="No protection options to cache")
     _cache_write(
         payload.customSkuId, payload.locale, age_in_months, assignment_request.price,
         assignment_request.gtee, bracket, currency, grouped,
-        assignment_request.working,
+        assignment_request.working, postcode=regional_postcode,
     )
     return {"status": "ok", "cached_options": len(grouped)}
 
@@ -542,7 +594,10 @@ def warm_widget_cache(client_key: str, custom_sku_id: str, locale: str, price: O
             clientKey=client_key, customSkuId=custom_sku_id, price=price, locale=locale
         )
         assignment_request, age_in_months, _client_doc, _sku, _lsd = resolve_widget_inputs(payload)
-        grouped, bracket, currency = _compute_options_from_assignment(assignment_request, age_in_months)
+        # No postcode here: a regionally-priced rule raises a 422, which the except below
+        # swallows. Those options are priced per postcode when a shopper asks, not warmed.
+        grouped, bracket, currency, _postcode = _compute_options_from_assignment(
+            assignment_request, age_in_months)
 
         if grouped:
             _cache_write(

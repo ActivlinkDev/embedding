@@ -89,6 +89,33 @@ def rule_device_working(rule: Dict[str, Any]) -> List[bool]:
     return accepted
 
 
+def rule_regional_pricing(rule: Dict[str, Any]) -> bool:
+    """Whether the products this rule assigns are priced with a regional adjustment.
+
+    Unlike everything else in `when`, this is **not a matching condition**. A rule with
+    `when.regionalPricing: true` matches exactly the devices it would match without it,
+    and its products then require a postcode. Were it a condition, a request that left
+    the postcode out would fall through to a rule without the adjustment, and anyone in
+    a supplement area could dodge it by not saying where they are.
+
+    Only a real `true` (or its text spellings) turns it on. Anything else is off, with a
+    warning for values that look like a mistake rather than an absence.
+    """
+    raw = (rule.get("when") or {}).get("regionalPricing")
+    if raw is None or raw is False:
+        return False
+    if raw is True:
+        return True
+    if isinstance(raw, str) and raw.strip().lower() in {"true", "1", "yes", "y"}:
+        return True
+    if not (isinstance(raw, str) and raw.strip().lower() in {"false", "0", "no", "n", ""}):
+        logger.warning(
+            "[assignment] rule %s has an unusable when.regionalPricing value %r; treating it as off",
+            rule.get("ruleId") or rule.get("_id"), raw,
+        )
+    return False
+
+
 _indexes_ready = False
 
 
@@ -505,6 +532,8 @@ def assign_products(payload: ProductAssignmentRequest) -> Dict[str, Any]:
             "rule_id": rule.get("ruleId"),
             "age_in_months": age_in_months,
             "products": (rule.get("then") or {}).get("products", []),
+            # Decided by the rule, not the caller: see `rule_regional_pricing`.
+            "regional_pricing": rule_regional_pricing(rule),
         }
 
     error_detail = {

@@ -198,6 +198,7 @@ def assign_product_for_device(
 
     # 5. Flatten products into the new array format
     product_list = []
+    regional_pricing = bool(assignment_result.get("regional_pricing"))
     for prod in assignment_result.get("products", []):
         product_id = prod["productId"]
         mode = prod.get("mode")
@@ -213,7 +214,9 @@ def assign_product_for_device(
                 "multi_count": 1,
                 "client": assignment_result["input"]["client"],
                 "source": assignment_result["input"]["source"],
-                "mode": mode
+                "mode": mode,
+                # The rating needs a postcode for these, and adds the region's adjustment.
+                "regional_pricing": regional_pricing,
             }
             product_list.append(product_entry)
 
@@ -240,5 +243,6 @@ def assign_product_for_device(
     return {
         "Inputs": req_payload.model_dump(),
         "Products": product_list,
-        "DistinctProductIds": distinct_product_ids
+        "DistinctProductIds": distinct_product_ids,
+        "RegionalPricing": regional_pricing,
     }

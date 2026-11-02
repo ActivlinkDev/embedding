@@ -19,6 +19,37 @@ db = client["Activlink"]
 quotes_collection = db["Quotes"]
 basket_collection = db["Basket_Quotes"]
 devices_collection = db["Devices"]
+service_requests_collection = db["ServiceRequests"]
+
+
+def assert_quote_region_matches_repair(quote: Dict[str, Any], service_request_id: Optional[str]) -> None:
+    """Refuse a regionally-priced quote whose repair is booked for a different postcode.
+
+    The quote's price includes an adjustment for the postcode it was priced on. The
+    service request says where the engineer actually goes. If those differ, the customer
+    would be charged one region's price for a visit to another — quoting at a postcode
+    with a deduction and booking at one with a supplement is exactly that. The request
+    is looked up through the quote's own device, so an id from another device (and so
+    another tenant) cannot be used to satisfy the check.
+
+    Quotes without regional pricing, and lines with no service request (the cover
+    journey), are unaffected.
+    """
+    if not quote.get("regionalPricing") or not service_request_id:
+        return
+    try:
+        sr_oid = ObjectId(str(service_request_id).strip())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid service_request_id")
+    service_request = service_requests_collection.find_one(
+        {"_id": sr_oid, "deviceId": quote.get("deviceId")}, {"postcode": 1})
+    if not service_request:
+        raise HTTPException(status_code=404, detail="Service request not found for this quote's device")
+    if not quote.get("postcode") or service_request.get("postcode") != quote.get("postcode"):
+        raise HTTPException(
+            status_code=409,
+            detail="The repair address is not the postcode this price was quoted for. Request a new quote.",
+        )
 
 
 class AddToBasketRequest(BaseModel):
@@ -384,6 +415,7 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
         if payload.optionref < 0 or payload.optionref >= len(options):
             raise HTTPException(status_code=400, detail="optionref out of range for this product")
         option = options[payload.optionref]
+        assert_quote_region_matches_repair(quote, payload.service_request_id)
 
         basket_item = {
             "deviceId": device_id,

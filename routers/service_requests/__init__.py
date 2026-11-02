@@ -25,6 +25,7 @@ from pydantic import BaseModel, EmailStr, Field, model_validator
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from utils.media import IMAGE_TYPES, decode_upload
+from utils.postcode import address_postcode
 
 from ..faults.catalogue import catalogue_collection, find_locale_content
 from ..faults.fault_types import is_known_type, type_label
@@ -93,6 +94,14 @@ class CreateServiceRequest(BaseModel):
     fault: FaultReport
     media: Optional[MediaUpload] = None
     quote_id: Optional[str] = None
+    postcode: Optional[str] = Field(
+        default=None,
+        max_length=16,
+        description=(
+            "Where the engineer will attend. Stored normalised; a regionally-priced quote "
+            "is only accepted into a basket alongside a request for the same postcode."
+        ),
+    )
 
 
 class AddMediaRequest(BaseModel):
@@ -224,6 +233,12 @@ def create_service_request(body: CreateServiceRequest, _: None = Depends(verify_
     device = owned_device(body.deviceId, client_id)
     category = ((device.get("identifiers") or {}).get("category")) or ""
 
+    postcode = None
+    if (body.postcode or "").strip():
+        postcode = address_postcode(body.postcode, body.locale)
+        if not postcode:
+            raise HTTPException(422, "That postcode is not valid for this country.")
+
     # Decode before inserting, so a rejected photo leaves nothing behind.
     photo = decode_fault_photo(body.media) if body.media else None
 
@@ -245,6 +260,7 @@ def create_service_request(body: CreateServiceRequest, _: None = Depends(verify_
         "basket_id": None,
         "contract_reference": None,
         "contact": None,
+        "postcode": postcode,
         "events": [event("REPORTED")],
         "createdAt": timestamp,
         "updatedAt": timestamp,
@@ -375,6 +391,13 @@ def set_appointment(body: SetAppointmentRequest, _: None = Depends(verify_token)
 
     if not can_transition(doc.get("status", REPORTED), SCHEDULED):
         raise HTTPException(409, "This service request can no longer be scheduled.")
+
+    # The engineer goes where the repair was priced. A contact postcode that differs from
+    # the one on the request would book a visit somewhere the price was never quoted for.
+    if body.contact and (body.contact.postcode or "").strip() and doc.get("postcode"):
+        if address_postcode(body.contact.postcode, doc.get("locale")) != doc["postcode"]:
+            raise HTTPException(
+                409, "That address is not the one your repair was priced for. Please start again with the new address.")
 
     booked_date = resolve_slot_date(body.slotId) if body.slotId else body.date
     if not booked_date:
