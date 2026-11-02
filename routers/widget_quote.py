@@ -328,6 +328,12 @@ def _cache_invalidate(custom_sku_id, locale=None):
 def _cache_write(custom_sku_id, locale, age, price, gtee, bracket, currency, grouped,
                  device_working=True, postcode=None):
     low, high = bracket if bracket else (price, price)
+    if postcode is not None:
+        # These options are now regionally priced, so any entry cached without a postcode
+        # is from before that and would be served first — unadjusted, and without asking
+        # for a postcode. Drop them for this SKU and locale.
+        widget_cache_collection.delete_many(
+            {"customSkuId": custom_sku_id, "locale": locale, "postcode": None})
     widget_cache_collection.update_one(
         {
             "customSkuId": custom_sku_id,
@@ -557,8 +563,16 @@ def widget_quote_refresh(payload: WidgetPriceRequest, _: None = Depends(verify_t
     called from a browser.
     """
     assignment_request, age_in_months, _client_doc, _sku, _lsd = resolve_widget_inputs(payload)
-    grouped, bracket, currency, regional_postcode = _compute_options_from_assignment(
-        assignment_request, age_in_months, payload.postcode)
+    try:
+        grouped, bracket, currency, regional_postcode = _compute_options_from_assignment(
+            assignment_request, age_in_months, payload.postcode)
+    except HTTPException as exc:
+        # A refresh without a postcode on a now-regional rule cannot price anything, but it
+        # must still stop the old postcode-free entry being served.
+        if exc.status_code == 422:
+            widget_cache_collection.delete_many(
+                {"customSkuId": payload.customSkuId, "locale": payload.locale, "postcode": None})
+        raise
     if not grouped:
         raise HTTPException(status_code=404, detail="No protection options to cache")
     _cache_write(

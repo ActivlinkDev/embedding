@@ -22,7 +22,24 @@ devices_collection = db["Devices"]
 service_requests_collection = db["ServiceRequests"]
 
 
-def assert_quote_region_matches_repair(quote: Dict[str, Any], service_request_id: Optional[str]) -> None:
+def quoted_postcode(quote: Dict[str, Any], option: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """The postcode the chosen price was adjusted for, or None if it was not regionally priced.
+
+    Read from the option itself first — `factors.region_adjustment` is written by the
+    rating for every adjusted line, whichever endpoint stored the quote — and from the
+    quote's own `postcode` otherwise. Relying on the quote-level flag alone would let a
+    quote stored without it (a direct `/rate_request`) skip the check.
+    """
+    region = (((option or {}).get("factors") or {}).get("region_adjustment") or {})
+    if region.get("postcode"):
+        return region["postcode"]
+    if quote.get("regionalPricing"):
+        return quote.get("postcode") or ""
+    return None
+
+
+def assert_quote_region_matches_repair(quote: Dict[str, Any], service_request_id: Optional[str],
+                                       option: Optional[Dict[str, Any]] = None) -> None:
     """Refuse a regionally-priced quote whose repair is booked for a different postcode.
 
     The quote's price includes an adjustment for the postcode it was priced on. The
@@ -35,7 +52,8 @@ def assert_quote_region_matches_repair(quote: Dict[str, Any], service_request_id
     Quotes without regional pricing, and lines with no service request (the cover
     journey), are unaffected.
     """
-    if not quote.get("regionalPricing") or not service_request_id:
+    postcode = quoted_postcode(quote, option)
+    if postcode is None or not service_request_id:
         return
     try:
         sr_oid = ObjectId(str(service_request_id).strip())
@@ -45,7 +63,7 @@ def assert_quote_region_matches_repair(quote: Dict[str, Any], service_request_id
         {"_id": sr_oid, "deviceId": quote.get("deviceId")}, {"postcode": 1})
     if not service_request:
         raise HTTPException(status_code=404, detail="Service request not found for this quote's device")
-    if not quote.get("postcode") or service_request.get("postcode") != quote.get("postcode"):
+    if not postcode or service_request.get("postcode") != postcode:
         raise HTTPException(
             status_code=409,
             detail="The repair address is not the postcode this price was quoted for. Request a new quote.",
@@ -415,7 +433,7 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
         if payload.optionref < 0 or payload.optionref >= len(options):
             raise HTTPException(status_code=400, detail="optionref out of range for this product")
         option = options[payload.optionref]
-        assert_quote_region_matches_repair(quote, payload.service_request_id)
+        assert_quote_region_matches_repair(quote, payload.service_request_id, option)
 
         basket_item = {
             "deviceId": device_id,

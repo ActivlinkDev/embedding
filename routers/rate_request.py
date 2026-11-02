@@ -623,10 +623,22 @@ def rate_request(
     Every call **writes a quote** to the `Quotes` collection and returns its `quote_id`, which
     `GET /quote/{quote_id}` and the payment-link endpoints consume. There is no dry-run mode.
     """
+    # A regionally-priced batch is for one place. Lines priced for different postcodes in
+    # one quote could not be checked against a single repair address, so refuse them.
+    regional = {r.postcode for r in payload.requests if r.regional_pricing}
+    if len(regional) > 1:
+        raise HTTPException(status_code=422, detail={
+            "code": "postcode_mixed",
+            "message": "Every regionally-priced line in one quote must use the same postcode.",
+        })
+
     grouped, _bracket = price_and_group(payload.requests)
 
-    # Store grouped responses in Quotes collection
-    created_quote_id = store_quote(grouped, device_id=payload.deviceId, client_key=payload.clientKey)
+    # Same quote-level record as `/embedded_quote` and `/widget_quote`, so the basket can
+    # check the repair address whichever endpoint priced it.
+    regional_postcode = next(iter(regional), None)
+    extra = {"postcode": regional_postcode, "regionalPricing": True} if regional else None
+    created_quote_id = store_quote(grouped, device_id=payload.deviceId, client_key=payload.clientKey, extra=extra)
 
     return {
         "quote_id": created_quote_id,

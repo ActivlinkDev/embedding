@@ -412,3 +412,44 @@ def test_an_appointment_for_a_different_postcode_is_refused(sr_db):
             date="2099-01-01", contact={"postcode": "EC1A 1BB"}), None)
     assert error.value.status_code == 409
     requests.find_one_and_update.assert_not_called()
+
+
+# ---- review follow-ups ----
+
+def test_the_basket_checks_a_regional_option_even_without_the_quote_flag(basket):
+    """A quote stored without `regionalPricing` (a direct /rate_request) is still checked."""
+    b, requests = basket
+    requests.find_one.return_value = {"postcode": "HS1 2XQ"}
+    option = {"factors": {"region_adjustment": {"postcode": "EC1A 1BB", "adjustment": -5}}}
+    with pytest.raises(HTTPException) as error:
+        b.assert_quote_region_matches_repair({"deviceId": "DEV1"}, str(ObjectId()), option)
+    assert error.value.status_code == 409
+
+
+def test_direct_rate_requests_record_the_postcode_on_the_quote(rating, monkeypatch):
+    stored = {}
+    monkeypatch.setattr(rr, "store_quote", lambda grouped, **k: stored.update(k) or "Q")
+    rr.rate_request(rr.RateRequestBatch(requests=[line(regional_pricing=True, postcode="HS1 2XQ")]), None)
+    assert stored["extra"] == {"postcode": "HS1 2XQ", "regionalPricing": True}
+
+
+def test_one_quote_cannot_mix_regional_postcodes(rating):
+    with pytest.raises(HTTPException) as error:
+        rr.rate_request(rr.RateRequestBatch(requests=[
+            line(regional_pricing=True, postcode="HS1 2XQ"),
+            line(regional_pricing=True, postcode="EC1A 1BB")]), None)
+    assert error.value.status_code == 422
+
+
+def test_caching_regional_options_drops_the_stale_postcode_free_entries(widget):
+    w, cache = widget
+    w._priced_options(widget_payload(w, "HS1 2XQ"))
+    dropped = cache.delete_many.call_args.args[0]
+    assert dropped["postcode"] is None and dropped["locale"] == "en_GB"
+
+
+def test_a_refresh_without_a_postcode_still_drops_stale_entries(widget):
+    w, cache = widget
+    with pytest.raises(HTTPException):
+        w.widget_quote_refresh(widget_payload(w, None), None)
+    assert cache.delete_many.call_args.args[0]["postcode"] is None
