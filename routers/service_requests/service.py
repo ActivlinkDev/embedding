@@ -179,6 +179,7 @@ def serialize_request(doc: dict, include_media: bool = True) -> dict:
         "fault": doc.get("fault") or {},
         "appointment": doc.get("appointment"),
         "quote_id": doc.get("quote_id"),
+        "postcode": doc.get("postcode"),
         "basket_id": doc.get("basket_id"),
         "contract_reference": doc.get("contract_reference"),
         "mediaCount": doc.get("mediaCount", 0),

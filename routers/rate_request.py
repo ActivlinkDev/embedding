@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from utils.api_docs import error, json_response, secured
 from utils.category_tree import resolve as resolve_category
@@ -9,6 +9,7 @@ import os
 import re
 from typing import List, Optional
 from utils.mongo import require_client
+from utils.postcode import find_region, normalise_postcode
 
 router = APIRouter(tags=["Payments"])
 
@@ -47,6 +48,9 @@ def _ensure_indexes() -> None:
 
 # --- Models ---
 
+# Optional by design; every other field on a rate line is mandatory.
+OPTIONAL_RATE_FIELDS = ("regional_pricing", "postcode")
+
 class RateRequest(BaseModel):
     """One product/term combination to price. **Every field is mandatory**, and each one has to
     match the rating configuration — a value with no configured factor fails that line.
@@ -82,10 +86,28 @@ class RateRequest(BaseModel):
     client: str = Field(..., description="**Mandatory.** `Client_ID` whose rating configuration applies.", examples=["ACME-UK"])
     source: str = Field(..., description="**Mandatory.** Sales channel the rating is defined for.", examples=["web"])
     mode: str = Field(..., description="**Mandatory.** Rating mode, e.g. `live` or `test`.", examples=["live"])
+    regional_pricing: bool = Field(
+        False,
+        description=(
+            "Set by product assignment, from the matched rule's `when.regionalPricing`. When "
+            "`true`, the line is priced `(base × factors) + adjustment` from the rating's "
+            "`regionAdjustment` table and needs `postcode`; a rating with no such table cannot "
+            "price it."
+        ),
+        examples=[False],
+    )
+    postcode: Optional[str] = Field(
+        None,
+        max_length=16,
+        description="Normalised postcode the regional adjustment is matched on. Ignored unless `regional_pricing`.",
+        examples=["IV1 1HY"],
+    )
 
     def missing_fields(self):
         missing = []
         for field in self.model_fields:
+            if field in OPTIONAL_RATE_FIELDS:
+                continue
             val = getattr(self, field)
             if field == "age":
                 if val in ("", None):  # Only blank/None age is missing, 0 is valid
@@ -231,8 +253,39 @@ def match_with_reasons(doc, payload):
         reasons.append(f"price '{payload.price}' not in any priceFactor band")
     if find_band(doc.get("multiFactor", []), payload.multi_count) is None:
         reasons.append(f"multi_count '{payload.multi_count}' not in any multiFactor band")
+    if getattr(payload, "regional_pricing", False):
+        reasons.extend(regional_reasons(doc, payload))
 
     return len(reasons) == 0, reasons
+
+
+def _adjustment_amount(row):
+    """A region row's adjustment as a float, or None if it is not a usable number."""
+    value = (row or {}).get("adjustment")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def regional_reasons(doc, payload):
+    """Why this rating cannot price a regionally-priced line. Empty when it can.
+
+    Every gap fails the line rather than pricing it without the adjustment: a missing
+    table, a missing postcode, a postcode no row covers, or a row with no usable amount.
+    Pricing without the adjustment would undercharge every supplement region.
+    """
+    table = doc.get("regionAdjustment")
+    regions = table.get("regions") if isinstance(table, dict) else None
+    if not regions:
+        return ["regional pricing required but regionAdjustment is not configured"]
+    if not payload.postcode:
+        return ["regional pricing requires a postcode"]
+    row = find_region(regions, payload.postcode, payload.locale)
+    if row is None:
+        return [f"postcode '{payload.postcode}' not in any regionAdjustment row and no '*' row"]
+    if _adjustment_amount(row) is None:
+        return [f"regionAdjustment row '{row.get('prefix')}' has no numeric adjustment"]
+    return []
 
 def extract_lang_from_locale(locale: str) -> str:
     """
@@ -241,6 +294,28 @@ def extract_lang_from_locale(locale: str) -> str:
     if not locale:
         return ""
     return re.split(r'[_-]', locale)[0].lower()
+
+def require_regional_postcode(postcode, locale):
+    """The normalised postcode a regionally-priced quote needs, or a 422 saying what is wrong.
+
+    Raised before anything is priced or stored, with a machine-readable `code` so a
+    journey can ask for the postcode and try again rather than show a dead end:
+    `postcode_required` when none was sent, `postcode_invalid` when it is not a postcode
+    in the locale's country.
+    """
+    if not isinstance(postcode, str) or not postcode.strip():
+        raise HTTPException(status_code=422, detail={
+            "code": "postcode_required",
+            "message": "A postcode is required to price these products.",
+        })
+    normalised = normalise_postcode(postcode, locale)
+    if not normalised:
+        raise HTTPException(status_code=422, detail={
+            "code": "postcode_invalid",
+            "message": "That postcode is not valid for this country.",
+        })
+    return normalised
+
 
 # --- Grouping Utility ---
 
@@ -365,6 +440,44 @@ def price_and_group(requests: List[RateRequest], log_errors: bool = True):
             multi_factor = find_band(matching_doc.get("multiFactor", []), req.multi_count)
 
             rate = round(base_fee * locale_factor * poc_factor * category_factor * age_factor * price_factor * multi_factor, 2)
+
+            # Regional pricing: the adjustment is added after every factor and before the
+            # .49/.99 rounding, so an adjusted price still lands on a price point.
+            region = None
+            if req.regional_pricing:
+                table = matching_doc["regionAdjustment"]
+                row = find_region(table["regions"], req.postcode, req.locale)
+                adjustment = _adjustment_amount(row)
+                adjusted = round(rate + adjustment, 2)
+                minimum = table.get("minimumPrice")
+                minimum = float(minimum) if isinstance(minimum, (int, float)) and not isinstance(minimum, bool) else None
+                region = {
+                    "postcode": req.postcode,
+                    "prefix": row.get("prefix"),
+                    "label": row.get("label"),
+                    "adjustment": adjustment,
+                    "rate_before_adjustment": rate,
+                }
+                # A deduction must not price the line at nothing, or below what the client
+                # has said it can be sold for. Fail the line rather than offer it.
+                if adjusted <= 0 or (minimum is not None and round_price_49_99(adjusted) < minimum):
+                    error = {
+                        "message": "Regional adjustment takes the price below the minimum.",
+                        "details": {**region, "adjusted_rate": adjusted, "minimum_price": minimum},
+                    }
+                    if log_errors:
+                        error_log_collection.insert_one({
+                            "input": req.dict(),
+                            "error_type": "below_minimum",
+                            "error_detail": error,
+                            "created_at": datetime.utcnow()
+                        })
+                    enriched["status"] = "error"
+                    enriched["error"] = error
+                    enriched_results.append(enriched)
+                    continue
+                rate = adjusted
+
             rounded_price = round_price_49_99(rate)
 
             # Track the narrowest price bracket containing this price (for caching)
@@ -383,6 +496,8 @@ def price_and_group(requests: List[RateRequest], log_errors: bool = True):
                 "price_factor": price_factor,
                 "multi_factor": multi_factor
             }
+            if region is not None:
+                enriched["factors"]["region_adjustment"] = region
             enriched["rate"] = rate
             enriched["rounded_price"] = rounded_price
             enriched["rounded_price_pence"] = int(round(rounded_price * 100))
@@ -485,6 +600,13 @@ def rate_request(
 
     `base_fee × locale_factor × poc_factor × category_factor × age_factor × price_factor × multi_factor`
 
+    A line with `regional_pricing: true` then has its region's amount added (or, when negative,
+    deducted) from the rating's `regionAdjustment` table, matched on `postcode` — the most
+    precise row wins and `*` is the catch-all. The rounding below applies after that. Such a
+    line fails, rather than pricing without the adjustment, when the rating has no table, no
+    row covers the postcode, or the result falls below the table's `minimumPrice`. The matched
+    row is shown in `factors.region_adjustment`.
+
     The result is rounded up to the nearest `.49` or `.99` — `rounded_price` is what to charge,
     `rounded_price_pence` the same value in minor units for payment providers, and `rate` the raw
     figure before rounding. The `factors` block shows exactly how the price was reached.
@@ -501,10 +623,22 @@ def rate_request(
     Every call **writes a quote** to the `Quotes` collection and returns its `quote_id`, which
     `GET /quote/{quote_id}` and the payment-link endpoints consume. There is no dry-run mode.
     """
+    # A regionally-priced batch is for one place. Lines priced for different postcodes in
+    # one quote could not be checked against a single repair address, so refuse them.
+    regional = {r.postcode for r in payload.requests if r.regional_pricing}
+    if len(regional) > 1:
+        raise HTTPException(status_code=422, detail={
+            "code": "postcode_mixed",
+            "message": "Every regionally-priced line in one quote must use the same postcode.",
+        })
+
     grouped, _bracket = price_and_group(payload.requests)
 
-    # Store grouped responses in Quotes collection
-    created_quote_id = store_quote(grouped, device_id=payload.deviceId, client_key=payload.clientKey)
+    # Same quote-level record as `/embedded_quote` and `/widget_quote`, so the basket can
+    # check the repair address whichever endpoint priced it.
+    regional_postcode = next(iter(regional), None)
+    extra = {"postcode": regional_postcode, "regionalPricing": True} if regional else None
+    created_quote_id = store_quote(grouped, device_id=payload.deviceId, client_key=payload.clientKey, extra=extra)
 
     return {
         "quote_id": created_quote_id,

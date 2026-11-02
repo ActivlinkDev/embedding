@@ -10,7 +10,12 @@ from utils.dependencies import verify_token
 
 # Import the existing assignment and rating logic
 from .assign_product_by_device_id import assign_product_for_device
-from .rate_request import RateRequest as RateReqModel, RateRequestBatch, rate_request
+from .rate_request import (
+    RateRequest as RateReqModel,
+    price_and_group,
+    require_regional_postcode,
+    store_quote,
+)
 
 router = APIRouter(tags=["Quotes"])
 
@@ -45,12 +50,25 @@ class EmbeddedQuoteRequest(BaseModel):
         examples=[True],
     )
 
+    postcode: Optional[str] = Field(
+        None,
+        max_length=16,
+        description=(
+            "Where the device is, for products whose assignment rule sets "
+            "`when.regionalPricing: true`. Required for those — the call returns `422` with "
+            "`detail.code: \"postcode_required\"` without it — and ignored otherwise. Stored "
+            "on the quote, normalised, so the repair can be checked against it later."
+        ),
+        examples=["IV1 1HY"],
+    )
+
     model_config = {
         "json_schema_extra": {
             "example": {
                 "device_id": "6820f1c9a4b21d0f8c9e4471",
                 "clientKey": "acme_uk_live",
                 "device_working": True,
+                "postcode": None,
             }
         }
     }
@@ -90,6 +108,11 @@ class EmbeddedQuoteRequest(BaseModel):
         ),
         400: error("The device id is malformed, or the stored device is missing a required field.", "Device 'currency' is missing or blank."),
         404: error("The device does not exist, or nothing was assignable to it.", "No products assigned for device"),
+        422: error(
+            "The assigned products are regionally priced and `postcode` is missing (`detail.code: postcode_required`) "
+            "or not valid for the device's country (`postcode_invalid`). Nothing was priced or stored.",
+            {"code": "postcode_required", "message": "A postcode is required to price these products."},
+        ),
         500: error("Assignment or rating failed unexpectedly.", "Rate request error: ..."),
     }),
 )
@@ -131,7 +154,13 @@ async def embedded_quote(payload: EmbeddedQuoteRequest, _: None = Depends(verify
     if not products:
         raise HTTPException(status_code=404, detail="No products assigned for device")
 
-    # 2) Build rate requests from assigned products
+    # 2) Regional pricing is the rule's decision. If it applies, the postcode has to be here
+    # before anything is priced — a quote stored without it could not be checked against
+    # where the repair actually happens.
+    regional = any(p.get("regional_pricing") for p in products)
+    postcode = require_regional_postcode(payload.postcode, products[0].get("locale")) if regional else None
+
+    # 3) Build rate requests from assigned products
     requests: List[RateReqModel] = []
     for p in products:
         try:
@@ -147,6 +176,8 @@ async def embedded_quote(payload: EmbeddedQuoteRequest, _: None = Depends(verify
                 client=p.get("client"),
                 source=p.get("source"),
                 mode=p.get("mode") or "live",
+                regional_pricing=bool(p.get("regional_pricing")),
+                postcode=postcode if p.get("regional_pricing") else None,
             )
             requests.append(rr)
         except Exception as e:
@@ -171,19 +202,19 @@ async def embedded_quote(payload: EmbeddedQuoteRequest, _: None = Depends(verify
         except Exception:
             client_key = None
 
-    batch = RateRequestBatch(deviceId=device_id, clientKey=client_key, requests=requests)
-
-    # 3) Call the rate_request logic which will store quotes and return quote_id
+    # 4) Price and store, exactly as `/rate_request` does — called directly so the quote can
+    # carry the postcode it was priced for. The basket compares that with the repair address.
     try:
-        rate_resp = rate_request(batch)
+        grouped, _bracket = price_and_group(requests)
+        extra = {"postcode": postcode, "regionalPricing": True} if regional else None
+        quote_id = store_quote(grouped, device_id=device_id, client_key=client_key, extra=extra)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Rate request error: {str(e)}")
 
-    # Return quote id and the grouped rate responses produced by rate_request.
     return {
-        "quote_id": rate_resp.get("quote_id"),
-        "responses": rate_resp.get("responses"),
+        "quote_id": quote_id,
+        "responses": grouped,
         "assignment": assignment_result,
     }
