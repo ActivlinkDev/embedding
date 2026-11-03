@@ -14,6 +14,25 @@ router = APIRouter(tags=["Assignments"])
 client = require_client()
 db = client["Activlink"]
 devices_collection = db["Devices"]
+locale_params_collection = db["Locale_Params"]
+
+
+def _months(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def default_guarantee(locale: str) -> int:
+    """The locale's standard manufacturer guarantee in months, from `Locale_Params`.
+
+    A device entered by hand has no catalogue record, so nothing supplies its guarantee,
+    and assignment refuses a device without one. The locale's statutory/standard term
+    is the honest default: it is what such a device is almost certainly covered by.
+    """
+    doc = locale_params_collection.find_one({"locale": locale}, {"gtee_labour": 1, "gtee_parts": 1}) or {}
+    return _months(doc.get("gtee_labour")) or _months(doc.get("gtee_parts"))
 error_log_collection = db["Error_Log_ProductAssignment"]
 
 @router.get(
@@ -159,10 +178,11 @@ def assign_product_for_device(
             or identifiers.get("gteeParts")
             or 0
         )
-        try:
-            gtee = int(gtee)
-        except Exception:
-            gtee = 0
+        gtee = _months(gtee)
+        if not gtee:
+            # Manually-entered devices carry no guarantee; fall back to the locale's
+            # standard term rather than refusing the device outright.
+            gtee = default_guarantee(locale)
 
         currency = device.get("registrationParameters", {}).get("currency")
         if not currency or not currency.strip():
