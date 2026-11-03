@@ -147,3 +147,30 @@ def test_the_widget_cache_never_serves_working_options_to_a_faulty_device(monkey
     query, update = cache.update_one.call_args[0][:2]
     assert query["deviceWorking"] is False
     assert update["$set"]["deviceWorking"] is False
+
+
+# ---- a device with no guarantee of its own ----
+
+def test_a_manual_device_takes_the_locales_standard_guarantee(monkeypatch):
+    """A hand-entered device has no catalogue guarantee; assignment used to refuse it."""
+    devices = MagicMock()
+    devices.find_one.return_value = {
+        "_id": ObjectId(), "client": "AO", "locale": "en_GB", "source": "POS",
+        "identifiers": {"category": "Washing Machine", "gteeLabour": "", "gteeParts": ""},
+        "registrationParameters": {"price": 499, "currency": "GBP", "purchaseDate": "2026-11-03",
+                                   "deviceWorking": False},
+    }
+    locales = MagicMock()
+    locales.find_one.return_value = {"gtee_labour": 12, "gtee_parts": 12}
+    monkeypatch.setattr(by_device, "devices_collection", devices)
+    monkeypatch.setattr(by_device, "locale_params_collection", locales)
+    seen = {}
+
+    def capture(payload):
+        seen["gtee"] = payload.gtee
+        return {"input": payload.model_dump(), "age_in_months": 0, "products": [
+            {"productId": "PON", "mode": "payment", "terms": [1]}]}
+
+    monkeypatch.setattr(by_device, "assign_products", capture)
+    by_device.assign_product_for_device(str(ObjectId()))
+    assert seen["gtee"] == 12
