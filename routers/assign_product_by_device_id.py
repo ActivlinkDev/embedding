@@ -6,7 +6,7 @@ from typing import Optional
 
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
-from .product_assignment import assign_products, coerce_device_working, ProductAssignmentRequest
+from .product_assignment import assign_products, coerce_device_working, product_type, ProductAssignmentRequest
 from utils.mongo import require_client
 
 router = APIRouter(tags=["Assignments"])
@@ -237,6 +237,8 @@ def assign_product_for_device(
                 "mode": mode,
                 # The rating needs a postcode for these, and adds the region's adjustment.
                 "regional_pricing": regional_pricing,
+                # `contract` or `repair`, from the rule's product entry.
+                "product_type": product_type(prod),
             }
             product_list.append(product_entry)
 

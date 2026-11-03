@@ -49,7 +49,7 @@ def _ensure_indexes() -> None:
 # --- Models ---
 
 # Optional by design; every other field on a rate line is mandatory.
-OPTIONAL_RATE_FIELDS = ("regional_pricing", "postcode")
+OPTIONAL_RATE_FIELDS = ("regional_pricing", "postcode", "product_type")
 
 class RateRequest(BaseModel):
     """One product/term combination to price. **Every field is mandatory**, and each one has to
@@ -95,6 +95,15 @@ class RateRequest(BaseModel):
             "price it."
         ),
         examples=[False],
+    )
+    product_type: str = Field(
+        "contract",
+        description=(
+            "Set by product assignment from the rule's `then.products[].productType`: "
+            "`contract` (cover, the default) or `repair` (a one-off paid repair). Carried "
+            "onto the quote and the basket line; it does not change the price."
+        ),
+        examples=["contract"],
     )
     postcode: Optional[str] = Field(
         None,
@@ -329,6 +338,8 @@ def group_responses(responses):
         group_key = tuple(resp.get(k) for k in group_keys)
         if group_key not in groups:
             group_obj = {k: resp.get(k) for k in group_keys}
+            # Per product, not a grouping key: every line of one product shares it.
+            group_obj["product_type"] = resp.get("product_type") or "contract"
             group_obj["options"] = []
             groups[group_key] = group_obj
         option = {
