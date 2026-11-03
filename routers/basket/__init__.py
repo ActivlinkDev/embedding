@@ -464,6 +464,8 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
             "rate": option.get("rate"),
             "rounded_price": option.get("rounded_price"),
             "rounded_price_pence": option.get("rounded_price_pence"),
+            # `contract` or `repair`. A quote stored before this field existed is cover.
+            "product_type": product.get("product_type") or "contract",
             # Per-line unique id to allow precise deletes
             "line_id": str(ObjectId()),
         }

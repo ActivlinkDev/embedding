@@ -89,6 +89,28 @@ def rule_device_working(rule: Dict[str, Any]) -> List[bool]:
     return accepted
 
 
+PRODUCT_TYPES = ("contract", "repair")
+
+
+def product_type(product: Dict[str, Any]) -> str:
+    """What buying this product gives the customer: `contract` (cover) or `repair`.
+
+    Set per product on the rule, as `then.products[].productType`. A repair is a one-off
+    paid fix with no ongoing cover, which the confirmation page presents as a booked
+    repair rather than active cover. Anything absent or unrecognised is `contract`, so
+    every rule written before this field existed keeps its meaning.
+    """
+    raw = (product or {}).get("productType")
+    if raw is None:
+        return "contract"
+    value = str(raw).strip().lower()
+    if value in PRODUCT_TYPES:
+        return value
+    logger.warning("[assignment] product %s has an unknown productType %r; treating it as contract",
+                   (product or {}).get("productId"), raw)
+    return "contract"
+
+
 def rule_regional_pricing(rule: Dict[str, Any]) -> bool:
     """Whether the products this rule assigns are priced with a regional adjustment.
 

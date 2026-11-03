@@ -177,6 +177,7 @@ async def embedded_quote(payload: EmbeddedQuoteRequest, _: None = Depends(verify
                 source=p.get("source"),
                 mode=p.get("mode") or "live",
                 regional_pricing=bool(p.get("regional_pricing")),
+                product_type=p.get("product_type") or "contract",
                 postcode=postcode if p.get("regional_pricing") else None,
             )
             requests.append(rr)

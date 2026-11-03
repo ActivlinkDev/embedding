@@ -28,6 +28,7 @@ from utils.dependencies import verify_token
 from routers.sku.catalog_dependencies import catalog
 from .product_assignment import (
     assign_products,
+    product_type,
     ProductAssignmentRequest,
     calculate_age_in_months,
 )
@@ -281,6 +282,7 @@ def _compute_options_from_assignment(assignment_request, age_in_months, postcode
                 mode=mode or "live",
                 regional_pricing=regional,
                 postcode=regional_postcode,
+                product_type=product_type(prod),
             ))
 
     grouped, bracket = price_and_group(requests)
