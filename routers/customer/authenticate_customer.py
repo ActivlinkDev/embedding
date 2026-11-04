@@ -59,7 +59,7 @@ def authenticate_customer(
 
     The supplied number is compared against the customer's stored `telephone`, `phone` or
     `mobile` after normalising both to E.164, so `07700 900123` and `+447700900123` match. On
-    success an SMS code is sent and an `otp_fallback` cookie is set; verify it with
+    success an SMS code is sent to the number on record; verify it with
     `POST /otp/verify`, then call `POST /customer/mark-verified`.
 
     **Failure is reported in the body, not the status code.** A mismatch returns `200` with
@@ -121,41 +121,12 @@ def authenticate_customer(
         if matched:
             # Trigger OTP request flow: reuse OTP module helpers so we don't duplicate logic
             try:
-                # Import internal helpers from otp module
-                from routers.otp import _get_record, _generate_code, _save_code, _send_sms, serialize_cookie, mask_destination, RESEND_COOLDOWN_SECONDS, _now_ms
+                from routers.otp import issue_code, mask_destination
 
-                channel = "sms"
                 phone_norm = phone.strip()
-
-                existing = _get_record(phone_norm, channel)
-                now = _now_ms()
-                reused = False
-                if existing and (now - existing["createdAt"]) < RESEND_COOLDOWN_SECONDS * 1000:
-                    code = existing["code"]
-                    reused = True
-                else:
-                    code = _generate_code()
-                    _save_code(phone_norm, channel, code)
-
-                if not reused:
-                    # send SMS (may raise HTTPException which will propagate)
-                    _send_sms(phone_norm, f"Your validation code is: {code}")
-
-                # set cookie fallback similar to OTP.request
-                try:
-                    cookie_val = serialize_cookie(code, phone_norm)
-                    if response is not None:
-                        response.set_cookie(
-                            key="otp_fallback",
-                            value=cookie_val,
-                            httponly=True,
-                            secure=True,
-                            samesite="lax",
-                            max_age=5 * 60,
-                        )
-                except Exception:
-                    # ignore cookie failures
-                    pass
+                # May raise HTTPException (SMS failure, send cap), which propagates. The code
+                # goes to the handset only — never into this response or a cookie.
+                reused = issue_code(phone_norm, "sms")
 
                 return {"authenticated": True, "otp_sent": True, "destination_masked": mask_destination(phone_norm), "reused": reused}
             except HTTPException:

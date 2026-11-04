@@ -4,11 +4,12 @@ import os
 import re
 import sys
 
-from utils.api_docs import json_response
+from utils.api_docs import error, json_response
 import traceback
 import logging
 from datetime import datetime, timezone
-from fastapi import APIRouter, BackgroundTasks, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from utils.dseo_auth import verify_tag
 from fastapi.responses import JSONResponse
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -618,7 +619,7 @@ def _slim_payload(body: dict) -> dict:
     response_description="Acknowledgement, with a per-task account of what was processed.",
     responses={
         200: json_response(
-            "**Always returned**, even when processing failed — see `processed` for what "
+            "Returned for every authenticated postback, even when processing failed — see `processed` for what "
             "actually happened.",
             {
                 "status": "ok",
@@ -640,6 +641,7 @@ def _slim_payload(body: dict) -> dict:
                 ],
             },
         ),
+        401: error("`sig` is missing or does not match the MasterSKU the tasks target.", "Invalid postback signature"),
     },
 )
 async def dseo_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -652,8 +654,8 @@ async def dseo_webhook(request: Request, background_tasks: BackgroundTasks):
     every payload is stored for audit — the bulky `items` arrays are stripped — and the data is
     written onto the matching MasterSKU's locale record.
 
-    **It always returns `200`**, even when a task cannot be matched or stored, so DataforSEO does
-    not retry into a loop. The real outcome is in `processed`, one entry per task, each with its
+    **Once authenticated it always returns `200`**, even when a task cannot be matched or stored,
+    so DataforSEO does not retry into a loop. The real outcome is in `processed`, one entry per task, each with its
     own `status`. Treat the status code as "received", never as "succeeded".
 
     A task whose best match carries a price the SKU's category cannot plausibly have — an
@@ -671,12 +673,25 @@ async def dseo_webhook(request: Request, background_tasks: BackgroundTasks):
     `market.merchant` with the cheapest seller it found, recording `priceMin`, `priceMean` and
     `priceSampleSize` alongside them.
 
-    There is **no bearer token** on this endpoint; the `id` query parameter is the task
-    correlation, not a credential.
+    There is **no bearer token** on this endpoint. Instead the `postback_url` given to DataforSEO
+    carries `sig`, an HMAC (keyed by `DSEO_WEBHOOK_SECRET`) of the MasterSKU id the task was
+    submitted for. A postback without a valid `sig`, or whose tasks target any other MasterSKU,
+    is refused with `401` and nothing from it is stored. The `id` query parameter is only the
+    task correlation, not a credential.
     """
     task_id = request.query_params.get("id")
 
     body = await _parse_body(request)
+
+    # Authenticate before anything is stored or written: every task must target the MasterSKU
+    # the signed postback URL was issued for. Unsigned, mis-signed or mixed-tag postbacks are
+    # refused outright and never reach the catalogue.
+    tasks = (body.get("tasks") or []) if isinstance(body, dict) else []
+    sig = request.query_params.get("sig")
+    tags = {str((t.get("data") or {}).get("tag") or "") for t in tasks if isinstance(t, dict)}
+    if not tasks or len(tags) != 1 or not verify_tag(next(iter(tags)), sig):
+        print(f"[DSEO Webhook] Rejected unauthenticated postback task_id={task_id}", file=sys.stderr)
+        raise HTTPException(status_code=401, detail="Invalid postback signature")
 
     print(f"[DSEO Webhook] Received postback task_id={task_id}", file=sys.stderr)
 
@@ -694,7 +709,6 @@ async def dseo_webhook(request: Request, background_tasks: BackgroundTasks):
         print(f"[DSEO Webhook] DB insert failed: {e}\n{traceback.format_exc()}", file=sys.stderr)
 
     # Dispatch each task to the correct handler based on the DataforSEO function type
-    tasks = (body.get("tasks") or []) if isinstance(body, dict) else []
     for task in tasks:
         fn = (task.get("data") or {}).get("function", "")
         handler = _process_product_info_task if fn == "product_info" else _process_task
