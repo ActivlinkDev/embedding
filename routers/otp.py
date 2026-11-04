@@ -5,6 +5,7 @@ import logging, os, time, hmac, hashlib, base64, secrets, requests
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import verify_token
 from utils.mongo import require_client
+from pymongo.errors import DuplicateKeyError
 
 logger = logging.getLogger(__name__)
 
@@ -93,13 +94,13 @@ def issue_code(phone: str, channel: str = "sms") -> bool:
     cid = _challenge_id(phone, channel)
     now = _now_ms()
 
-    existing = _get_record(phone, channel)
-    if existing and (now - existing["createdAt"]) < RESEND_COOLDOWN_SECONDS * 1000:
+    prior = otp_collection.find_one({"_id": cid})
+    if (prior and not prior.get("consumed")
+            and (now - prior.get("createdAt", 0)) < RESEND_COOLDOWN_SECONDS * 1000):
         return True
 
-    prior = otp_collection.find_one({"_id": cid}, {"sendWindowStart": 1, "sendCount": 1}) or {}
-    window_start = prior.get("sendWindowStart") or 0
-    send_count = prior.get("sendCount") or 0
+    window_start = (prior or {}).get("sendWindowStart") or 0
+    send_count = (prior or {}).get("sendCount") or 0
     if now - window_start >= SEND_WINDOW_SECONDS * 1000:
         window_start, send_count = now, 0
     if send_count >= MAX_SENDS_PER_WINDOW:
@@ -107,24 +108,33 @@ def issue_code(phone: str, channel: str = "sms") -> bool:
 
     code = _generate_code()
     nonce = secrets.token_hex(16)
-    otp_collection.replace_one(
-        {"_id": cid},
-        {
-            "_id": cid,
-            "phone": phone,
-            "channel": channel,
-            "codeHash": _hash_code(phone, channel, code),
-            "nonce": nonce,
-            "createdAt": now,
-            "attempts": 0,
-            "consumed": False,
-            "sendWindowStart": window_start,
-            "sendCount": send_count + 1,
-            # Kept past the code's own TTL so the send-rate window survives until it lapses.
-            "purgeAt": datetime.fromtimestamp((now / 1000) + max(OTP_TTL_SECONDS, SEND_WINDOW_SECONDS), tz=timezone.utc),
-        },
-        upsert=True,
-    )
+    new_doc = {
+        "_id": cid,
+        "phone": phone,
+        "channel": channel,
+        "codeHash": _hash_code(phone, channel, code),
+        "nonce": nonce,
+        "createdAt": now,
+        "attempts": 0,
+        "consumed": False,
+        "sendWindowStart": window_start,
+        "sendCount": send_count + 1,
+        # Kept past the code's own TTL so the send-rate window survives until it lapses.
+        "purgeAt": datetime.fromtimestamp((now / 1000) + max(OTP_TTL_SECONDS, SEND_WINDOW_SECONDS), tz=timezone.utc),
+    }
+
+    # Compare-and-swap on the challenge we read: if a concurrent request replaced it first, we
+    # lose and send nothing, so two racing requests cannot both pass the cap or both send.
+    if prior is None:
+        try:
+            otp_collection.insert_one(new_doc)
+        except DuplicateKeyError:
+            return True
+    else:
+        swapped = otp_collection.replace_one({"_id": cid, "nonce": prior.get("nonce")}, new_doc)
+        if swapped.modified_count != 1:
+            return True
+
     try:
         _send_sms(phone, f"Your validation code is: {code}")
     except Exception:

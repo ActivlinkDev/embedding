@@ -51,8 +51,18 @@ class FakeCollection:
                 return dict(doc)
         return None
 
-    def replace_one(self, flt, doc, upsert=False):
+    def insert_one(self, doc):
+        from pymongo.errors import DuplicateKeyError
+        if doc["_id"] in self.docs:
+            raise DuplicateKeyError("dup")
         self.docs[doc["_id"]] = dict(doc)
+
+    def replace_one(self, flt, doc, upsert=False):
+        for key, existing in list(self.docs.items()):
+            if _matches(existing, flt):
+                self.docs[key] = dict(doc)
+                return _Result(1)
+        return _Result(0)
 
     def update_one(self, flt, update):
         for doc in self.docs.values():
@@ -144,6 +154,28 @@ def test_send_rate_is_capped_per_number(otp_env):
     assert len(sent) == otp.MAX_SENDS_PER_WINDOW
 
 
+def test_concurrent_requests_send_only_once(otp_env, monkeypatch):
+    """Two requests that read the same challenge: only the one whose swap lands sends."""
+    coll, sent, clock = otp_env
+    otp.request_otp(otp.OtpRequestIn(phone=PHONE))
+    clock["ms"] += (otp.RESEND_COOLDOWN_SECONDS + 1) * 1000
+    stale = coll.find_one({"_id": otp._challenge_id(PHONE, "sms")})
+
+    real_find = coll.find_one
+    monkeypatch.setattr(coll, "find_one", lambda flt, projection=None: dict(stale) if flt == {"_id": stale["_id"]} else real_find(flt, projection))
+    assert otp.request_otp(otp.OtpRequestIn(phone=PHONE))["reused"] is False   # wins the swap
+    assert otp.request_otp(otp.OtpRequestIn(phone=PHONE))["reused"] is True    # stale read loses
+    assert len(sent) == 2  # the initial send plus exactly one of the racing pair
+
+
+def test_concurrent_first_requests_send_only_once(otp_env, monkeypatch):
+    coll, sent, _ = otp_env
+    monkeypatch.setattr(coll, "find_one", lambda flt, projection=None: None)  # both see no challenge
+    otp.request_otp(otp.OtpRequestIn(phone=PHONE))
+    assert otp.request_otp(otp.OtpRequestIn(phone=PHONE))["reused"] is True
+    assert len(sent) == 1
+
+
 def test_resend_inside_cooldown_sends_nothing(otp_env):
     _, sent, _ = otp_env
     otp.request_otp(otp.OtpRequestIn(phone=PHONE))
@@ -181,6 +213,32 @@ def test_pinned_caller_cannot_read_another_tenants_customer(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         get_by_id.get_customer_by_id(customer_id=str(doc["_id"]), scope="AO12345")
     assert exc.value.status_code == 404
+
+
+def test_consent_alone_does_not_grant_access(monkeypatch):
+    """marketingPreferences can be written by anyone via /get-or-create-customer, so a consent
+    entry under the caller's own ClientKey must not unlock the customer."""
+    doc = _customer(str(ObjectId()), str(ObjectId()))
+    doc["marketingPreferences"] = [{"clientKey": "AO12345"}]
+    monkeypatch.setattr(get_by_id, "customer_collection", _Coll(doc))
+    monkeypatch.setattr(get_by_id, "orders_collection", _Coll(None))
+    monkeypatch.setattr(get_by_id, "client_id_for_key", lambda key: "AO")
+    monkeypatch.setattr(get_by_id, "device_ids_owned_by", lambda cid, ids: set())
+
+    with pytest.raises(HTTPException) as exc:
+        get_by_id.get_customer_by_id(customer_id=str(doc["_id"]), scope="AO12345")
+    assert exc.value.status_code == 404
+
+
+def test_order_under_the_callers_key_grants_access(monkeypatch):
+    doc = _customer(str(ObjectId()), str(ObjectId()))
+    monkeypatch.setattr(get_by_id, "customer_collection", _Coll(doc))
+    monkeypatch.setattr(get_by_id, "orders_collection", _Coll({"_id": ObjectId()}))
+    monkeypatch.setattr(get_by_id, "client_id_for_key", lambda key: "AO")
+    monkeypatch.setattr(get_by_id, "device_ids_owned_by", lambda cid, ids: set())
+
+    data = get_by_id.get_customer_by_id(customer_id=str(doc["_id"]), scope="AO12345")["data"]
+    assert data["devices"] == []
 
 
 def test_pinned_caller_sees_only_its_own_slice(monkeypatch):

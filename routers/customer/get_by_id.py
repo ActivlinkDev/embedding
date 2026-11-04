@@ -41,8 +41,8 @@ def _serialize_doc(doc: dict) -> dict:
 def _restrict_to_tenant(doc: dict, client_key: str) -> dict | None:
     """The customer as `client_key` may see it, or None when that tenant has no claim on them.
 
-    Fail-closed: an unknown ClientKey, or a customer with no device, consent or order tied to
-    the tenant, yields None rather than the unfiltered record.
+    Fail-closed: an unknown ClientKey, or a customer with no device or order tied to the
+    tenant, yields None rather than the unfiltered record.
     """
     client_id = client_id_for_key(client_key)
     if not client_id:
@@ -58,7 +58,10 @@ def _restrict_to_tenant(doc: dict, client_key: str) -> dict | None:
     has_order = bool(orders_collection.find_one(
         {"customer_id": str(doc.get("_id")), "client_key": client_key}, {"_id": 1}))
 
-    if not owned and not own_prefs and not has_order:
+    # Consent is deliberately not a qualifying relationship: /get-or-create-customer is
+    # unauthenticated and records marketingPreferences for any known ClientKey, so anyone could
+    # manufacture it. Only devices and orders, written by authenticated/trusted paths, count.
+    if not owned and not has_order:
         return None
 
     scoped = dict(doc)
@@ -116,9 +119,10 @@ def get_customer_by_id(
     `customer_id` is mandatory.
 
     **Tenant scoping.** A customer record is shared between clients, so a caller pinned to a
-    ClientKey only sees a customer it has a relationship with — a device in `devices` owned by
-    its client, consent recorded under its ClientKey, or an order placed under it. Anyone else
-    gets `404`, as if the id did not exist. For such a caller `devices` and
+    ClientKey only sees a customer it has a relationship with: a device in `devices` owned by
+    its client, or an order placed under its ClientKey. Anyone else gets `404`, as if the id
+    did not exist. Consent in `marketingPreferences` does **not** count, because
+    `/get-or-create-customer` lets anyone record it. For such a caller `devices` and
     `marketingPreferences` are narrowed to its own entries.
     """
     try:
