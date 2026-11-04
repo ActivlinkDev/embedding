@@ -3,8 +3,9 @@ from bson import ObjectId
 import os
 
 from utils.api_docs import error, json_response, secured
-from utils.dependencies import verify_token
+from utils.dependencies import caller_client_key
 from utils.mongo import require_client
+from utils.tenant import client_id_for_key, device_ids_owned_by
 
 router = APIRouter(tags=["Customers"], prefix="")
 
@@ -15,6 +16,7 @@ if not MONGO_URI:
 client = require_client()
 db = client["Activlink"]
 customer_collection = db["Customer"]
+orders_collection = db["ContractOrders"]
 
 
 def _serialize_doc(doc: dict) -> dict:
@@ -34,6 +36,40 @@ def _serialize_doc(doc: dict) -> dict:
     if not doc:
         return {}
     return _serialize_value(doc)
+
+
+def _restrict_to_tenant(doc: dict, client_key: str) -> dict | None:
+    """The customer as `client_key` may see it, or None when that tenant has no claim on them.
+
+    Fail-closed: an unknown ClientKey, or a customer with no device or order tied to the
+    tenant, yields None rather than the unfiltered record.
+    """
+    client_id = client_id_for_key(client_key)
+    if not client_id:
+        return None
+
+    devices = doc.get("devices") if isinstance(doc.get("devices"), list) else []
+    device_ids = [str(d.get("deviceId")) for d in devices if isinstance(d, dict) and d.get("deviceId")]
+    owned = device_ids_owned_by(client_id, device_ids) if device_ids else set()
+
+    prefs = doc.get("marketingPreferences") if isinstance(doc.get("marketingPreferences"), list) else []
+    own_prefs = [p for p in prefs if isinstance(p, dict) and p.get("clientKey") == client_key]
+
+    has_order = bool(orders_collection.find_one(
+        {"customer_id": str(doc.get("_id")), "client_key": client_key}, {"_id": 1}))
+
+    # Consent is deliberately not a qualifying relationship: /get-or-create-customer is
+    # unauthenticated and records marketingPreferences for any known ClientKey, so anyone could
+    # manufacture it. Only devices and orders, written by authenticated/trusted paths, count.
+    if not owned and not has_order:
+        return None
+
+    scoped = dict(doc)
+    if "devices" in doc:
+        scoped["devices"] = [d for d in devices if isinstance(d, dict) and str(d.get("deviceId")) in owned]
+    if "marketingPreferences" in doc:
+        scoped["marketingPreferences"] = own_prefs
+    return scoped
 
 
 @router.get(
@@ -68,7 +104,7 @@ def get_customer_by_id(
         description="**Mandatory.** The customer's `_id` (24-character ObjectId).",
         examples=["6820f1c9a4b21d0f8c9e9001"],
     ),
-    _=Depends(verify_token),
+    scope: str | None = Depends(caller_client_key),
 ):
     """
     Fetch a customer record by id.
@@ -81,6 +117,13 @@ def get_customer_by_id(
     cover, `registered` for devices where it was declined.
 
     `customer_id` is mandatory.
+
+    **Tenant scoping.** A customer record is shared between clients, so a caller pinned to a
+    ClientKey only sees a customer it has a relationship with: a device in `devices` owned by
+    its client, or an order placed under its ClientKey. Anyone else gets `404`, as if the id
+    did not exist. Consent in `marketingPreferences` does **not** count, because
+    `/get-or-create-customer` lets anyone record it. For such a caller `devices` and
+    `marketingPreferences` are narrowed to its own entries.
     """
     try:
         try:
@@ -91,6 +134,12 @@ def get_customer_by_id(
         doc = customer_collection.find_one({"_id": objid})
         if not doc:
             raise HTTPException(status_code=404, detail="Customer not found")
+
+        if scope:
+            doc = _restrict_to_tenant(doc, scope)
+            if doc is None:
+                # 404 rather than 403: a pinned caller must not learn another tenant's ids exist.
+                raise HTTPException(status_code=404, detail="Customer not found")
 
         # Exclude transaction_log from API responses
         if isinstance(doc, dict) and "transaction_log" in doc:
@@ -104,5 +153,4 @@ def get_customer_by_id(
     except HTTPException:
         raise
     except Exception as e:
-        # Development helper: return exception details for debugging
-        raise HTTPException(status_code=500, detail=f"Internal error: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {type(e).__name__}")

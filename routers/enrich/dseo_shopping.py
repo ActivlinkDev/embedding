@@ -3,6 +3,7 @@ import base64
 import logging
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
+from utils.dseo_auth import postback_url as signed_postback_url
 from fastapi.responses import JSONResponse
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -70,7 +71,7 @@ async def submit_dseo_shopping_task(masterSKUid: str, locale: str) -> dict:
     location_code = locale_doc.get("location_code") or 2826
     language_code = locale_doc.get("hl") or "en"
 
-    postback_url = f"{DSEO_WEBHOOK_BASE_URL}/dseo/webhook?id=$id"
+    postback_url = signed_postback_url(DSEO_WEBHOOK_BASE_URL, masterSKUid)
 
     payload = [
         {
