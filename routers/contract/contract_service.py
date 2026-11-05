@@ -144,6 +144,12 @@ def _get_or_create_order(session: dict, customer_id: str, basket_id: str | None,
     return order
 
 
+def _first_payment(contract: dict):
+    """What the contract's first charge was: its initial payment when it has one."""
+    initial = contract.get("initial_price")
+    return initial if initial is not None else contract.get("price")
+
+
 def _refresh_order(order_id) -> None:
     """Recompute the parent order's rolled-up status and amount reconciliation."""
     children = list(contracts_collection.find({"order_id": order_id}))
@@ -159,7 +165,9 @@ def _refresh_order(order_id) -> None:
     else:
         rollup = "PENDING_ACTIVATION"
 
-    items_sum = round(sum((c.get("price") or 0) for c in children), 2)
+    # The checkout total is the first payment: a subscription that opens with an initial
+    # payment charged that, not the monthly price, at checkout.
+    items_sum = round(sum(_first_payment(c) or 0 for c in children), 2)
     order = orders_collection.find_one({"_id": order_id})
     total = order.get("stripe_amount_total") if order else None
     reconciled = None
@@ -229,6 +237,13 @@ def create_contract(session: dict, customer_id: str) -> list[dict]:
         price = item.get("rounded_price")
         if price is None and item.get("rounded_price_pence") is not None:
             price = item["rounded_price_pence"] / 100
+        # Monthly plans that open with an initial payment: charged at checkout, covering
+        # month 1. `price` is the monthly amount billed from month 2.
+        initial_price = item.get("initial_price")
+        if initial_price is None and item.get("initial_price_pence") is not None:
+            initial_price = item["initial_price_pence"] / 100
+        if billing != "MONTHLY":
+            initial_price = None
         currency = (item.get("currency") or session.get("currency") or "gbp").upper()
 
         doc = {
@@ -254,6 +269,7 @@ def create_contract(session: dict, customer_id: str) -> list[dict]:
             "end_date": None,
             "billing": billing,
             "price": price,
+            "initial_price": initial_price,
             "currency": currency,
             "auto_renew": billing == "MONTHLY",
             "stripe_customer_id": session.get("customer"),
@@ -469,7 +485,7 @@ def handle_invoice_paid(invoice: dict, stripe_event_id: str | None = None) -> li
             {"stripe_subscription_id": sub_id, "status": "PENDING_ACTIVATION"}
         ))
         for doc in pending:
-            _record_payment(doc, invoice_id, "INITIAL", doc.get("price"),
+            _record_payment(doc, invoice_id, "INITIAL", _first_payment(doc),
                             doc.get("currency") or currency, stripe_event_id=stripe_event_id)
             activate(doc, doc.get("term_months") or 12)
             affected.append(contracts_collection.find_one({"_id": doc["_id"]}))

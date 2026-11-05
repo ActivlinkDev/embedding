@@ -1,7 +1,9 @@
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field, EmailStr, HttpUrl
+from pydantic import BaseModel, Field, EmailStr, HttpUrl, model_validator
 from typing import List, Optional, Dict
 from enum import Enum
+from datetime import datetime, timezone
+import calendar
 import stripe
 import os
 import logging
@@ -157,6 +159,34 @@ class CheckoutSessionRequest(BaseModel):
         examples=["hosted_page"],
     )
 
+    initial_amount: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "**Subscriptions only.** An opening payment, in the smallest currency unit, charged "
+            "at checkout and covering the first month. `unit_amount` is then billed monthly "
+            "from month 2: the subscription starts with a trial that ends on the same day next "
+            "month. Use `initial_price_pence` from `/rate_request`. Rejected with `mode: payment`."
+        ),
+        examples=[14999],
+    )
+    initial_item_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Line name for the opening payment on the Checkout page. Defaults to "
+            "`<product_name> — initial payment (includes first month)`."
+        ),
+        examples=["Initial payment (includes first month)"],
+    )
+
+    @model_validator(mode="after")
+    def _initial_amount_needs_subscription(self):
+        # A one-off checkout has no month 2, so an opening payment there would be a
+        # second charge for the same cover. Refuse rather than drop it silently.
+        if self.initial_amount is not None and self.mode != ModeEnum.subscription:
+            raise ValueError("initial_amount is only valid when mode is 'subscription'")
+        return self
+
     model_config = {
         "json_schema_extra": {
             "example": {
@@ -200,10 +230,46 @@ def build_line_items(request: CheckoutSessionRequest):
             "interval_count": request.recurring_interval_count or 1
         }
 
-    return [{
+    line_items = [{
         "price_data": price_data,
         "quantity": request.quantity
     }]
+
+    # The opening payment: a one-off price (no `recurring`) in a subscription session is
+    # charged on the subscription's first invoice only.
+    if request.mode == "subscription" and request.initial_amount:
+        initial_product = {
+            "name": request.initial_item_name
+            or f"{request.product_name} — initial payment (includes first month)",
+        }
+        if request.product_images:
+            initial_product["images"] = request.product_images
+        line_items.insert(0, {
+            "price_data": {
+                "currency": request.currency,
+                "product_data": initial_product,
+                "unit_amount": request.initial_amount,
+            },
+            "quantity": 1,
+        })
+
+    return line_items
+
+
+def add_months(moment: datetime, months: int) -> datetime:
+    """`moment` moved by whole calendar months, clamped to the end of shorter months
+    (31 Jan + 1 month is 28/29 Feb)."""
+    month_index = moment.month - 1 + months
+    year = moment.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(moment.day, calendar.monthrange(year, month)[1])
+    return moment.replace(year=year, month=month, day=day)
+
+
+def first_recurring_charge_at(now: Optional[datetime] = None) -> int:
+    """Unix time the monthly billing starts when an initial payment covers month 1."""
+    now = now or datetime.now(timezone.utc)
+    return int(add_months(now, 1).timestamp())
 
 def _resolve_stripe_customer_id(email: Optional[str], phone: str) -> str:
     """Find or create a Stripe Customer carrying the phone so Checkout pre-fills it."""
@@ -326,6 +392,18 @@ def generate_checkout_session(request: CheckoutSessionRequest):
             "metadata": {**(request.metadata or {}), "internal_reference": request.internal_reference},
             "locale": request.locale if request.locale else None
         }
+        if request.mode == ModeEnum.subscription and request.initial_amount:
+            # Month 1 is paid for by the opening payment, so the first monthly charge is
+            # the same day next month. A trial defers the recurring line; the one-off line
+            # is still charged now, on the subscription's first invoice.
+            session_params["subscription_data"] = {
+                "trial_end": first_recurring_charge_at(),
+                "metadata": {
+                    "initial_amount": str(request.initial_amount),
+                    "recurring_amount": str(request.unit_amount * request.quantity),
+                },
+            }
+            session_params["metadata"]["initial_amount"] = str(request.initial_amount)
         if request.ui_mode == UiModeEnum.elements:
             # Elements sessions have no success/cancel pages: the customer stays on the
             # caller's page and only leaves (and comes back to return_url) for payment

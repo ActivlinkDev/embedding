@@ -149,6 +149,16 @@ def generate_quote_payment_link(req: PaymentLinkRequest):
     except (ValueError, KeyError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid or missing rounded_price_pence in option")
 
+    # Subscriptions that open with a larger first payment covering month 1.
+    initial_amount = None
+    if option.get("mode") == "subscription" and option.get("initial_price_pence") is not None:
+        try:
+            initial_amount = int(option["initial_price_pence"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid initial_price_pence in option")
+        if initial_amount <= 0:
+            raise HTTPException(status_code=400, detail="Invalid initial_price_pence in option")
+
     # Use locale only if it exists
     locale = product.get("lang") if "lang" in product else None
 
@@ -157,6 +167,7 @@ def generate_quote_payment_link(req: PaymentLinkRequest):
         product_description=req.product_description or product.get("product_description"),
         product_images=req.product_images or product.get("product_images"),
         unit_amount=unit_amount,
+        initial_amount=initial_amount,
         currency=product.get("currency", "gbp").lower(),
         quantity=1,
         mode=ModeEnum(option.get("mode", "payment")),

@@ -464,6 +464,10 @@ def add_to_basket(payload: AddToBasketRequest, _: None = Depends(verify_token)):
             "rate": option.get("rate"),
             "rounded_price": option.get("rounded_price"),
             "rounded_price_pence": option.get("rounded_price_pence"),
+            # Subscriptions with an opening payment: charged once at checkout and covering
+            # month 1; `rounded_price` is then billed monthly from month 2.
+            "initial_price": option.get("initial_price"),
+            "initial_price_pence": option.get("initial_price_pence"),
             # `contract` or `repair`. A quote stored before this field existed is cover.
             "product_type": product.get("product_type") or "contract",
             # Per-line unique id to allow precise deletes
