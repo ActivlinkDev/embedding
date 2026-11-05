@@ -243,6 +243,72 @@ def round_price_49_99(value):
     else:
         return round(whole + 1.49, 2)
 
+# --- Initial payment (subscriptions) ---
+#
+# A subscription can open with a larger first payment that covers month 1, with the
+# monthly price billed from month 2. The Rating document configures it as:
+#
+#   "initialPayment": {"baseFee": 105.0, "applyFactors": ["locale", "category", ...]}
+#
+# `baseFee` is multiplied by the named factors (the same ones the monthly price used for
+# this line) and rounded to .49/.99 like every other price. An empty list means a fixed
+# amount. A rating with no block prices the subscription monthly from month 1, as before.
+# A regional adjustment applies to the monthly price only.
+
+INITIAL_PAYMENT_FACTORS = ("locale", "poc", "category", "age", "price", "multi")
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def initial_payment_reasons(doc, payload):
+    """Why this rating cannot price the line's initial payment. Empty when it can.
+
+    Only subscription lines take an initial payment. A malformed block fails the line
+    rather than selling the subscription without its first payment.
+    """
+    block = doc.get("initialPayment")
+    if block is None or getattr(payload, "mode", None) != "subscription":
+        return []
+    if not isinstance(block, dict):
+        return ["initialPayment must be an object"]
+    reasons = []
+    base_fee = block.get("baseFee")
+    if not _is_number(base_fee) or base_fee <= 0:
+        reasons.append("initialPayment.baseFee must be a number greater than 0")
+    apply = block.get("applyFactors", [])
+    if not isinstance(apply, list) or any(f not in INITIAL_PAYMENT_FACTORS for f in apply):
+        reasons.append(
+            "initialPayment.applyFactors must be a list drawn from "
+            + ", ".join(INITIAL_PAYMENT_FACTORS)
+        )
+    return reasons
+
+
+def price_initial_payment(doc, payload, factors):
+    """The initial payment for a subscription line, or None when the rating has none.
+
+    `factors` are the line's resolved factors, keyed as INITIAL_PAYMENT_FACTORS.
+    Call only after `initial_payment_reasons` returned nothing.
+    """
+    block = doc.get("initialPayment")
+    if block is None or getattr(payload, "mode", None) != "subscription":
+        return None
+    applied = list(block.get("applyFactors", []))
+    rate = float(block["baseFee"])
+    for name in applied:
+        rate *= factors[name]
+    rate = round(rate, 2)
+    rounded = round_price_49_99(rate)
+    return {
+        "initial_rate": rate,
+        "initial_price": rounded,
+        "initial_price_pence": int(round(rounded * 100)),
+        "factors": {"base_fee": block["baseFee"], "applied_factors": applied},
+    }
+
+
 def match_with_reasons(doc, payload):
     reasons = []
 
@@ -264,6 +330,7 @@ def match_with_reasons(doc, payload):
         reasons.append(f"multi_count '{payload.multi_count}' not in any multiFactor band")
     if getattr(payload, "regional_pricing", False):
         reasons.extend(regional_reasons(doc, payload))
+    reasons.extend(initial_payment_reasons(doc, payload))
 
     return len(reasons) == 0, reasons
 
@@ -349,6 +416,10 @@ def group_responses(responses):
             "rate": resp.get("rate"),
             "rounded_price": resp.get("rounded_price"),
             "rounded_price_pence": resp.get("rounded_price_pence"),
+            "initial_rate": resp.get("initial_rate"),
+            "initial_price": resp.get("initial_price"),
+            "initial_price_pence": resp.get("initial_price_pence"),
+            "billing": resp.get("billing"),
             "factors": resp.get("factors"),
             "error": resp.get("error") if "error" in resp else None
         }
@@ -513,6 +584,27 @@ def price_and_group(requests: List[RateRequest], log_errors: bool = True):
             enriched["rounded_price"] = rounded_price
             enriched["rounded_price_pence"] = int(round(rounded_price * 100))
 
+            # Subscription with an opening payment: the initial price covers month 1 and
+            # `rounded_price` is billed monthly from month 2.
+            initial = price_initial_payment(matching_doc, req, {
+                "locale": locale_factor,
+                "poc": poc_factor,
+                "category": category_factor,
+                "age": age_factor,
+                "price": price_factor,
+                "multi": multi_factor,
+            })
+            if initial is not None:
+                enriched["initial_rate"] = initial["initial_rate"]
+                enriched["initial_price"] = initial["initial_price"]
+                enriched["initial_price_pence"] = initial["initial_price_pence"]
+                enriched["factors"]["initial_payment"] = initial["factors"]
+                enriched["billing"] = {
+                    "initial_pence": initial["initial_price_pence"],
+                    "recurring_pence": enriched["rounded_price_pence"],
+                    "recurring_from_month": 2,
+                }
+
         except Exception as e:
             enriched["status"] = "error"
             enriched["error"] = str(e)
@@ -621,6 +713,12 @@ def rate_request(
     The result is rounded up to the nearest `.49` or `.99` — `rounded_price` is what to charge,
     `rounded_price_pence` the same value in minor units for payment providers, and `rate` the raw
     figure before rounding. The `factors` block shows exactly how the price was reached.
+
+    **Initial payment (subscriptions).** When the matched rating carries an `initialPayment`
+    block (`baseFee` plus the `applyFactors` to multiply it by) and the line's `mode` is
+    `subscription`, the option also returns `initial_price` / `initial_price_pence`: a first
+    payment that covers month 1, with `rounded_price` billed monthly from month 2. `billing`
+    spells the schedule out. A malformed block fails the line. One-off lines ignore the block.
 
     **Responses are grouped, not one-per-request.** Lines sharing a product, client, currency,
     locale, category, age, price, multi-count and source collapse into a single entry, with one

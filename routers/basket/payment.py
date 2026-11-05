@@ -100,6 +100,37 @@ def _extract_currency(items: list[dict[str, Any]]) -> str:
     return basket_currency(items).lower()
 
 
+def _initial_amount(items: list[dict[str, Any]], mode: str) -> Optional[int]:
+    """The basket's opening payment in minor units, or None when it has none.
+
+    Only subscription lines carry one. Checkout defers every monthly line to month 2
+    when there is an opening payment, so a line without one would get month 1 free:
+    a basket mixing the two is refused rather than charged that way.
+    """
+    if mode != "subscription":
+        return None
+    amounts = []
+    for it in items:
+        value = (it or {}).get("initial_price_pence")
+        if value is None:
+            amounts.append(None)
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise HTTPException(status_code=400, detail="A basket line has an invalid initial_price_pence")
+        amounts.append(int(value))
+    if all(a is None for a in amounts):
+        return None
+    if any(a is None for a in amounts):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The basket mixes monthly plans that open with an initial payment and plans "
+                "that do not. These cannot share one subscription; check them out separately."
+            ),
+        )
+    return sum(amounts)
+
+
 def _extract_locale(items: list[dict[str, Any]]) -> Optional[str]:
     for it in items:
         loc = (it or {}).get("lang") or (it or {}).get("locale")
@@ -202,6 +233,12 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
     `payment`. The basket id is passed as `internal_reference` and repeated in the metadata
     alongside client and source, so the webhook can reconcile the payment to the basket.
 
+    **Initial payment.** When the basket's monthly lines carry `initial_price_pence`, their sum
+    is charged at checkout as a one-off line covering month 1, and the monthly total is billed
+    from month 2 (the subscription trials until then). Bundle discounts reduce the monthly
+    amount only. A basket mixing monthly lines with and without an initial payment is rejected
+    with `409`.
+
     **One mode per basket.** A session carries a single mode, so a basket mixing one-off
     (`payment`) and recurring (`subscription`) lines is rejected with `409` rather than charged
     under whichever mode happens to win. `POST /basket/add` blocks the mix at source; this is the
@@ -271,6 +308,8 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
         mode_enum = ModeEnum(mode_value)
     except Exception:
         mode_enum = ModeEnum.payment
+    # Charged at checkout and covering month 1; `amount_minor` is billed from month 2.
+    initial_amount = _initial_amount(items, mode_enum.value)
 
     # 4) Build request for Stripe
     best_rule = basket.get("best_rule") or {}
@@ -286,6 +325,7 @@ def create_basket_payment_session(req: BasketPaymentRequest, _: None = Depends(v
         product_description=product_description,
         product_images=product_images,
         unit_amount=int(amount_minor),
+        initial_amount=initial_amount,
         currency=currency,
         quantity=1,
         mode=mode_enum,
