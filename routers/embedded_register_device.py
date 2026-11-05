@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Any
 from utils.api_docs import error, json_response, secured
@@ -13,7 +13,10 @@ import qrcode
 import io
 import base64
 import re
+from bson import ObjectId
 from utils.mongo import require_client
+from routers.devices.registration_core import build_device_doc, find_duplicate, unique_parameters
+from routers.customer.create_customer import get_or_create_customer, upsert_marketing_preferences
 
 router = APIRouter(
     tags=["Devices"]
@@ -26,6 +29,8 @@ clients_collection = db["ClientKey"]
 locale_params_collection = db["Locale_Params"]
 registrations_collection = db["Registrations"]
 registrations_error_log_collection = db["Registrations_Error_Log"]
+devices_collection = db["Devices"]
+customer_collection = db["Customer"]
 
 # ---------- Pydantic Models ----------
 
@@ -217,6 +222,33 @@ def fallback_value(input_val, *fallbacks):
             return f
     return input_val  # blank if nothing found
 
+def _assign_customer(payload, device_ids: list) -> Optional[str]:
+    """Find or create the customer and assign the newly stored devices to them.
+
+    Only devices created by this call are assigned: a duplicate already belongs to whoever
+    registered it first. `registrationPhone` is deliberately not set — the phone here is
+    whatever the caller sent, unverified, and that field is what /my-registrations treats as
+    proof of ownership.
+    """
+    customer = payload.customer
+    if not customer or not device_ids:
+        return None
+    phone = (customer.phone or "").strip()
+    email = (customer.email or "").strip()
+    if not phone and not email:
+        return None
+    customer_id, _existing = get_or_create_customer(customer_collection, customer.name or "", phone, email)
+    devices_collection.update_many(
+        {"_id": {"$in": [ObjectId(d) for d in device_ids]},
+         "registrationParameters.customerId": {"$exists": False}},
+        {"$set": {"registrationParameters.customerId": customer_id,
+                  "registrationParameters.registrationStatus": "assigned"}})
+    if customer.Opt_email is not None or customer.Opt_SMS is not None:
+        upsert_marketing_preferences(customer_collection, customer_id, payload.clientkey, {
+            "email": bool(customer.Opt_email), "sms": bool(customer.Opt_SMS),
+            "phone": False, "post": False})
+    return customer_id
+
 # ---------- The Endpoint ----------
 
 @router.post(
@@ -253,7 +285,8 @@ def fallback_value(input_val, *fallbacks):
         ),
     }),
 )
-def register(payload: RegisterRequest, _: None = Depends(verify_token)):
+def register(payload: RegisterRequest, background_tasks: BackgroundTasks = None,
+             _: None = Depends(verify_token)):
     """
     Register devices from an embedded/widget journey and return everything needed to complete
     activation: a registration id, a short activation code, a landing URL, and a QR image.
@@ -271,6 +304,17 @@ def register(payload: RegisterRequest, _: None = Depends(verify_token)):
       instead of `Registrations` and the root `status` is `error logged`. The call still returns
       `200` with a usable registration id.
 
+    **Matched devices are also stored as `Devices`**, the same records `POST /device-register`
+    creates, so they appear on /my-registrations and can be assigned cover:
+
+    - Each device result gains `deviceId` (the `Devices` id) and `duplicate`. A device already
+      registered — same IMEI, MAC, make+model+serial or GTIN+serial, checked in that order on
+      the submitted values — is not stored again: `deviceId` is the existing record and
+      `duplicate` is `true`. Unmatched devices have neither key.
+    - When `customer` has a phone or email, the customer is found or created and the newly
+      stored devices are assigned to them. An existing device's owner is never changed.
+      `Opt_SMS` / `Opt_email` are recorded as this client's marketing consent.
+
     `clientkey`, `locale` and `source` are mandatory in practice; `customer` is optional, but a
     non-blank `customer.email` must be a valid address.
     """
@@ -284,9 +328,11 @@ def register(payload: RegisterRequest, _: None = Depends(verify_token)):
     locale_doc = locale_params_collection.find_one({"locale": payload.locale})
     if not locale_doc:
         raise HTTPException(status_code=400, detail="Locale is not supported in system.")
+    client_id = client_doc.get("Client_ID")
 
     device_results = []
     any_matched = False
+    new_device_ids = []
 
     for device in payload.Devices:
         ids = device.Identifiers
@@ -324,6 +370,12 @@ def register(payload: RegisterRequest, _: None = Depends(verify_token)):
                 "registered_at": datetime.utcnow().isoformat() + "Z"
             })
             continue
+
+        # Checked on the submitted values, before enrichment below rewrites them, so this
+        # agrees with /device-register about what is already registered.
+        duplicate = find_duplicate(
+            devices_collection, gtin=ids.GTIN, make=ids.make, model=ids.model,
+            serial=unique.serial, imei=unique.imei, mac=unique.MAC)
 
         try:
             resolved, _ = catalog.resolve_lookup(
@@ -364,7 +416,7 @@ def register(payload: RegisterRequest, _: None = Depends(verify_token)):
         if matched_status == "matched":
             any_matched = True
 
-        device_results.append({
+        result_entry = {
             "device_id": device_id,
             "Identifiers": ids.dict(),
             "Unique_Parameters": unique.dict(),
@@ -373,7 +425,37 @@ def register(payload: RegisterRequest, _: None = Depends(verify_token)):
             "catalogueSnapshot": product if resolved else None,
             "status": "matched" if matched_status == "matched" else "error logged",
             "registered_at": datetime.utcnow().isoformat() + "Z"
-        })
+        }
+        if matched_status == "matched" and client_id:
+            if duplicate:
+                result_entry["deviceId"] = str(duplicate["device"]["_id"])
+                result_entry["duplicate"] = True
+            else:
+                device_doc = build_device_doc(
+                    client_id=client_id, locale=payload.locale, source=payload.source,
+                    identifiers={
+                        "GTIN": ids.GTIN or "", "make": ids.make or "", "model": ids.model or "",
+                        "SKU": ids.SKU or "", "title": ids.title or "", "category": ids.category or "",
+                        "gteeParts": ids.gtee_parts or "", "gteeLabour": ids.gtee_labour or "",
+                        "promo": ids.promo or "",
+                    },
+                    unique=unique_parameters(unique.MAC, unique.serial, unique.imei),
+                    registration_parameters={
+                        "purchaseDate": unique.purchase_date or "",
+                        "price": float(unique.price or 0),
+                        "currency": locale_doc.get("currency", ""),
+                        "clientRef": unique.client_ref or "",
+                        "registrationStatus": "unassigned",
+                        "deviceWorking": None,
+                    },
+                    custom_sku_id=customsku_id, master_sku_id=mastersku_id, sku_status="matched")
+                inserted = devices_collection.insert_one(device_doc)
+                result_entry["deviceId"] = str(inserted.inserted_id)
+                result_entry["duplicate"] = False
+                new_device_ids.append(result_entry["deviceId"])
+        device_results.append(result_entry)
+
+    customer_id = _assign_customer(payload, new_device_ids)
 
     # --- Build and insert the registration doc (root) ---
     registration_doc = {
@@ -414,6 +496,11 @@ def register(payload: RegisterRequest, _: None = Depends(verify_token)):
             {"_id": result.inserted_id},
             {"$set": update_fields}
         )
+
+    if customer_id and new_device_ids and background_tasks is not None:
+        from routers.comms.confirmation import send_registration_confirmation
+
+        background_tasks.add_task(send_registration_confirmation, customer_id, new_device_ids)
 
     # --- Return response (activation fields at root, not per-device) ---
     return {

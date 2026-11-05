@@ -127,3 +127,28 @@ def test_phone_pattern_does_not_match_a_longer_number():
     assert re.match(pattern, '+44 7700 900123')
     assert not re.match(pattern, '+1447700900123')
     assert not re.match(pattern, '+4477009001234')
+
+
+def test_paired_devices_schedule_one_registration_email(collections):
+    from fastapi import BackgroundTasks
+
+    tasks = BackgroundTasks()
+    device_id = str(ObjectId())
+    customer_id = str(ObjectId())
+
+    route.pair_customer_devices(request(customer_id, [device_id]), tasks)
+
+    assert len(tasks.tasks) == 1
+    assert tasks.tasks[0].args == (customer_id, [device_id])
+
+
+def test_no_email_is_scheduled_when_every_device_is_skipped(collections):
+    from fastapi import BackgroundTasks
+
+    _customers, devices = collections
+    devices.update_one.return_value.matched_count = 0
+    tasks = BackgroundTasks()
+
+    route.pair_customer_devices(request(str(ObjectId()), [str(ObjectId())]), tasks)
+
+    assert tasks.tasks == []

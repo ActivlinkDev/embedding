@@ -8,12 +8,15 @@ from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from utils.api_docs import error, json_response, secured
 from utils.dependencies import caller_client_key, verify_token
 from utils.tenant import client_id_for_key, device_ids_owned_by
 
 from routers.contract import contract_service as svc
+from routers.comms import links
+from routers.customer.create_customer import customer_ids_for_email
 
 router = APIRouter(tags=["Contracts"], dependencies=[Depends(verify_token)])
 
@@ -309,6 +312,47 @@ def customer_contracts(
         docs = [d for d in docs if d.get("device_id") in owned]
 
     return [_serialize(d) for d in docs]
+
+
+class MyContractsRequest(BaseModel):
+    # Supplied by the trusted frontend from its signed session cookie after an email code.
+    email: str = Field(..., min_length=3, max_length=254)
+    clientkey: str = Field(..., min_length=1)
+    link: str | None = Field(None, max_length=128)
+
+
+@router.post(
+    "/my-contracts",
+    summary="List the contracts of an email-verified customer on one client",
+    response_description="Contracts across every customer record with that email, newest first.",
+    responses=secured({
+        200: json_response(
+            "Same contract shape as `GET /customers/{customer_id}/contracts`. `highlightId` is "
+            "the contract a confirmation-email link points at, when it is in the list.",
+            {"contracts": [], "highlightId": None}),
+    }),
+)
+def my_contracts_by_email(body: MyContractsRequest, scope: str | None = Depends(caller_client_key)):
+    """
+    The email counterpart of `/customers/{customer_id}/contracts` for the customer-facing
+    /my-contracts page. One person can have several `Customer` records with the same email
+    (one per phone they used), so every one of them is included.
+
+    Scoped the same way: only contracts covering devices owned by `clientkey`'s client. An
+    unknown `clientkey` returns nothing.
+    """
+    client_id = client_id_for_key(body.clientkey)
+    customer_ids = [value for value in customer_ids_for_email(body.email) if isinstance(value, str)]
+    if not client_id or not customer_ids:
+        return {"contracts": [], "highlightId": None}
+    docs = list(svc.contracts_collection.find(
+        _scoped({"customer_id": {"$in": customer_ids}}, scope)
+    ).sort("created_at", -1))
+    owned = device_ids_owned_by(client_id, [d.get("device_id") for d in docs])
+    docs = [d for d in docs if d.get("device_id") in owned]
+    contracts = [_serialize(d) for d in docs]
+    highlight = links.highlight_id(body.link, client_id, "contract", {c["id"] for c in contracts})
+    return {"contracts": contracts, "highlightId": highlight}
 
 
 # --- orders (parent) ---------------------------------------------------------

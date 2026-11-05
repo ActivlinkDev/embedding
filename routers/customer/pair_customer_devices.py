@@ -15,7 +15,7 @@ frontend before anything is written.
 import re
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from utils.api_docs import error, json_response, secured
@@ -76,7 +76,8 @@ def phone_pattern(phone: str) -> dict:
         404: error("The customer does not exist.", "Customer not found"),
     }),
 )
-def pair_customer_devices(body: PairCustomerDevicesRequest, _: None = Depends(verify_token)):
+def pair_customer_devices(body: PairCustomerDevicesRequest, background_tasks: BackgroundTasks = None,
+                          _: None = Depends(verify_token)):
     """
     Mark devices registered in the current session as owned by a customer, for journeys that
     end without a payment.
@@ -147,5 +148,13 @@ def pair_customer_devices(body: PairCustomerDevicesRequest, _: None = Depends(ve
         customer_collection.update_one({'_id': customer_objid},
                                        {'$push': {'devices': {'deviceId': device_id, 'status': status}}})
         results.append({'deviceId': device_id, 'status': status})
+
+    paired = [entry['deviceId'] for entry in results if entry['status'] != 'skipped']
+    if paired and background_tasks is not None:
+        # Sent after the response. Re-pairing the same devices is deduplicated, so the
+        # retry-safe contract above still holds for the customer's inbox.
+        from routers.comms.confirmation import send_registration_confirmation
+
+        background_tasks.add_task(send_registration_confirmation, body.customer_id, paired)
 
     return {'customer_id': body.customer_id, 'device_update': summary, 'devices': results}
