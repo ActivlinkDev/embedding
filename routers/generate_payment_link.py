@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, EmailStr, HttpUrl, model_validator
 from typing import List, Optional, Dict
 from enum import Enum
@@ -9,7 +9,8 @@ import os
 import logging
 import requests
 
-from utils.api_docs import error, json_response
+from utils.dependencies import verify_token
+from utils.api_docs import error, json_response, FORBIDDEN, UNAUTHORIZED
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -335,9 +336,12 @@ def shorten_with_tinyurl(long_url: str) -> str:
 
 @router.post(
     "/generate_checkout_session",
+    dependencies=[Depends(verify_token)],
     summary="Create a Stripe Checkout session and a short payment link",
     response_description="The checkout URL, a shortened link, the session id, and pre-fill diagnostics.",
     responses={
+        401: UNAUTHORIZED,
+        403: FORBIDDEN,
         200: json_response(
             "The session was created. `checkout_url_short` is the TinyURL link, or the full Stripe URL if shortening failed.",
             {

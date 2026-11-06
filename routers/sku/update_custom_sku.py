@@ -81,7 +81,10 @@ def _inherit_path(name: str, locale: Optional[str]) -> str:
     return f"overrides.locales.{locale}.{locale_names[name]}"
 
 
-@router.post("/update_custom_sku")
+@router.post(
+    "/update_custom_sku",
+    summary="Update a client SKU or its overrides",
+)
 def update_custom_sku(
     data: UpdateCustomSKURequest,
     background_tasks: BackgroundTasks,

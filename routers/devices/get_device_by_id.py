@@ -1,9 +1,13 @@
-from fastapi import APIRouter, Query, HTTPException
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Query, HTTPException
 from bson import ObjectId
 import os
 
-from utils.api_docs import error, json_response
+from utils.dependencies import caller_client_key, verify_token
+from utils.api_docs import error, json_response, FORBIDDEN, UNAUTHORIZED
 from utils.mongo import require_client
+from utils.tenant import client_id_for_key
 
 router = APIRouter(tags=["Devices"])
 
@@ -26,9 +30,12 @@ def _serialize(doc: dict) -> dict:
 
 @router.get(
     "/devices/by-id",
+    dependencies=[Depends(verify_token)],
     summary="Fetch a registered device by its id",
     response_description="The stored device document, wrapped in `data`.",
     responses={
+        401: UNAUTHORIZED,
+        403: FORBIDDEN,
         200: json_response(
             "The device was found.",
             {
@@ -61,10 +68,17 @@ def _serialize(doc: dict) -> dict:
                 }
             },
         ),
-        404: error("No device with this id.", "Device not found"),
+        404: error(
+            "No device with this id, **or** it belongs to another tenant. The two are deliberately "
+            "indistinguishable.",
+            "Device not found",
+        ),
     },
 )
-def get_device_by_id(device_id: str = Query(..., alias="device_id")):
+def get_device_by_id(
+    device_id: str = Query(..., alias="device_id"),
+    scope: Optional[str] = Depends(caller_client_key),
+):
     """
     Look up a single registered device.
 
@@ -75,6 +89,9 @@ def get_device_by_id(device_id: str = Query(..., alias="device_id")):
     The document is returned as stored, with `_id` converted to a string. Its shape follows the
     registration that created it: `identifiers`, `uniqueParameters` and `registrationParameters`,
     plus the catalogue links (`customSkuId`, `masterSkuId`) resolved at registration time.
+
+    **Tenant-scoped.** A caller pinned to a ClientKey only sees devices registered to that
+    ClientKey's client; another tenant's device returns `404`, exactly as an unknown id does.
     """
     try:
         objid = ObjectId(device_id)
@@ -83,6 +100,12 @@ def get_device_by_id(device_id: str = Query(..., alias="device_id")):
         objid = None
 
     query = {"_id": objid} if objid is not None else {"_id": device_id}
+    if scope is not None:
+        # Devices record their owner as the Client_ID, not the ClientKey (see utils/tenant.py).
+        client_id = client_id_for_key(scope)
+        if not client_id:
+            raise HTTPException(status_code=404, detail="Device not found")
+        query["client"] = client_id
     # Receipts and verified contact details are private to the registration session.
     doc = devices_collection.find_one(query, {'receipt': 0, 'registrationPhone': 0})
     if not doc:

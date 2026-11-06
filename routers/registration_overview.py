@@ -54,7 +54,7 @@ def registration_owner_query(phone: str, client_id: str):
                      {'registrationParameters.customerId': {'$in': customer_ids}}]}
 
 
-@router.post('/my-registrations')
+@router.post('/my-registrations', summary="List a customer's registered devices by phone number")
 def my_registrations(body: MyRegistrationsRequest, _: None = Depends(verify_token)):
     db = client['Activlink']
     owner = registration_owner_query(body.phone, resolve_client_id(body.clientkey))
@@ -83,7 +83,7 @@ class RegistrationReceiptRequest(MyRegistrationsRequest):
     device_id: str
 
 
-@router.post('/my-registrations/receipt')
+@router.post('/my-registrations/receipt', summary="Download the receipt stored with a registration")
 def registration_receipt(body: RegistrationReceiptRequest, _: None = Depends(verify_token)):
     if not ObjectId.is_valid(body.device_id):
         raise HTTPException(404, 'Receipt unavailable')
@@ -124,7 +124,7 @@ def decode_receipt(receipt: Receipt):
     )
 
 
-@router.post('/registration-overview')
+@router.post('/registration-overview', summary="Confirm verified registrations and attach a receipt")
 def registration_overview(body: OverviewRequest, _: None = Depends(verify_token)):
     # device_ids and phone are supplied by the frontend after checking signed,
     # HTTP-only registration and OTP cookies, never from browser JSON.

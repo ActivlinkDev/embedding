@@ -1,9 +1,13 @@
-from fastapi import APIRouter, Body, HTTPException
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Body, HTTPException
 from bson import ObjectId
 import os
 
-from utils.api_docs import error, json_response
+from utils.dependencies import caller_client_key, verify_token
+from utils.api_docs import error, json_response, FORBIDDEN, UNAUTHORIZED
 from utils.mongo import require_client
+from utils.tenant import client_id_for_key, device_ids_owned_by
 
 router = APIRouter(tags=["Customers"])
 
@@ -17,9 +21,12 @@ devices_collection = db["Devices"]
 
 @router.post(
     "/pair-customer",
+    dependencies=[Depends(verify_token)],
     summary="Attach a basket's devices to a customer",
     response_description="Per-device outcome and update counts for both the customer and the devices.",
     responses={
+        401: UNAUTHORIZED,
+        403: FORBIDDEN,
         200: json_response(
             "The pairing ran. **Inspect the counts and `errors`** — a device that could not be "
             "updated is reported here, not raised.",
@@ -34,12 +41,17 @@ devices_collection = db["Devices"]
             },
         ),
         400: error("`customer_id` or `basket_id` is not a valid 24-character ObjectId.", "Invalid basket_id"),
-        404: error("The basket or the customer does not exist.", "Customer not found"),
+        404: error(
+            "The basket or the customer does not exist, **or** the basket holds a device that "
+            "belongs to another tenant.",
+            "Basket not found",
+        ),
     },
 )
 def pair_customer(
     customer_id: str = Body(..., description="**Mandatory.** The customer to attach the devices to.", examples=["6820f1c9a4b21d0f8c9e9001"]),
     basket_id: str = Body(..., description="**Mandatory.** The basket whose devices are being paired.", examples=["68b2d1f0a4b21d0f8c9e8801"]),
+    scope: Optional[str] = Depends(caller_client_key),
 ):
     """
     Link every device in a basket to a customer — the step that turns an anonymous basket into
@@ -62,7 +74,11 @@ def pair_customer(
     `matched` against `attempted` to confirm everything landed. An empty basket returns zeroed
     counts without touching anything.
 
-    Both ids are mandatory. **This endpoint is not authenticated.**
+    Both ids are mandatory.
+
+    **Tenant-scoped.** For a caller pinned to a ClientKey, every device in the basket must be
+    registered to that ClientKey's client. If any is not, the call returns `404 Basket not found`
+    before anything is written, so it never reveals that another tenant's basket exists.
     """
     # Validate ids
     try:
@@ -98,6 +114,15 @@ def pair_customer(
             # only set to 'registered' if not already marked (contract takes precedence)
             device_status_map.setdefault(did, "registered")
 
+    # A pinned caller may only pair devices its own client registered. The basket's own
+    # `client` field comes from the request that created it, so ownership is read from
+    # the Devices collection instead (see utils/tenant.py).
+    owner_client_id = None
+    if scope is not None:
+        owner_client_id = client_id_for_key(scope)
+        if not owner_client_id or device_ids_owned_by(owner_client_id, device_ids) != device_ids:
+            raise HTTPException(status_code=404, detail="Basket not found")
+
     if not device_ids:
         return {"customer_update": {"matched": 0, "modified": 0}, "device_update": {"attempted": 0, "matched": 0, "modified": 0, "errors": []}, "deviceIds": []}
 
@@ -128,6 +153,8 @@ def pair_customer(
             oid = None
 
         query = {"_id": oid} if oid is not None else {"_id": did}
+        if owner_client_id:
+            query["client"] = owner_client_id
         try:
             dev_res = devices_collection.update_one(
                 query,

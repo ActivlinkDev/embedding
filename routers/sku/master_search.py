@@ -128,7 +128,10 @@ def _owned_by_client(client_id: Any, master_ids: list[str]) -> dict[str, dict]:
     return by_master
 
 
-@router.get("/master_search")
+@router.get(
+    "/master_search",
+    summary="Search the master product catalogue by GTIN, make or model",
+)
 def master_search(
     q: str = Query(...),
     field: str = Query("any", pattern="^(any|gtin|make|model)$"),

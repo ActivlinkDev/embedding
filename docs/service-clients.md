@@ -189,8 +189,8 @@ reaching outside their tenant before enforcement starts returning errors.
 ### Row-level scoping
 
 Rejecting requests that *name* another tenant is not enough on its own: an endpoint can reach
-tenant data by a record id, a customer id, or no filter at all. So the contract, order and quote
-routes also constrain their own queries via the `caller_client_key` dependency:
+tenant data by a record id, a customer id, or no filter at all. So the contract, order, quote and
+device routes below also constrain their own queries via the `caller_client_key` dependency:
 
 | Route | Behaviour for a pinned caller |
 | --- | --- |
@@ -198,6 +198,8 @@ routes also constrain their own queries via the `caller_client_key` dependency:
 | `GET /customers/{id}/contracts`, `.../orders`, `GET /devices/{id}/contracts` | Same filter applied. |
 | `GET /contracts/{id}`, `GET /orders/{id}`, `GET /quote/{id}` | `404` if the record belongs to another tenant. |
 | `POST /contracts/{id}/cancel`, `.../resend` | `404` on another tenant's contract — mutations are scoped too. |
+| `GET /devices/by-id` | `404` if the device was registered to another client. |
+| `POST /pair-customer` | `404 Basket not found` if any device in the basket was registered to another client; nothing is written. |
 | `POST /contracts/jobs/*` | `403`. These sweep every tenant, so they are closed to pinned callers. |
 
 Cross-tenant reads return **404, not 403**, so a pinned caller cannot use the status code to

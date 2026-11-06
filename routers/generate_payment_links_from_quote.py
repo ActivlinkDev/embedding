@@ -1,11 +1,12 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from bson import ObjectId
 from routers.generate_payment_link import generate_checkout_session, CheckoutSessionRequest, ModeEnum
 import os
 
-from utils.api_docs import error, json_response
+from utils.dependencies import verify_token
+from utils.api_docs import error, json_response, FORBIDDEN, UNAUTHORIZED
 from utils.mongo import require_client
 
 router = APIRouter(tags=["Payments"])
@@ -72,9 +73,12 @@ class PaymentLinkRequest(BaseModel):
 
 @router.post(
     "/generate_payment_link",
+    dependencies=[Depends(verify_token)],
     summary="Create a payment link for one option of a stored quote",
     response_description="The same payload as `/generate_checkout_session`: URLs, session id and pre-fill diagnostics.",
     responses={
+        401: UNAUTHORIZED,
+        403: FORBIDDEN,
         200: json_response(
             "The Stripe session was created for the selected option.",
             {

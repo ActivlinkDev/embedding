@@ -10,7 +10,10 @@ from .catalog_dependencies import catalog
 
 
 router = APIRouter(prefix="/sku", tags=["Catalog"])
-@router.get("/lookup_custom_sku")
+@router.get(
+    "/lookup_custom_sku",
+    summary="Find a client SKU by id, SKU code, GTIN, or make and model",
+)
 def lookup_sku(
     clientKey: str = Query(...),
     locale: str = Query(...),

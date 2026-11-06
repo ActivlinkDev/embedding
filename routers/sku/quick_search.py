@@ -13,7 +13,10 @@ from .catalog_dependencies import catalog, custom_collection
 router = APIRouter(prefix="/sku", tags=["Catalog"])
 
 
-@router.get("/quick_search")
+@router.get(
+    "/quick_search",
+    summary="Search a client's own SKUs",
+)
 def quick_search(
     clientKey: str = Query(...),
     q: Optional[str] = Query(None),

@@ -13,7 +13,10 @@ from .catalog_dependencies import catalog, custom_collection
 router = APIRouter(prefix="/sku", tags=["Catalog"])
 
 
-@router.get("/get_custom_sku")
+@router.get(
+    "/get_custom_sku",
+    summary="Fetch a client SKU with its resolved and inherited values",
+)
 def get_custom_sku(
     id: str = Query(...),
     clientKey: str = Query(...),

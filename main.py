@@ -12,38 +12,32 @@ from fastapi import FastAPI, Request
 from routers.quote import router as quote_router
 from routers.auth import router as auth_router
 
-OPENAPI_TAGS = [
-    {"name": "Auth", "description": "Service-client authentication: exchange credentials for a short-lived JWT."},
-    {"name": "Catalog", "description": "Category, SKU, and client catalog lookups."},
-    {"name": "Localization", "description": "Locale lookups and mappings."},
-    {"name": "Enrichment", "description": "Third-party enrichment and AI extraction."},
-    {"name": "Devices", "description": "Device registration and lookup."},
-    {"name": "Assignments", "description": "Device and product assignment workflows."},
-    {"name": "Quotes", "description": "Quote generation and retrieval."},
-    {"name": "Payments", "description": "Rates, payment links, and Stripe utilities."},
-    {"name": "Contracts", "description": "Device-cover contract issuance and administration."},
-    {"name": "Basket", "description": "Basket pricing and payments."},
-    {"name": "Customers", "description": "Customer identity and verification."},
-    {"name": "Messaging", "description": "SMS, email ingest, and OTP flows."},
-    {"name": "CMS", "description": "Content management integrations."},
-    {"name": "Operations", "description": "Internal tools and maintenance utilities."},
-    {"name": "QA", "description": "Quality assurance utilities."},
-    {"name": "Portal", "description": "Portal admin login and user management."},
-    {"name": "QR", "description": "QR code collection generation, scanning, and pairing."},
-    {"name": "Service", "description": "Repair booking: fault reports, attachments, availability, and appointments."},
-]
+from utils.api_reference import OPENAPI_TAGS, build_openapi, reference_html
 
 docs_enabled = os.getenv("ENABLE_API_DOCS", "false").lower() == "true"
 
 app = FastAPI(
-    title="Activlink API Suite",
-    description="APIs for registration, ingestion, enrichment, and payments.",
+    title="Activlink API",
     version="1.0.0",
     openapi_tags=OPENAPI_TAGS,
-    docs_url="/docs" if docs_enabled else None,
-    redoc_url="/redoc" if docs_enabled else None,
+    # /docs is the branded reference page below; FastAPI's stock Swagger and ReDoc pages are off.
+    docs_url=None,
+    redoc_url=None,
     openapi_url="/openapi.json" if docs_enabled else None,
 )
+app.openapi = lambda: build_openapi(app)
+
+if docs_enabled:
+    from fastapi.responses import HTMLResponse, RedirectResponse
+
+    @app.get("/docs", include_in_schema=False)
+    def api_reference() -> HTMLResponse:
+        return HTMLResponse(reference_html(app.openapi_url))
+
+    @app.get("/redoc", include_in_schema=False)
+    def redoc_moved() -> RedirectResponse:
+        """Old bookmarks: ReDoc was replaced by /docs."""
+        return RedirectResponse("/docs", status_code=308)
 
 
 @app.on_event("startup")
