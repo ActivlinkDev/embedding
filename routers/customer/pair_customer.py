@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Depends, Body, HTTPException
 from bson import ObjectId
 import os
 
-from utils.api_docs import error, json_response
+from utils.dependencies import verify_token
+from utils.api_docs import error, json_response, FORBIDDEN, UNAUTHORIZED
 from utils.mongo import require_client
 
 router = APIRouter(tags=["Customers"])
@@ -17,9 +18,12 @@ devices_collection = db["Devices"]
 
 @router.post(
     "/pair-customer",
+    dependencies=[Depends(verify_token)],
     summary="Attach a basket's devices to a customer",
     response_description="Per-device outcome and update counts for both the customer and the devices.",
     responses={
+        401: UNAUTHORIZED,
+        403: FORBIDDEN,
         200: json_response(
             "The pairing ran. **Inspect the counts and `errors`** — a device that could not be "
             "updated is reported here, not raised.",

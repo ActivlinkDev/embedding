@@ -2,10 +2,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Depends, Body, HTTPException
 import os
 
-from utils.api_docs import error, json_response
+from utils.dependencies import verify_token
+from utils.api_docs import error, json_response, FORBIDDEN, UNAUTHORIZED
 from utils.mongo import require_client
 
 router = APIRouter(tags=["Customers"])
@@ -103,9 +104,12 @@ def get_or_create_customer(
 # --- FastAPI Endpoint using the function ---
 @router.post(
     "/get-or-create-customer",
+    dependencies=[Depends(verify_token)],
     summary="Find a customer by phone or email, creating one if needed",
     response_description="The customer id, and whether they already existed.",
     responses={
+        401: UNAUTHORIZED,
+        403: FORBIDDEN,
         200: json_response(
             "A customer id, either matched or newly created. `existing` tells you which.",
             {"customerId": "6820f1c9a4b21d0f8c9e9001", "existing": False, "marketingPreferencesStored": True},

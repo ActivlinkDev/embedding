@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException
 from bson import ObjectId
 import os
 
-from utils.api_docs import error, json_response
+from utils.dependencies import verify_token
+from utils.api_docs import error, json_response, FORBIDDEN, UNAUTHORIZED
 from utils.mongo import require_client
 
 router = APIRouter(tags=["Devices"])
@@ -26,9 +27,12 @@ def _serialize(doc: dict) -> dict:
 
 @router.get(
     "/devices/by-id",
+    dependencies=[Depends(verify_token)],
     summary="Fetch a registered device by its id",
     response_description="The stored device document, wrapped in `data`.",
     responses={
+        401: UNAUTHORIZED,
+        403: FORBIDDEN,
         200: json_response(
             "The device was found.",
             {

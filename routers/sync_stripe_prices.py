@@ -1,8 +1,9 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 import stripe
 import os
 
-from utils.api_docs import error, json_response
+from utils.dependencies import verify_token
+from utils.api_docs import error, json_response, FORBIDDEN, UNAUTHORIZED
 from utils.mongo import require_client
 
 router = APIRouter(tags=["Payments"])
@@ -32,9 +33,12 @@ def serialize_price(price):
 
 @router.post(
     "/sync_stripe_prices",
+    dependencies=[Depends(verify_token)],
     summary="Import new Stripe prices into the local catalogue",
     response_description="How many prices were newly imported, and which ones.",
     responses={
+        401: UNAUTHORIZED,
+        403: FORBIDDEN,
         200: json_response(
             "The sync completed. `inserted_count` is `0` when nothing new was found — the "
             "normal result of a repeat run.",
