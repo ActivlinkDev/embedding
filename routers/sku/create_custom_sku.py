@@ -232,7 +232,10 @@ def create_custom_sku_service(
     }
 
 
-@router.post("/create_custom_sku")
+@router.post(
+    "/create_custom_sku",
+    summary="Add a product to a client's catalogue",
+)
 def create_custom_sku(
     data: CustomSKURequest,
     background_tasks: BackgroundTasks,

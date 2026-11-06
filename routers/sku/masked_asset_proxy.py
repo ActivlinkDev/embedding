@@ -24,7 +24,10 @@ async def _close_upstream(response: httpx.Response, client: httpx.AsyncClient) -
     await client.aclose()
 
 
-@router.get("/r/{key}")
+@router.get(
+    "/r/{key}",
+    summary="Serve a product image or document through its masked Activlink URL",
+)
 async def proxy_masked(key: str):
     doc = url_map_collection.find_one({"_id": key})
     if not doc or not doc.get("url"):

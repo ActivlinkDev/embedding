@@ -155,7 +155,7 @@ def _import_one(doc: dict, client_key: str, locales: list[str], category: str,
     return results
 
 
-@router.post("/import", status_code=200)
+@router.post("/import", status_code=200, summary="Import one EPREL model into a client's catalogue")
 def import_record(payload: ImportRequest):
     """Import one EPREL model into a client's catalog, across one or more locales.
 
@@ -268,7 +268,7 @@ def _run_brand_import(job_id: str, payload: BrandImportRequest, query: dict) -> 
         )
 
 
-@router.post("/import/brand", status_code=202)
+@router.post("/import/brand", status_code=202, summary="Import a whole brand from EPREL in the background")
 def import_brand(payload: BrandImportRequest, background_tasks: BackgroundTasks):
     """Import every scraped EPREL record for a brand into a client's catalog.
 
@@ -323,7 +323,7 @@ def import_brand(payload: BrandImportRequest, background_tasks: BackgroundTasks)
     }
 
 
-@router.get("/import/jobs/{job_id}")
+@router.get("/import/jobs/{job_id}", summary="Poll the progress of an EPREL import job")
 def get_import_job(job_id: str):
     """Progress and per-locale totals for an import job."""
     job = jobs_collection.find_one({"jobId": job_id}, {"_id": 0})
@@ -332,7 +332,7 @@ def get_import_job(job_id: str):
     return job
 
 
-@router.get("/category-map")
+@router.get("/category-map", summary="List how EPREL product groups map to categories")
 def list_category_map():
     """List EPREL product group to category mappings, and which groups are importable."""
     mappings = list(category_map_collection.find({}, {"_id": 0}).sort("productGroup", 1))
@@ -341,7 +341,7 @@ def list_category_map():
     return {"mappings": mappings, "count": len(mappings), "unpinned": unresolved}
 
 
-@router.put("/category-map/{product_group}")
+@router.put("/category-map/{product_group}", summary="Set the category an EPREL product group maps to")
 def upsert_category_map(product_group: str, payload: CategoryMapEntry):
     """Create or correct the category mapping for one EPREL product group."""
     if payload.category:

@@ -43,15 +43,16 @@ def json_response(description: str, example: Any) -> Dict[str, Any]:
 # Wording mirrors the real behaviour of utils.dependencies.verify_token / _enforce_client_key.
 
 UNAUTHORIZED = error(
-    "No bearer token was supplied, or the token is malformed, expired, or signed with the "
-    "wrong key. Obtain a fresh token from `POST /auth/token`.",
-    "Invalid or expired token",
+    "The bearer token is malformed, expired, or signed with the wrong key. Obtain a fresh "
+    "token from `POST /auth/token`.",
+    "Invalid or missing token",
 )
 
 FORBIDDEN = error(
     "The caller is authenticated but not permitted to act on the `ClientKey` named in this "
     "request. A ServiceClient pinned to one tenant may only address that tenant; an unpinned "
-    "ServiceClient needs the `clientkey:*` scope to address any tenant at all.",
+    "ServiceClient needs the `clientkey:*` scope to address any tenant at all. A request "
+    "sent with no `Authorization` header is also refused here, with `Not authenticated`.",
     "Caller is scoped to ClientKey acme_uk_live",
 )
 
